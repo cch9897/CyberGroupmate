@@ -278,6 +278,8 @@ export class OneBotAdapter implements PlatformAdapter {
             "onebot.sendSticker",
             "onebot.sendFace",
             "onebot.sendTyping",
+            "onebot.sendReaction",
+            "onebot.pokeUser",
             "onebot.deleteMessages",
             "qq.sendText",
             "qq.sendMedia",
@@ -285,6 +287,8 @@ export class OneBotAdapter implements PlatformAdapter {
             "qq.sendSticker",
             "qq.sendFace",
             "qq.sendTyping",
+            "qq.sendReaction",
+            "qq.pokeUser",
             "qq.deleteMessages",
         ];
     }
@@ -422,6 +426,41 @@ export class OneBotAdapter implements PlatformAdapter {
                 const chatId = ensureCompositeId("onebot", String(args[0] ?? ""));
                 const ids = Array.isArray(args[1]) ? args[1].map(id => String(id)).filter(Boolean) : [];
                 return this.deleteMessages(chatId, ids);
+            }
+            case "onebot.sendReaction":
+            case "qq.sendReaction": {
+                // chatId 仅用于 handleCall 顶部的 mute 拦截；set_msg_emoji_like 本身不需要 chat 范围
+                const messageId = String(args[1] ?? "").trim();
+                const emoji = String(args[2] ?? "").trim();
+                if (!messageId) throw new Error("onebot.sendReaction: messageId is required");
+                if (!emoji) throw new Error("onebot.sendReaction: emoji is required");
+                return this.callAction("set_msg_emoji_like", {
+                    message_id: /^-?\d+$/.test(messageId) ? Number(messageId) : messageId,
+                    emoji_id: emoji,
+                });
+            }
+            case "onebot.pokeUser":
+            case "qq.pokeUser": {
+                const chatId = ensureCompositeId("onebot", String(args[0] ?? ""));
+                const targetUserId = args[1] != null ? String(args[1]).trim() : "";
+                const parsed = parseChatId(chatId);
+                if (parsed.groupId == null) {
+                    throw new Error("onebot.pokeUser: 当前实现仅支持群聊戳一戳");
+                }
+                if (!targetUserId) throw new Error("onebot.pokeUser: userId is required");
+                return this.callAction("group_poke", {
+                    group_id: Number(parsed.groupId),
+                    user_id: Number(targetUserId),
+                });
+            }
+            case "onebot.getChatMembers":
+            case "qq.getChatMembers": {
+                const chatId = ensureCompositeId("onebot", String(args[0] ?? ""));
+                const parsed = parseChatId(chatId);
+                if (parsed.groupId == null) {
+                    throw new Error("onebot.getChatMembers: 仅支持群聊");
+                }
+                return this.callAction("get_group_member_list", { group_id: Number(parsed.groupId) });
             }
             case "onebot.sendTyping":
             case "qq.sendTyping": {

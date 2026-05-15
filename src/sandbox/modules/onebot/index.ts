@@ -299,6 +299,22 @@ export function createOneBotClientProxy(
         sendTyping: async (_chatId: string) => {
             // OneBot 没有 typing 指示，静默忽略
         },
+        sendReaction: async (chatId: string | number, messageId: string | number, emoji: string | number) => {
+            const sent = await env.callHost("onebot.sendReaction", [chatId, messageId, emoji]);
+            env.emitOutput(`[QQ] sendReaction ok chat=${String(chatId)} msg=${String(messageId)} emoji=${String(emoji)}`);
+            return sent;
+        },
+        pokeUser: async (chatId: string | number, userId: string | number) => {
+            const sent = await env.callHost("onebot.pokeUser", [chatId, userId]);
+            env.emitOutput(`[QQ] pokeUser ok chat=${String(chatId)} user=${String(userId)}`);
+            return sent;
+        },
+        getChatMembers: async (chatId: string | number) => {
+            const result = await env.callHost("onebot.getChatMembers", [chatId]);
+            const count = Array.isArray(result) ? result.length : 0;
+            env.emitOutput(`[QQ] getChatMembers ok chat=${String(chatId)} count=${count}`);
+            return result;
+        },
         deleteMessages: async (chatId: string, messageIds: (string | number)[]) => {
             await env.callHost("onebot.deleteMessages", [chatId, messageIds]);
             env.emitOutput(`[QQ] deleteMessages ok chat=${String(chatId)} ids=[${messageIds.join(",")}]`);

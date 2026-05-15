@@ -94,11 +94,33 @@ declare const onebot: {
     sendTyping(chatId: string | number): Promise<void>;
 
     /**
-     * 撤回消息。
+     * 撤回消息。群聊与私聊均支持（私聊仅能撤回自己发的）。
      * @example
      * await onebot.deleteMessages(chatId, [messageId]);
      */
     deleteMessages(chatId: string | number, messageIds: Array<string | number>): Promise<void>;
+
+    /**
+     * 给一条消息添加表情回应（NapCat `set_msg_emoji_like`）。
+     * emoji 通常为 QQ face id 字符串（如 "128077" 表示 👍）。
+     * @example
+     * await onebot.sendReaction(chatId, messageId, "128077");
+     */
+    sendReaction(chatId: string | number, messageId: string | number, emoji: string | number): Promise<unknown>;
+
+    /**
+     * 群聊戳一戳（NapCat `group_poke`）。仅群聊支持。
+     * @example
+     * await onebot.pokeUser(groupChatId, userId);
+     */
+    pokeUser(chatId: string | number, userId: string | number): Promise<unknown>;
+
+    /**
+     * 获取群成员列表（NapCat `get_group_member_list`）。仅群聊。
+     * @example
+     * const members = await onebot.getChatMembers(groupChatId);
+     */
+    getChatMembers(chatId: string | number): Promise<unknown[]>;
 
     /**
      * 下载 QQ 媒体到 CyberGroupmate 本机 workspace/Downloads/。
@@ -108,6 +130,14 @@ declare const onebot: {
      * const localPath = await onebot.downloadMedia(794582600);
      */
     downloadMedia(mediaRef: string | number): Promise<string>;
+
+    /**
+     * 通用 NapCat passthrough（受 guide 白名单限制）。
+     * 仅披露过 guide 的 action 可调用；`action` 可带或不带开头 `/`。
+     * @example
+     * const history = await onebot.callApi("get_group_msg_history", { group_id: 123, count: 20 });
+     */
+    callApi(action: string, params?: Record<string, unknown>): Promise<unknown>;
 };
 
 declare const qq: typeof onebot;
