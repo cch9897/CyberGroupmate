@@ -118,7 +118,10 @@ export class OneBotAdapter implements PlatformAdapter {
         return new Promise<void>((resolve, reject) => {
             const isReconnect = this.reconnectAttempts > 0;
             let settled = false;
-            const ws = new WebSocket(this.config.wsUrl);
+            const wsOpts = this.config.accessToken
+                ? { headers: { Authorization: `Bearer ${this.config.accessToken}` } }
+                : undefined;
+            const ws = new WebSocket(this.config.wsUrl, wsOpts);
             this.ws = ws;
 
             ws.once("open", () => {

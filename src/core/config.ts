@@ -178,6 +178,9 @@ export interface OneBotConfig {
     wsUrl: string;
     /** Bot 的 QQ 号（用于识别自己的消息） */
     selfId: string;
+    /** OneBot v11 鉴权 token；若 NapCat 配置了 access_token，需在此填入相同值。
+     * 将以 `Authorization: Bearer <token>` 头发送到 WS。 */
+    accessToken?: string;
     /** 是否将本地文件编码为 data URL 发送（跨机器部署时建议开启） */
     sendFileAsDataUrl?: boolean;
     /** 入站白名单（可选） */
@@ -603,6 +606,7 @@ export function loadConfig(configPath?: string, forceReload?: boolean): AppConfi
         onebot: Object.keys(fileOB).length > 0 ? {
             wsUrl: str(fileOB.ws_url) ?? "",
             selfId: str(fileOB.self_id) ?? "",
+            accessToken: str(fileOB.access_token),
             sendFileAsDataUrl: fileOB.send_file_as_data_url != null ? Boolean(fileOB.send_file_as_data_url) : undefined,
             whitelist: parseOneBotWhitelist(fileOB),
             humanizedDelay: parseOneBotHumanizedDelay(fileOB),
@@ -1225,6 +1229,9 @@ export function serializeConfigToObject(config: AppConfig): Record<string, unkno
             ws_url: config.onebot.wsUrl,
             self_id: config.onebot.selfId,
         };
+        if (config.onebot.accessToken) {
+            ob.access_token = config.onebot.accessToken;
+        }
         if (config.onebot.sendFileAsDataUrl != null) {
             ob.send_file_as_data_url = config.onebot.sendFileAsDataUrl;
         }
