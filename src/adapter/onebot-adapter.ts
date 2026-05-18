@@ -106,6 +106,7 @@ export class OneBotAdapter implements PlatformAdapter {
         private config: OneBotConfig,
         private nc: NotificationCenter,
         private mediaDownloader?: MediaDownloader,
+        private personaName: string = "我",
     ) {}
 
     async start(): Promise<void> {
@@ -1411,7 +1412,18 @@ export class OneBotAdapter implements PlatformAdapter {
     private extractText(message: OneBotMessageSegment[]): string {
         return message.map(seg => {
             if (seg.type === "text") return String(seg.data?.text ?? "");
-            if (seg.type === "at") return `[CQ:at,qq=${String(seg.data?.qq ?? "")}]`;
+            if (seg.type === "at") {
+                const qq = String(seg.data?.qq ?? "");
+                // LLM 看不懂裸 CQ 码里的 QQ 号；命中自己时显示 personaName，
+                // 其他人优先用昵称缓存，未命中时 fire-and-forget 拉取，下次可用
+                if (qq && qq === String(this.config.selfId)) {
+                    return `@${this.personaName}`;
+                }
+                const nick = qq ? this.userNickCache.get(qq) : undefined;
+                if (nick) return `@${nick}(${qq})`;
+                if (qq) this.fetchUserNickname(qq).catch(() => undefined);
+                return `[CQ:at,qq=${qq}]`;
+            }
             if (seg.type === "face") {
                 const id = String(seg.data?.id ?? "");
                 const result = typeof seg.data?.result === "string" ? seg.data.result : "";

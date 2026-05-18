@@ -310,6 +310,25 @@ describe("OneBotAdapter", () => {
         nc.dispose();
     });
 
+    it("extractText rewrites @self to @personaName, others use nickname cache with CQ fallback", () => {
+        const nc = makeNC();
+        const adapter = new OneBotAdapter(makeConfig(), nc, undefined, "赛博群友");
+        // 预填一个其他用户的昵称缓存，验证缓存路径
+        // @ts-expect-error - 私有字段，测试需要
+        adapter.userNickCache.set("999", "张三");
+        // @ts-expect-error - 私有方法，验证渲染逻辑
+        const out = adapter["extractText"]([
+            { type: "at", data: { qq: "123456789" } },   // 自己
+            { type: "text", data: { text: " 在吗，告诉 " } },
+            { type: "at", data: { qq: "999" } },          // 缓存命中
+            { type: "text", data: { text: " 和 " } },
+            { type: "at", data: { qq: "777" } },          // 缓存未命中
+            { type: "text", data: { text: " 一声" } },
+        ]);
+        assert.equal(out, "@赛博群友 在吗，告诉 @张三(999) 和 [CQ:at,qq=777] 一声");
+        nc.dispose();
+    });
+
     it("getMessage strips envelope only once (no double .data unwrap)", async () => {
         const nc = makeNC();
         const adapter = new OneBotAdapter(makeConfig(), nc);

@@ -420,7 +420,12 @@ async function main(): Promise<void> {
     }
 
     if (appConfig.onebot) {
-        const onebotAdapter = new OneBotAdapter(appConfig.onebot, nc, sharedMediaDownloader);
+        const onebotAdapter = new OneBotAdapter(
+            appConfig.onebot,
+            nc,
+            sharedMediaDownloader,
+            appConfig.persona?.name ?? "赛博群友",
+        );
         adapters.push(onebotAdapter);
     }
 
