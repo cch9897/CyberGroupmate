@@ -451,10 +451,10 @@ export class GlobalState {
             schedulerEvents: Array.isArray(obj.schedulerEvents) ? obj.schedulerEvents : def.schedulerEvents,
             memos: Array.isArray(obj.memos) ? obj.memos as MemoEntry[] : def.memos,
             sessionDigests: Array.isArray(obj.sessionDigests) ? obj.sessionDigests as SessionDigestEntry[] : def.sessionDigests,
-            metaSessionHistory: Array.isArray(obj.metaSessionHistory) ? obj.metaSessionHistory as MetaSessionHistoryEntry[] : def.metaSessionHistory,
+            metaSessionHistory: Array.isArray(obj.metaSessionHistory) ? sanitizeMetaSessionHistory(obj.metaSessionHistory as MetaSessionHistoryEntry[]) : def.metaSessionHistory,
             signalPool: Array.isArray(obj.signalPool) ? obj.signalPool as SignalPoolItem[] : def.signalPool,
             wakeConditions: Array.isArray(obj.wakeConditions) ? obj.wakeConditions as WakeConditionRecord[] : def.wakeConditions,
-            dispatchedSubagentTasks: Array.isArray(obj.dispatchedSubagentTasks) ? obj.dispatchedSubagentTasks as DispatchedSubagentTaskRecord[] : def.dispatchedSubagentTasks,
+            dispatchedSubagentTasks: Array.isArray(obj.dispatchedSubagentTasks) ? sanitizeDispatchedTasks(obj.dispatchedSubagentTasks as DispatchedSubagentTaskRecord[]) : def.dispatchedSubagentTasks,
         };
     }
 
@@ -469,4 +469,20 @@ export class GlobalState {
             dispatchedSubagentTasks: [],
         };
     }
+}
+
+function sanitizeDispatchedTasks(tasks: DispatchedSubagentTaskRecord[]): DispatchedSubagentTaskRecord[] {
+    return tasks
+        .filter((task) => task && typeof task.taskId === "string" && typeof task.chatId === "string")
+        .map((task) => {
+            const { context: _legacyContext, ...rest } = task as DispatchedSubagentTaskRecord & { context?: unknown };
+            return rest;
+        });
+}
+
+function sanitizeMetaSessionHistory(messages: MetaSessionHistoryEntry[]): MetaSessionHistoryEntry[] {
+    return messages.filter((message) => {
+        const content = String(message?.content ?? "");
+        return !/\bcontext\s*:/.test(content) && !/dispatchContext/.test(content);
+    });
 }

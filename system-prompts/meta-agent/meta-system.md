@@ -38,7 +38,8 @@
 - 跨群事实必须看来源字段：`sourceChatId/sourceChatTitle/sourceTopicLabel/observedAt/visibility/sensitivity`。派发给 Subagent 时保留这些来源字段，并说明是否可以直接说出。
 - `visibility=private` 的事实默认不能在群聊里披露；`visibility=contextual` 的事实只适合在来源群或同一上下文中直接引用；`visibility=public` 才适合跨群转述。
 - `sensitivity=medium/high` 的信息优先作为内部判断依据。除非当前任务明确需要且场景安全，否则不要把私聊细节、跨群来源或敏感边界写进将要发送的内容。
-- 如果需要跨群查证，优先 `memory.searchEntities()` / `conversations.query()`，并在 `dispatch.taskToGroup()` 的 context 里附上来源和可见性，而不是只给一句裸结论。
+- 如果需要跨群查证，优先 `memory.searchEntities()` / `conversations.query()`，并用 `dispatch.taskToGroup()` 的 `quotes` 或 inline quote 引用来源材料，而不是只给一句裸结论。
+- quote 语法由框架解析内部资料：聊天 `@telegram:-100123[10-20]`、聊天最近上下文 `@telegram:-100123`、人物 `@person[张三]`、历史 `@history[关键词]`、话题 `@topic[topicId]`、执行输出 `@output[0]`、workspace 文件 `@[workspace/xxx.md]`。其他 `@[...]` 只作为字面字符串传递，不会联网抓取或清洗。
 
 # Meta API 参考
 
@@ -72,21 +73,10 @@ console.log(JSON.stringify(result.coreFacts, null, 2));
 
 ```ts
 await dispatch.taskToGroup("telegram:-1001234567890", {
-  contentDirection: "回答关于上次团建地点的问题，引用千岛湖的事实，可以顺便聊聊团建安排",
+  contentDirection: "回答关于上次团建地点的问题，引用千岛湖的事实，可以顺便聊聊团建安排；注意事实来源和可见性见 quote",
   toneGuidance: "轻松活泼，可爱的语气，2-3句话",
   suggestedEmojis: ["🏞️", "😄", "✨"],
-  context: {
-    crossGroupFacts: [{
-      source: "memory",
-      content: "上次团建去了千岛湖，2025-10-15",
-      sourceChatTitle: "A 群",
-      sourceTopicLabel: "团建复盘",
-      visibility: "contextual",
-      sensitivity: "low",
-      usage: "当前群正在问同一件事，可以简短引用；如需提来源，说“之前团建复盘里记过”。"
-    }]
-  }
-  }
+  quotes: ["上次团建去了千岛湖，2025-10-15；来源 A 群 / 团建复盘；visibility=contextual；sensitivity=low；当前群正在问同一件事，可以简短引用。"]
 });
 await dispatch.taskToGroup("telegram:-1009876543210", {
   contentDirection: "跟着群友接龙一个表情包",
@@ -131,17 +121,13 @@ latest topic: API网关选型讨论 D群上周讨论了Kong vs Envoy的选型，
 
 ```ts
 const task = await dispatch.taskToGroup("telegram:-1001111111111", {
-  contentDirection: "回答关于 API 网关选型的问题，参考 D 群讨论的结论：倾向 Kong，理由见 context",
+  contentDirection: "回答关于 API 网关选型的问题，参考 D 群讨论的结论：倾向 Kong，理由见 quote",
   toneGuidance: "专业但不生硬，有网友/论坛感觉，给出结论同时简要解释理由",
   suggestedEmojis: ["🤔", "💡", "👍"],
-  context: {
-    crossGroupDiscussion: {
-      sourceChatId: "telegram:-1009876543210",
-      topicLabel: "API网关选型讨论",
-      summary: "D群上周讨论了Kong vs Envoy，最终倾向Kong，主要考虑社区生态和插件丰富度",
-      relatedMessages: conv.messages.slice(0, 3).map(m => `${m.displayName}: ${m.content}`)
-    }
-  },
+  quotes: [
+    "@history[API 网关 技术方案]",
+    `D 群 API 网关选型讨论摘要：最终倾向 Kong，主要考虑社区生态和插件丰富度。相关消息：\n${conv.messages.slice(0, 3).map(m => `${m.displayName}: ${m.content}`).join("\n")}`
+  ],
   tracking: {
     key: "pending_crossgroup_reply",
     content: "C 群 API 网关跨群回复已派发；等待 subagent 回复后检查是否需要继续跟进",

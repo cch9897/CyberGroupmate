@@ -19,7 +19,123 @@ function makeImageFile(): { dir: string; path: string; bytes: Buffer } {
     return { dir, path, bytes };
 }
 
+function makeIncomingMessage(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+        id: "message-1",
+        content: "hello",
+        createdAt: new Date("2026-05-20T00:00:00.000Z"),
+        system: false,
+        author: {
+            id: "sender-1",
+            username: "sender",
+            displayName: "Sender",
+        },
+        member: {
+            displayName: "Sender",
+        },
+        channel: {
+            id: "channel-1",
+            name: "general",
+            isDMBased: () => false,
+        },
+        guild: {
+            id: "guild-1",
+            name: "Guild",
+        },
+        mentions: {
+            has: () => false,
+            members: { get: () => undefined },
+            users: { get: () => undefined },
+        },
+        attachments: { size: 0 },
+        embeds: [],
+        ...overrides,
+    };
+}
+
 describe("DiscordAdapter", () => {
+    it("should append known display names to inbound Discord user mentions", () => {
+        const nc = makeNC();
+        const adapter = new DiscordAdapter({ botToken: "token" }, nc, {
+            getPersonIdentity(userId: string) {
+                assert.equal(userId, "discord:1485835320535810058");
+                return { displayName: "Miu" } as any;
+            },
+        });
+
+        try {
+            const normalized = (adapter as any).normalizeIncomingMessage(makeIncomingMessage({
+                content: "<@1485835320535810058> 试试去搜一下",
+            }));
+
+            assert.equal(normalized.text, "<@1485835320535810058>(Miu) 试试去搜一下");
+        } finally {
+            nc.dispose();
+        }
+    });
+
+    it("should fall back to Discord mention metadata when memory has no display name", () => {
+        const nc = makeNC();
+        const adapter = new DiscordAdapter({ botToken: "token" }, nc, {
+            getPersonIdentity() {
+                return null;
+            },
+        });
+
+        try {
+            const normalized = (adapter as any).normalizeIncomingMessage(makeIncomingMessage({
+                content: "ping <@123456789012345678>",
+                mentions: {
+                    has: () => false,
+                    members: { get: () => ({ displayName: "Orion" }) },
+                    users: { get: () => ({ username: "orion-zhen" }) },
+                },
+            }));
+
+            assert.equal(normalized.text, "ping <@123456789012345678>(Orion)");
+        } finally {
+            nc.dispose();
+        }
+    });
+
+    it("should strip mention display labels before sending text", async () => {
+        const nc = makeNC();
+        const adapter = new DiscordAdapter({ botToken: "token" }, nc);
+        let sentOptions: Record<string, unknown> | undefined;
+
+        (adapter as any).client = {
+            channels: {
+                async fetch(id: string) {
+                    assert.equal(id, "channel-1");
+                    return {
+                        id: "channel-1",
+                        isTextBased: () => true,
+                        async send(opts: Record<string, unknown>) {
+                            sentOptions = opts;
+                            return {
+                                id: "msg-text-1",
+                                content: opts.content,
+                                channel: { id: "channel-1" },
+                                createdAt: new Date("2026-05-20T00:00:00.000Z"),
+                            };
+                        },
+                    };
+                },
+            },
+        };
+
+        try {
+            await adapter.handleCall("discord.sendText", [
+                "discord:channel-1",
+                "<@1485835320535810058>(Miu) 收到",
+            ]);
+
+            assert.equal(sentOptions?.content, "<@1485835320535810058> 收到");
+        } finally {
+            nc.dispose();
+        }
+    });
+
     it("should fall back from a user id to a DM channel and upload local files as buffers", async () => {
         const nc = makeNC();
         const adapter = new DiscordAdapter({ botToken: "token" }, nc);
@@ -104,7 +220,7 @@ describe("DiscordAdapter", () => {
             fetchCalls.push({ input, init });
             return new Response(JSON.stringify({
                 id: "msg-2",
-                content: "caption from opts",
+                content: "<@123456789012345678> caption from opts",
                 channel_id: "channel-1",
                 timestamp: "2026-05-04T00:00:00.000Z",
             }), { status: 200, headers: { "content-type": "application/json" } });
@@ -124,14 +240,14 @@ describe("DiscordAdapter", () => {
             await adapter.handleCall("discord.sendMedia", [
                 "discord:channel-1",
                 image.path,
-                { caption: "caption from opts" },
+                { caption: "<@123456789012345678>(Alice) caption from opts" },
             ]);
 
             assert.equal(fetchCalls.length, 1);
             assert.equal(String(fetchCalls[0].input), "https://discord.com/api/v10/channels/channel-1/messages");
             const form = fetchCalls[0].init?.body as FormData;
             const payload = JSON.parse(String(form.get("payload_json")));
-            assert.equal(payload.content, "caption from opts");
+            assert.equal(payload.content, "<@123456789012345678> caption from opts");
             assert.deepEqual(payload.attachments, [{ id: "0", filename: "image.jpg" }]);
             const uploadedFile = form.get("files[0]") as unknown as { name: string; arrayBuffer: () => Promise<ArrayBuffer> };
             assert.equal(uploadedFile.name, "image.jpg");

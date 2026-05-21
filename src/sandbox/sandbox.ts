@@ -59,6 +59,11 @@ export interface ExecutionResult {
     error: boolean;
 }
 
+export interface SandboxExecuteOptions {
+    /** CodeAct session/task scope. When set, JS top-level variables persist within that scope. */
+    scopeId?: string;
+}
+
 /** Worker → Host 消息 */
 interface WorkerMessage {
     type: "result" | "notify" | "input_request" | "print" | "host_call";
@@ -558,7 +563,7 @@ export class Sandbox extends EventEmitter {
     /**
      * 在 sandbox 中执行代码
      */
-    async execute(code: string, timeout: number = 30000): Promise<ExecutionResult> {
+    async execute(code: string, timeout: number = 30000, options?: SandboxExecuteOptions): Promise<ExecutionResult> {
         if (!this.child || !this.child.stdin) {
             throw new Error("Sandbox worker is not running");
         }
@@ -586,7 +591,34 @@ export class Sandbox extends EventEmitter {
 
             this.pendingRequests.set(id, { resolve, reject, timer });
 
-            const msg = JSON.stringify({ type: "execute", id, code });
+            const msg = JSON.stringify({
+                type: "execute",
+                id,
+                code,
+                ...(options?.scopeId ? { scopeId: options.scopeId } : {}),
+            });
+            this.child!.stdin!.write(msg + "\n");
+        });
+    }
+
+    /**
+     * 清理一个 CodeAct task-scoped notebook namespace。
+     */
+    async resetNotebookScope(scopeId: string, timeout: number = 5000): Promise<void> {
+        if (!this.child || !this.child.stdin) {
+            throw new Error("Sandbox worker is not running");
+        }
+
+        const id = `req_${++this.requestCounter}`;
+        await new Promise<ExecutionResult>((resolve, reject) => {
+            const timer = setTimeout(() => {
+                this.pendingRequests.delete(id);
+                reject(new Error(`Notebook scope reset timed out after ${timeout}ms`));
+            }, timeout);
+
+            this.pendingRequests.set(id, { resolve, reject, timer });
+
+            const msg = JSON.stringify({ type: "reset_scope", id, scopeId });
             this.child!.stdin!.write(msg + "\n");
         });
     }

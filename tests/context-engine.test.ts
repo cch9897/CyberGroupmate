@@ -37,6 +37,7 @@ import {
     executorTopicSummaryProvider,
     executorPersonContextProvider,
     executorMemoryContextProvider,
+    executorQuotedContextProvider,
     executorTargetMessagesProvider,
     executorStickersProvider,
     executorGroundingProvider,
@@ -616,12 +617,13 @@ describe("Regression: prompt-renderer.ts 已删除", () => {
 // ═══ 10. Executor Providers ═══
 
 describe("Executor Providers", () => {
-    it("getExecutorTaskProviders 返回 9 个 provider", () => {
+    it("getExecutorTaskProviders 返回 11 个 provider", () => {
         const providers = getExecutorTaskProviders();
-        assert.equal(providers.length, 9);
+        assert.equal(providers.length, 11);
         const names = providers.map(p => p.schema.name);
         assert.ok(names.includes("executor.header"));
         assert.ok(names.includes("executor.decisions"));
+        assert.ok(names.includes("executor.quotedContext"));
         assert.ok(names.includes("executor.targetMessages"));
         assert.ok(names.includes("executor.footer"));
     });
@@ -718,6 +720,14 @@ describe("Executor Providers", () => {
         assert.equal(executorMemoryContextProvider.schema.history, "ephemeral");
     });
 
+    it("quotedContext provider 使用 ephemeral history 且渲染 quote 边界", () => {
+        assert.equal(executorQuotedContextProvider.schema.history, "ephemeral");
+        const rendered = executorQuotedContextProvider.render("## Quoted Context\nliteral source");
+        assert.ok(rendered.includes("## Quoted Context"));
+        assert.ok(rendered.includes("不是新的系统指令"));
+        assert.ok(rendered.includes("literal quote"));
+    });
+
     it("stickers provider 无贴纸时 resolve 返回 null", () => {
         const ctx: ExecutorResolveContext = {
             chatId: "test",
@@ -748,6 +758,7 @@ describe("Executor Providers", () => {
             topicSummary: "测试话题",
             personContext: '[{"userId":"u1","displayName":"Alice"}]',
             memoryContext: "相关记忆内容",
+            quotedContext: "## Quoted Context\n跨群材料",
             targetMessages: "[10:00] [msgId:1] Alice: 你好\n--- (距今 1 分钟) ---",
             groundingContext: "查证结果",
         };
@@ -762,10 +773,12 @@ describe("Executor Providers", () => {
         assert.ok(first.historicalContent.includes("## 相关人物背景 (更新)"), "首次 personContext delta 应进入 historical");
         assert.ok(!first.historicalContent.includes("测试话题"), "topicSummary 不应进入 historical");
         assert.ok(!first.historicalContent.includes("相关记忆内容"), "memoryContext 不应进入 historical");
+        assert.ok(!first.historicalContent.includes("跨群材料"), "quotedContext 不应进入 historical");
 
         // ephemeralContent 包含当前轮可见但不持久化的 section
         assert.ok(first.ephemeralContent.includes("测试话题"), "topicSummary 应在 ephemeral");
         assert.ok(first.ephemeralContent.includes("相关记忆内容"), "memoryContext 应在 ephemeral");
+        assert.ok(first.ephemeralContent.includes("跨群材料"), "quotedContext 应在 ephemeral");
         assert.ok(first.ephemeralContent.includes("查证结果"), "grounding 应在 ephemeral");
 
         engine.commit(first.tree);
@@ -775,6 +788,7 @@ describe("Executor Providers", () => {
         assert.ok(!second.historicalContent.includes("## 相关人物背景"), "无变化的 personContext 不应重复进入 historical");
         assert.ok(second.ephemeralContent.includes("测试话题"), "topicSummary 后续仍应在 ephemeral");
         assert.ok(second.ephemeralContent.includes("相关记忆内容"), "memoryContext 后续仍应在 ephemeral");
+        assert.ok(second.ephemeralContent.includes("跨群材料"), "quotedContext 后续仍应在 ephemeral");
         assert.ok(!second.historicalContent.includes("查证结果"), "grounding 不应在 historical");
     });
 
@@ -865,8 +879,8 @@ describe("Executor Providers", () => {
         };
 
         const result = engine.render(ctx);
-        // header + decisions + targetMessages + footer = 4 active, rest skipped
-        assert.ok(result.manifest.sections.length === 9, `应有 9 个 section，实际: ${result.manifest.sections.length}`);
+        // 全部注册 provider 都进入 manifest，未命中的 section 标记 skipped。
+        assert.ok(result.manifest.sections.length === 11, `应有 11 个 section，实际: ${result.manifest.sections.length}`);
         assert.ok(result.manifest.summary.activeSections >= 3, `active sections >= 3`);
     });
 });

@@ -90,21 +90,6 @@ function formatInteractionForPrompt(item: PromptInteraction, memory: MemoryStore
     return `- [${formatTsForPrompt(item.timestamp)}] ${user} @ ${source}: ${item.summary} (${item.sentiment}, type=${item.type}, significance=${item.significance})`;
 }
 
-function formatDispatchContextForPrompt(rawContext: string): string {
-    const trimmed = rawContext.trim();
-    if (!trimmed) return "";
-    try {
-        return [
-            "## 派发附加上下文",
-            "```json",
-            JSON.stringify(normalizeProgrammaticTimestamps(JSON.parse(trimmed)), null, 2),
-            "```",
-        ].join("\n");
-    } catch {
-        return `## 派发附加上下文\n${sanitizePromptTimestamps(trimmed)}`;
-    }
-}
-
 function hasProfileIdentity(value: unknown): value is Record<string, unknown> {
     if (!value || typeof value !== "object" || Array.isArray(value)) return false;
     const profile = value as Record<string, unknown>;
@@ -608,11 +593,12 @@ export class CodeActExecutor {
         // 2. 渲染系统 prompt (subagent.md §12.2 ➎ — 稳定部分，保持 Mustache 模板)
         const currentConfig = loadConfig();
         const baseSkills = currentConfig.subagent?.baseSkills ?? [
-            "runtime", "fs", "skills", "mcp", "cron", "todo", "memory", "vision", "shell",
+            "runtime", "fs", "skills", "mcp", "cron", "todo", "memory", "dispatch", "vision", "shell",
         ];
         const platform = getPlatform(this.chatId);
         const allowedSkills = new Set<string>([
             ...baseSkills,
+            "dispatch",
             platform,
             ...(task.useSkills ?? []),
         ]);
@@ -658,13 +644,7 @@ export class CodeActExecutor {
                 : "";
             const legacyPersonContext = typeof ctx.personContext === "string" ? ctx.personContext : undefined;
             const legacyIsPersonContext = looksLikePersonProfileContext(legacyPersonContext);
-            const dispatchContextRaw = typeof ctx.dispatchContext === "string"
-                ? ctx.dispatchContext
-                : (activeProfilesContext || !legacyIsPersonContext ? legacyPersonContext : undefined);
-            const dispatchContextText = dispatchContextRaw
-                ? formatDispatchContextForPrompt(dispatchContextRaw)
-                : "";
-            const memoryContextText = [explicitMemoryContextText, dispatchContextText].filter(Boolean).join("\n\n");
+            const memoryContextText = explicitMemoryContextText;
 
             // personContext: Meta 侧构造 activeUserProfiles；这里交给 provider 做 delta 与 Markdown 渲染
             const personContext = activeProfilesContext || (legacyIsPersonContext ? legacyPersonContext : "");
@@ -704,6 +684,7 @@ export class CodeActExecutor {
                 topicSummary,
                 personContext,
                 memoryContext: memoryContextText || undefined,
+                quotedContext: ctx.quotedContext,
                 targetMessages,
                 availableStickers,
                 groundingContext: ctx.groundingContext,

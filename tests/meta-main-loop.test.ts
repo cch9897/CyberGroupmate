@@ -190,7 +190,7 @@ describe("MainAgentLoop meta session path", () => {
                     "await dispatch.taskToGroup(\"telegram:g1\", {",
                     "  contentDirection: \"reply from meta session\",",
                     "  toneGuidance: \"calm\",",
-                    "  context: { source: \"meta-session\" },",
+                    "  quotes: [\"source: meta-session\"],",
                     "  useSkills: [\"memory\"],",
                     "});",
                     "```",
@@ -205,7 +205,7 @@ describe("MainAgentLoop meta session path", () => {
                     "await dispatch.taskToGroup(\"telegram:g1\", {",
                     "  contentDirection: \"reply from meta session\",",
                     "  toneGuidance: \"calm\",",
-                    "  context: { source: \"meta-session\" },",
+                    "  quotes: [\"source: meta-session\"],",
                     "  useSkills: [\"memory\"],",
                     "});",
                     "```",
@@ -260,7 +260,8 @@ describe("MainAgentLoop meta session path", () => {
         assert.equal(enqueuedTasks[0]?.contextSnapshot.contentDirection, "reply from meta session");
         assert.equal(enqueuedTasks[0]?.contextSnapshot.toneGuidance, "calm");
         assert.equal(enqueuedTasks[0]?.contextSnapshot.personContext, undefined);
-        assert.equal(enqueuedTasks[0]?.contextSnapshot.dispatchContext, JSON.stringify({ source: "meta-session" }));
+        assert.match(enqueuedTasks[0]?.contextSnapshot.quotedContext ?? "", /source: meta-session/);
+        assert.equal(enqueuedTasks[0]?.contextSnapshot.dispatchContext, undefined);
         assert.deepEqual(Array.from(enqueuedTasks[0]?.useSkills ?? []), ["memory"]);
         assert.equal(globalState.getSessionDigests()[0]?.content, "dispatched task to telegram:g1");
 

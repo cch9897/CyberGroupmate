@@ -296,7 +296,8 @@ export interface DispatchedSubagentTaskRecord {
     contentDirection: string;
     toneGuidance?: string;
     suggestedEmojis?: string[];
-    context?: unknown;
+    quotes?: string[];
+    quoteWarnings?: string[];
     useSkills?: string[];
     tracking?: unknown;
     status: "PENDING" | "RUNNING" | "COMPLETED" | "ERROR" | "SKIPPED" | "TIMEOUT";
@@ -400,8 +401,10 @@ export interface GroupContextPackage {
     }>;
     /** 人物背景（通常由 activeUserProfiles 序列化后交给 provider 渲染；兼容旧任务） */
     personContext?: string;
-    /** Meta 派发时附带的普通任务上下文，例如 topic/avoid，不应当作人物背景渲染 */
-    dispatchContext?: string;
+    /** Meta/Subagent 派发时通过 quote 解析出的上下文材料 */
+    quotedContext?: string;
+    /** quote 解析时产生的警告 */
+    quoteWarnings?: string[];
     /** 语气指导 */
     toneGuidance?: string;
     /** 回复方向 */

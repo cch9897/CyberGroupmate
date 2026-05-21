@@ -17,6 +17,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { Long } from "@mtcute/node";
 import { isAllowedTelegramMtcutePassthroughMethod } from "../core/telegram-mtcute-passthrough.js";
 
@@ -1067,7 +1068,7 @@ export class TelegramAdapter implements PlatformAdapter {
 
     private isFileLikeKey(key?: string): boolean {
         if (!key) return false;
-        return /^(file|thumb|thumbnail|videoCover|sticker|photo)$/i.test(key);
+        return /^(file|media|thumb|thumbnail|videoCover|sticker|photo)$/i.test(key);
     }
 
     private normalizeInlineBotResults(raw: unknown): Record<string, unknown> {
@@ -1184,14 +1185,62 @@ export class TelegramAdapter implements PlatformAdapter {
         if (typeof file !== "string") return file;
         const trimmed = file.trim();
         if (!trimmed) return file;
-        if (/^(https?:|data:|file:)/i.test(trimmed)) return trimmed;
+        if (/^(https?:|data:)/i.test(trimmed)) return trimmed;
 
-        const candidates = [
-            path.isAbsolute(trimmed) ? trimmed : path.resolve(process.cwd(), trimmed),
-            path.resolve(process.cwd(), "workspace", trimmed),
-        ];
-        const existing = candidates.find(candidate => fs.existsSync(candidate));
+        if (/^file:/i.test(trimmed)) {
+            const localPath = this.localPathFromFileUri(trimmed);
+            if (!localPath) {
+                throw new Error("mtcute 文件路径为空: file:");
+            }
+            const existing = this.resolveExistingMtcuteUploadPath(localPath, true);
+            return `file:${existing}`;
+        }
+
+        const existing = this.resolveExistingMtcuteUploadPath(trimmed, false);
         return existing ? `file:${existing}` : file;
+    }
+
+    private localPathFromFileUri(fileUri: string): string {
+        if (/^file:\/\//i.test(fileUri)) {
+            try {
+                return fileURLToPath(fileUri);
+            } catch {
+                // Fall through to the plain file: stripping path below.
+            }
+        }
+        return fileUri.replace(/^file:/i, "");
+    }
+
+    private resolveExistingMtcuteUploadPath(filePath: string, requireExists: true): string;
+    private resolveExistingMtcuteUploadPath(filePath: string, requireExists: false): string | null;
+    private resolveExistingMtcuteUploadPath(filePath: string, requireExists: boolean): string | null {
+        const candidates = this.localUploadPathCandidates(filePath);
+        const existing = candidates.find(candidate => fs.existsSync(candidate));
+        if (!existing) {
+            if (requireExists) {
+                throw new Error(`mtcute 文件不存在: ${filePath} (尝试: ${candidates.join(", ")})`);
+            }
+            return null;
+        }
+        const stat = fs.statSync(existing);
+        if (!stat.isFile()) {
+            throw new Error(`mtcute 文件路径不是文件: ${existing}`);
+        }
+        try {
+            fs.accessSync(existing, fs.constants.R_OK);
+        } catch (err) {
+            const reason = err instanceof Error ? err.message : String(err);
+            throw new Error(`mtcute 文件不可读: ${existing}: ${reason}`);
+        }
+        return existing;
+    }
+
+    private localUploadPathCandidates(filePath: string): string[] {
+        const candidates = [
+            path.isAbsolute(filePath) ? path.resolve(filePath) : path.resolve(process.cwd(), filePath),
+            path.resolve(process.cwd(), "workspace", filePath),
+        ];
+        return [...new Set(candidates)];
     }
 
     private normalizeStoryReaction(reaction: unknown): unknown {

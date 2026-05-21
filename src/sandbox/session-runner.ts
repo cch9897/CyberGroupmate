@@ -390,6 +390,7 @@ export async function runCodeActSession(
         });
     }
 
+    try {
     for (let turnNum = 0; turnNum < effectiveMaxTurns; turnNum++) {
         // ─── 层 2: turn 间消息注入 ───
         if (pendingMessagesDrain) {
@@ -542,7 +543,7 @@ export async function runCodeActSession(
             const remaining = effectiveMaxTurns - currentTurn;
             let turnStatus = `[📊 轮次状态: 第 ${currentTurn}/${effectiveMaxTurns} 轮，剩余 ${remaining} 轮]`;
             if (turnNum === 0) {
-                turnStatus += `\n[💡 每轮代码在独立作用域执行，局部变量不跨轮次保留。需要跨轮次传递的状态请存入 ctx 对象]`;
+                turnStatus += `\n[💡 JS 顶层变量和函数会在本次 task 的 turn 间保留；task 结束后清理。需要跨 task / remind 保留的状态请存入 ctx 对象]`;
             }
             if (remaining === 0) {
                 turnStatus += `\n[⚠ 这是最后一轮，请确保在本轮内完成所有必要操作并发送最终回复]`;
@@ -713,7 +714,7 @@ ${fullDocs}
             try {
                 const result = block.lang === "bash"
                     ? await sandbox.executeShell(block.code, effectiveExecuteTimeout)
-                    : await sandbox.execute(block.code, effectiveExecuteTimeout);
+                    : await sandbox.execute(block.code, effectiveExecuteTimeout, { scopeId: sessionId });
                 turn.executionResults.push(result);
 
                 // Debug: 输出执行结果
@@ -795,7 +796,7 @@ ${fullDocs}
         const remaining = effectiveMaxTurns - currentTurn;
         let turnStatus = `[📊 轮次状态: 第 ${currentTurn}/${effectiveMaxTurns} 轮，剩余 ${remaining} 轮]`;
         if (turnNum === 0) {
-            turnStatus += `\n[💡 每轮代码在独立作用域执行，局部变量不跨轮次保留。需要跨轮次传递的状态请存入 ctx 对象]`;
+            turnStatus += `\n[💡 JS 顶层变量和函数会在本次 task 的 turn 间保留；task 结束后清理。需要跨 task / remind 保留的状态请存入 ctx 对象]`;
         }
         if (remaining === 0) {
             turnStatus += `\n[⚠ 这是最后一轮，请确保在本轮内完成所有必要操作并发送最终回复]`;
@@ -875,6 +876,13 @@ ${fullDocs}
         messages,
         endReason: "max_turns",
     };
+    } finally {
+        if (sandbox.isAlive()) {
+            await sandbox.resetNotebookScope(sessionId).catch((err) => {
+                log.warn("清理 notebook scope 失败", { sessionId, error: String(err) });
+            });
+        }
+    }
 }
 
 /**

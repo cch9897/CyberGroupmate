@@ -110,7 +110,7 @@
       if (config.subagent.postTaskWindowMs == null) config.subagent.postTaskWindowMs = 120000;
       if (!config.subagent.metaHistory) config.subagent.metaHistory = {};
       if (!config.subagent.baseSkills) config.subagent.baseSkills = [
-        "runtime", "fs", "skills", "mcp", "cron", "todo", "memory", "vision", "shell",
+        "runtime", "fs", "skills", "mcp", "cron", "todo", "memory", "dispatch", "vision", "shell",
       ];
       if (!config.llmRouting) config.llmRouting = {};
       if (!config.llmRouting.timeouts) config.llmRouting.timeouts = {};
@@ -332,7 +332,7 @@
   }
   function resetBaseSkills() {
     config.subagent.baseSkills = [
-      "runtime", "fs", "skills", "mcp", "cron", "todo", "memory", "vision", "shell",
+      "runtime", "fs", "skills", "mcp", "cron", "todo", "memory", "dispatch", "vision", "shell",
     ];
     config = config;
   }

@@ -9,6 +9,11 @@ import type { GlobalState } from "../../main-agent/global-state.js";
 import type { SubagentManager } from "../../subagent/subagent-manager.js";
 import { getGroupModelKey } from "../../core/chat-id.js";
 import { toUnixTimestampMs } from "../../core/timezone.js";
+import {
+    collectQuoteRefs,
+    resolveQuoteRefs,
+    type QuoteExecutionOutput,
+} from "./quotes.js";
 
 export interface DispatchTrackingSpec {
     key?: string;
@@ -22,7 +27,7 @@ export interface DispatchTaskSpec {
     contentDirection: string;
     toneGuidance?: string;
     suggestedEmojis?: string[];
-    context?: unknown;
+    quotes?: string[];
     useSkills?: string[];
     tracking?: DispatchTrackingSpec;
 }
@@ -68,7 +73,8 @@ export interface DispatchApiDeps {
         "addReminder" |
         "recordDispatchedSubagentTask" |
         "getDispatchedSubagentTask" |
-        "listDispatchedSubagentTasks"
+        "listDispatchedSubagentTasks" |
+        "getSessionDigests"
     >;
     accumulator: AttentionAccumulator;
     onTaskDispatched?: (task: CodeActReplyTask) => void | Promise<void>;
@@ -77,6 +83,8 @@ export interface DispatchApiDeps {
         config: GroundingConfig,
         messagesText: string,
     ) => Promise<string | undefined>;
+    getQuoteOutput?: (index: number) => QuoteExecutionOutput | null | undefined;
+    workspaceRoot?: string;
     executorFactory?: (chatId: string) => ExecutorLike;
     initializeExecutor?: (executor: ExecutorLike, chatId: string) => void | Promise<void>;
     taskIdFactory?: () => string;
@@ -86,10 +94,19 @@ export interface DispatchApiDeps {
 export function createDispatchApi(deps: DispatchApiDeps) {
     return {
         taskToGroup: async (chatId: string, taskSpec: DispatchTaskSpec): Promise<DispatchTaskResult> => {
+            assertNoLegacyContext(taskSpec);
             const subagent = deps.subagentManager.getOrCreate(chatId) as SubagentLike;
             const executor = await ensureExecutor(subagent, chatId, deps);
             const taskId = deps.taskIdFactory?.() ?? shortUuid();
             const groundingContext = await maybeRunGrounding(deps, taskSpec.contentDirection);
+            const contextSnapshot = await buildDispatchContext(
+                deps.memory,
+                chatId,
+                taskSpec,
+                groundingContext,
+                deps.getActiveUserProfilesForChat?.(chatId),
+                deps,
+            );
 
             const task: CodeActReplyTask = {
                 type: "CODEACT_REPLY",
@@ -103,13 +120,7 @@ export function createDispatchApi(deps: DispatchApiDeps) {
                     confidence: 1.0,
                     reason: "Meta-CodeAct dispatch",
                 }],
-                contextSnapshot: buildDispatchContext(
-                    deps.memory,
-                    chatId,
-                    taskSpec,
-                    groundingContext,
-                    deps.getActiveUserProfilesForChat?.(chatId),
-                ),
+                contextSnapshot,
                 replyMode: "SINGLE",
                 useSkills: taskSpec.useSkills,
                 createdAt: new Date().toISOString(),
@@ -120,7 +131,8 @@ export function createDispatchApi(deps: DispatchApiDeps) {
                 chatId,
                 contentDirection: taskSpec.contentDirection,
                 toneGuidance: taskSpec.toneGuidance,
-                context: taskSpec.context,
+                quotes: taskSpec.quotes,
+                quoteWarnings: contextSnapshot.quoteWarnings,
                 suggestedEmojis: taskSpec.suggestedEmojis,
                 useSkills: taskSpec.useSkills,
                 tracking: taskSpec.tracking,
@@ -150,6 +162,12 @@ export function createDispatchApi(deps: DispatchApiDeps) {
             };
         },
     };
+}
+
+function assertNoLegacyContext(taskSpec: DispatchTaskSpec): void {
+    if (taskSpec && typeof taskSpec === "object" && "context" in (taskSpec as unknown as Record<string, unknown>)) {
+        throw new Error("dispatch.taskToGroup 已移除 taskSpec.context；请使用 quotes 或在 contentDirection/toneGuidance 中写 quote 引用。");
+    }
 }
 
 function toPromptTaskStatus(task: DispatchedSubagentTaskRecord): DispatchedTaskStatusForPrompt {
@@ -202,16 +220,18 @@ async function maybeRunGrounding(
     return runner(deps.groundingConfig, contentDirection);
 }
 
-function buildDispatchContext(
+async function buildDispatchContext(
     memory: MemoryStoreV2,
     chatId: string,
     taskSpec: DispatchTaskSpec,
     groundingContext?: string,
     activeUserProfiles?: ActiveUserProfile[],
-): GroupContextPackage {
+    deps?: Pick<DispatchApiDeps, "globalState" | "getQuoteOutput" | "workspaceRoot">,
+): Promise<GroupContextPackage> {
     const groupModel = typeof memory.getGroupModel === "function"
         ? memory.getGroupModel(getGroupModelKey(chatId))
         : null;
+    const quoteContext = await resolveDispatchQuoteContext(memory, taskSpec, deps);
     return {
         depth: 2,
         chatId,
@@ -222,11 +242,33 @@ function buildDispatchContext(
         chatTitle: groupModel?.chatTitle,
         isDirectMessage: groupModel?.isDirectMessage,
         activeUserProfiles: activeUserProfiles && activeUserProfiles.length > 0 ? activeUserProfiles : undefined,
-        dispatchContext: taskSpec.context ? JSON.stringify(taskSpec.context) : undefined,
+        quotedContext: quoteContext.renderedMarkdown,
+        quoteWarnings: quoteContext.warnings.length > 0 ? quoteContext.warnings : undefined,
         toneGuidance: taskSpec.toneGuidance,
         contentDirection: taskSpec.contentDirection,
         groundingContext,
     };
+}
+
+async function resolveDispatchQuoteContext(
+    memory: MemoryStoreV2,
+    taskSpec: DispatchTaskSpec,
+    deps?: Pick<DispatchApiDeps, "globalState" | "getQuoteOutput" | "workspaceRoot">,
+) {
+    const refs = collectQuoteRefs({
+        contentDirection: taskSpec.contentDirection,
+        toneGuidance: taskSpec.toneGuidance,
+        quotes: taskSpec.quotes,
+    });
+    if (refs.length === 0) {
+        return { items: [], warnings: [], renderedMarkdown: undefined };
+    }
+    return resolveQuoteRefs(refs, {
+        memory,
+        globalState: deps?.globalState,
+        getOutput: deps?.getQuoteOutput,
+        workspaceRoot: deps?.workspaceRoot,
+    });
 }
 
 function recordDispatchTracking(

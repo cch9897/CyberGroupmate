@@ -1,9 +1,69 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createDispatchApi } from "../src/meta-sandbox/meta-api/dispatch.js";
+import { collectQuoteRefs, resolveQuoteRefs } from "../src/meta-sandbox/meta-api/quotes.js";
+
+describe("quote refs", () => {
+    it("parses framework-owned refs and keeps external refs as literal strings", async () => {
+        const refs = collectQuoteRefs({
+            contentDirection: "搬运 @telegram:-1001[10-12] 给 @person[阿喵 in telegram:-1001]",
+            quotes: [
+                "@[workspace/notes.md]",
+                "@[https://example.com/page]",
+                "人工整理：外部网页需要 agent 自己抓取。",
+                "manual note around @telegram:-1002",
+            ],
+        });
+
+        assert.deepEqual(refs.map(ref => ref.kind), [
+            "chat_range",
+            "person",
+            "workspace_file",
+            "literal",
+            "literal",
+            "literal",
+        ]);
+        assert.equal(refs[3]?.raw, "@[https://example.com/page]");
+        assert.equal((refs[3] as any).text, "https://example.com/page");
+        assert.equal((refs[5] as any).text, "manual note around @telegram:-1002");
+
+        const resolved = await resolveQuoteRefs([
+            { kind: "output", raw: "@output[0]", index: 0, source: "test" },
+            refs[3]!,
+        ], {
+            memory: {} as any,
+            getOutput: () => ({
+                index: 0,
+                output: "上一步执行结果",
+                timestamp: "2026-05-21T00:00:00.000Z",
+                source: "meta.execute",
+            }),
+        });
+
+        assert.match(resolved.renderedMarkdown ?? "", /Execution Output #0/);
+        assert.match(resolved.renderedMarkdown ?? "", /上一步执行结果/);
+        assert.match(resolved.renderedMarkdown ?? "", /https:\/\/example\.com\/page/);
+    });
+});
 
 describe("createDispatchApi", () => {
-    it("builds and enqueues a CodeActReplyTask with serialized context and grounding", async () => {
+    it("rejects the removed legacy context field", async () => {
+        const api = createDispatchApi({
+            memory: {} as any,
+            subagentManager: {} as any,
+            accumulator: {} as any,
+        });
+
+        await assert.rejects(
+            () => api.taskToGroup("telegram:1", {
+                contentDirection: "reply",
+                context: { facts: ["legacy"] },
+            } as any),
+            /已移除 taskSpec\.context/,
+        );
+    });
+
+    it("builds and enqueues a CodeActReplyTask with quoted context and grounding", async () => {
         const enqueued: any[] = [];
         const marked: string[] = [];
         const dispatched: string[] = [];
@@ -47,12 +107,15 @@ describe("createDispatchApi", () => {
                     messageCount: 1,
                 }]
                 : undefined,
+            getQuoteOutput: (index) => index === 0
+                ? { index, output: "facts: x", timestamp: "2026-05-21T00:00:00.000Z" }
+                : undefined,
         });
 
         const result = await api.taskToGroup("telegram:1", {
             contentDirection: "reply with a concise answer",
             toneGuidance: "calm",
-            context: { facts: ["x"] },
+            quotes: ["@output[0]"],
             useSkills: ["memory", "telegram"],
         });
 
@@ -66,7 +129,9 @@ describe("createDispatchApi", () => {
         assert.equal(enqueued[0].contextSnapshot.toneGuidance, "calm");
         assert.equal(enqueued[0].contextSnapshot.groundingContext, "grounded");
         assert.equal(enqueued[0].contextSnapshot.personContext, undefined);
-        assert.equal(enqueued[0].contextSnapshot.dispatchContext, JSON.stringify({ facts: ["x"] }));
+        assert.match(enqueued[0].contextSnapshot.quotedContext, /Execution Output #0/);
+        assert.match(enqueued[0].contextSnapshot.quotedContext, /facts: x/);
+        assert.equal(enqueued[0].contextSnapshot.dispatchContext, undefined);
         assert.equal(enqueued[0].contextSnapshot.activeUserProfiles[0].userId, "telegram:u1");
         assert.deepEqual(enqueued[0].useSkills, ["memory", "telegram"]);
     });

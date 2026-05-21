@@ -14,6 +14,13 @@ discord.d.ts — Discord 平台 API 系统注入的 Discord host proxy 接口。
 - `sendMedia`: 发送媒体消息（附件）到指定频道。支持 URL 和本地文件路径（支持绝对路径或基于 cwd 工作区的相对路径）。
 - `sendTyping`: 在频道中显示 "正在输入..." 状态。
 
+## dispatch
+dispatch.d.ts — Subagent 任务派发 API 当前 Subagent 可以把任务派发给另一个群/私聊绑定的 Subagent。 派发后目标 Subagent 会收到同一套 quote 解析后的任务上下文。
+
+- `taskToGroup`: 向指定群组派发一个任务，由目标群的 Subagent 执行回复、reaction 或其他群内行动。 chatId 必须使用 composite chatId，例如 "telegram:-1001234567890"。 当前 Subagent 不能用 dispatch 给自己派任务；当前群内行动直接调用平台 API。 不要使用已废弃的 context 字段；需要搬运材料时写 quotes 或 inline quote。
+- `getTask`: 查询已派发任务的状态与执行结果；不存在时返回 null。
+- `listTasks`: 列出已派发任务，可按 chatId/status 分页过滤。
+
 ## fs
 filesystem.d.ts — 文件系统操作模块类型定义 所有路径操作限定在 workspace/ 目录下。 支持相对路径（相对于 workspace/）和绝对路径。
 

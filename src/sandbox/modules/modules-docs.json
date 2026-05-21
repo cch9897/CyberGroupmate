@@ -42,6 +42,28 @@
     ]
   },
   {
+    "name": "dispatch",
+    "description": "dispatch.d.ts — Subagent 任务派发 API 当前 Subagent 可以把任务派发给另一个群/私聊绑定的 Subagent。 派发后目标 Subagent 会收到同一套 quote 解析后的任务上下文。",
+    "methods": [
+      {
+        "name": "taskToGroup",
+        "brief": "向指定群组派发一个任务，由目标群的 Subagent 执行回复、reaction 或其他群内行动。 chatId 必须使用 composite chatId，例如 \"telegram:-1001234567890\"。 当前 Subagent 不能用 dispatch 给自己派任务；当前群内行动直接调用平台 API。 不要使用已废弃的 context 字段；需要搬运材料时写 quotes 或 inline quote。",
+        "fullDoc": "```typescript\ntaskToGroup(chatId: string, taskSpec: DispatchTaskSpec): Promise<DispatchTaskResult>\n```\n\n\n向指定群组派发一个任务，由目标群的 Subagent 执行回复、reaction 或其他群内行动。\n\nchatId 必须使用 composite chatId，例如 \"telegram:-1001234567890\"。\n当前 Subagent 不能用 dispatch 给自己派任务；当前群内行动直接调用平台 API。\n不要使用已废弃的 context 字段；需要搬运材料时写 quotes 或 inline quote。\n\n**参数：**\n- `chatId`: 目标 composite chatId。\n- `taskSpec`: 任务方向、语气、quote、技能和跟踪信息。\n- **返回值**: 派发任务 ID，以及可选的 trackingKey / reminderId。\n\n**示例：**\n```typescript\nconst task = await dispatch.taskToGroup(\"telegram:-1001111111111\", {\n  contentDirection: \"把当前群的问题带到目标群请他们确认，保留来源边界\",\n  toneGuidance: \"简短、礼貌，不要泄露不必要的上下文\",\n  quotes: [\"@telegram:-1002222222222[100-106]\", \"@output[0]\"],\n  tracking: {\n    content: \"等待目标群确认后回到当前群同步\",\n    remindAfterMinutes: 15,\n    callback: \"检查目标群是否已回复；如有结论，再派回来源群。\"\n  }\n});\nconsole.log(task.taskId);\n```"
+      },
+      {
+        "name": "getTask",
+        "brief": "查询已派发任务的状态与执行结果；不存在时返回 null。",
+        "fullDoc": "```typescript\ngetTask(taskId: string): Promise<DispatchedTaskStatus | null>\n```\n\n\n查询已派发任务的状态与执行结果；不存在时返回 null。"
+      },
+      {
+        "name": "listTasks",
+        "brief": "列出已派发任务，可按 chatId/status 分页过滤。",
+        "fullDoc": "```typescript\nlistTasks(options?: { chatId?: string; status?: string; limit?: number; offset?: number }): Promise<{\n        tasks: DispatchedTaskStatus[];\n        total: number;\n        hasMore: boolean;\n    }>\n```\n\n\n列出已派发任务，可按 chatId/status 分页过滤。"
+      }
+    ],
+    "typeDefs": "interface DispatchTrackingSpec {\n    /** 默认 dispatch:<taskId>。 */\n    key?: string;\n    /** 待跟进内容。 */\n    content: string;\n    /** 若设置，则自动注册一次性唤醒给 Meta 做后续检查。 */\n    remindAfterMinutes?: number;\n    /** reminder 唤醒后给 Meta 的明确动作。 */\n    callback?: string;\n    /** 附带结构化数据。 */\n    data?: unknown;\n}\n\ninterface DispatchTaskSpec {\n    /** 必填：行动方向，告诉目标 Subagent 往哪个方向回复或互动。 */\n    contentDirection: string;\n    /** 语气指导，如轻松、正式、简短等。 */\n    toneGuidance?: string;\n    /** 建议用于召回可发送贴纸的 emoji 候选，如 [\"😂\", \"🤣\", \"😅\"]。 */\n    suggestedEmojis?: string[];\n    /**\n     * 需要随任务携带的 quote 引用。也可以直接写在 contentDirection / toneGuidance 中。\n     *\n     * 框架会解析内部 quote：\n     * - @telegram:-100123[10-20] / @discord:guild:channel[10-20] / @onebot:group:123[10-20]\n     * - @telegram:-100123 / @discord:guild:channel / @onebot:group:123\n     * - @person[张三] 或 @person[张三 in telegram:-100123]\n     * - @history[关键词] / @topic[topicId]\n     * - @output[0]（Subagent 侧会展开为本 session 之前的执行结果 literal quote）\n     * - @[workspace/xxx.md]\n     *\n     * 其他 @[...] 会作为 literal string 传递，不抓取、不清洗、不联网。\n     */\n    quotes?: string[];\n    /** 需要目标 Subagent 额外加载的 Skill 模块名。基础模块不需要重复填写。 */\n    useSkills?: string[];\n    /** 派发后自动记录待跟进 todo / remind。 */\n    tracking?: DispatchTrackingSpec;\n}\n\ninterface DispatchTaskResult {\n    taskId: string;\n    trackingKey?: string;\n    reminderId?: string;\n}\n\ninterface DispatchedTaskStatus {\n    taskId: string;\n    chatId: string;\n    contentDirection: string;\n    toneGuidance?: string;\n    quotes?: string[];\n    quoteWarnings?: string[];\n    status: \"PENDING\" | \"RUNNING\" | \"COMPLETED\" | \"ERROR\" | \"SKIPPED\" | \"TIMEOUT\";\n    /** Unix epoch milliseconds. */\n    createdAt: number;\n    /** Unix epoch milliseconds. */\n    updatedAt: number;\n    /** Unix epoch milliseconds. */\n    completedAt?: number;\n    sessionId?: string;\n    summary?: string;\n    sentMessages?: Array<{ messageId?: string; text: string; timestamp: number }>;\n    error?: string;\n}"
+  },
+  {
     "name": "fs",
     "description": "filesystem.d.ts — 文件系统操作模块类型定义 所有路径操作限定在 workspace/ 目录下。 支持相对路径（相对于 workspace/）和绝对路径。",
     "methods": [

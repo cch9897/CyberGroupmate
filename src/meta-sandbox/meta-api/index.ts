@@ -40,6 +40,8 @@ export function buildMetaApiContext(deps: BuildMetaApiContextDeps) {
             onTaskDispatched: deps.onTaskDispatched,
             groundingConfig: deps.groundingConfig,
             groundingRunner: deps.groundingRunner,
+            getQuoteOutput: deps.getQuoteOutput,
+            workspaceRoot: deps.workspaceRoot,
             executorFactory: deps.executorFactory,
             initializeExecutor: deps.initializeExecutor,
             taskIdFactory: deps.taskIdFactory,

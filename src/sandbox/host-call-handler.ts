@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { relative, resolve } from "node:path";
-import { ensureCompositeId, getGroupModelKey, getPlatform } from "../core/chat-id.js";
+import { ensureCompositeId, getGroupModelKey, getPlatform, isValidCompositeChatId } from "../core/chat-id.js";
 import {
     loadConfig,
     resolveComponentProfiles,
@@ -39,6 +39,12 @@ interface McpBridgeLike {
     call(serverName: string, toolName: string, toolArgs: Record<string, unknown>): Promise<unknown>;
 }
 
+interface DispatchApiLike {
+    taskToGroup(chatId: string, taskSpec: unknown): Promise<unknown>;
+    getTask(taskId: string): Promise<unknown>;
+    listTasks(options?: unknown): Promise<unknown>;
+}
+
 interface CreateSandboxHostCallHandlerDeps {
     appConfig: AppConfig;
     globalState: GlobalState;
@@ -48,6 +54,7 @@ interface CreateSandboxHostCallHandlerDeps {
     sandbox: Sandbox;
     sandboxPool: SandboxPool;
     mcpBridge: McpBridgeLike;
+    dispatchApi?: DispatchApiLike;
     buildEnvPlan: (envVars?: EnvironmentVariable[]) => ManagedEnvPlan;
     getCurrentEnvPlan: () => ManagedEnvPlan;
     setCurrentEnvPlan: (plan: ManagedEnvPlan) => void;
@@ -100,6 +107,7 @@ export function createSandboxHostCallHandler(chatId: string, deps: CreateSandbox
         sandbox,
         sandboxPool,
         mcpBridge,
+        dispatchApi,
         buildEnvPlan,
         getCurrentEnvPlan,
         setCurrentEnvPlan,
@@ -511,6 +519,32 @@ export function createSandboxHostCallHandler(chatId: string, deps: CreateSandbox
                     score: (topic.callbackPotential ?? 0) / 100,
                 })));
             return [...factResults, ...topicResults].slice(0, limit);
+        }
+
+        if (method === "dispatch.taskToGroup") {
+            if (!dispatchApi) {
+                throw new Error("dispatch module is not available in this host context");
+            }
+            const targetChatId = String(args[0] ?? "").trim();
+            if (!isValidCompositeChatId(targetChatId)) {
+                throw new Error(`dispatch.taskToGroup 需要 composite chatId，收到: ${targetChatId || "(empty)"}`);
+            }
+            if (targetChatId === chatId) {
+                throw new Error("当前 Subagent 不能 dispatch 给自己；当前群内行动请直接调用平台 API。");
+            }
+            return dispatchApi.taskToGroup(targetChatId, args[1]);
+        }
+        if (method === "dispatch.getTask") {
+            if (!dispatchApi) {
+                throw new Error("dispatch module is not available in this host context");
+            }
+            return dispatchApi.getTask(String(args[0] ?? ""));
+        }
+        if (method === "dispatch.listTasks") {
+            if (!dispatchApi) {
+                throw new Error("dispatch module is not available in this host context");
+            }
+            return dispatchApi.listTasks(args[0]);
         }
 
         if (method === "mcp.list") {

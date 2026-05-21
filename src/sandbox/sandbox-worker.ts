@@ -21,14 +21,20 @@ import { cronModule, setCronCallbacks } from "./modules/cron/index.js";
 import { todoModule, setTodoCallbacks } from "./modules/kv/index.js";
 import { visionModule, setVisionCallbacks } from "./modules/vision/index.js";
 import { memoryModule, setMemoryCallbacks } from "./modules/memory/index.js";
+import { dispatchModule, setDispatchCallbacks, type SandboxQuoteOutput } from "./modules/dispatch/index.js";
 import { setSkillManagerCallbacks } from "./modules/skills/index.js";
 import { setRuntimeCallbacks } from "./modules/runtime/index.js";
 import { installShell, setShellCallbacks } from "./modules/shell/index.js";
 import { getSkillListEntries, loadAllSkills, reloadAllSkills, installDepsRuntime, type LoadedSkill } from "./skill-loader.js";
+import { NOTEBOOK_RESERVED_NAMES, transformNotebookCode } from "./notebook-scope.js";
 import { configureLogger } from "../core/logger.js";
 
 // ─── 全局 Skills 缓存（Worker 启动时加载一次） ───
 let loadedSkills: LoadedSkill[] = [];
+
+const outputLedger: SandboxQuoteOutput[] = [];
+let outputLedgerCounter = 0;
+const MAX_OUTPUT_LEDGER_ITEMS = 50;
 
 
 
@@ -54,6 +60,15 @@ interface ExecuteMessage {
     type: "execute";
     id: string;
     code: string;
+    /** Optional CodeAct session/task scope for LLM-friendly notebook variables. */
+    scopeId?: string;
+}
+
+/** Host → Worker: 清理一个 task-scoped notebook namespace */
+interface ResetScopeMessage {
+    type: "reset_scope";
+    id: string;
+    scopeId: string;
 }
 
 
@@ -110,8 +125,163 @@ interface HostCallMessage {
     args: unknown[];
 }
 
-type IncomingMessage = ExecuteMessage | InputResponseMessage | HostCallResultMessage;
+type IncomingMessage = ExecuteMessage | ResetScopeMessage | InputResponseMessage | HostCallResultMessage;
 type OutgoingMessage = ResultMessage | NotifyMessage | InputRequestMessage | PrintMessage | HostCallMessage;
+
+// ─── Task-scoped notebook state ───
+
+interface NotebookScopeState {
+    values: Record<string, unknown>;
+    functionSources: Record<string, string>;
+    lastUsedAt: number;
+}
+
+const notebookScopes = new Map<string, NotebookScopeState>();
+const MAX_NOTEBOOK_SCOPE_BYTES = Number(process.env.SANDBOX_NOTEBOOK_SCOPE_MAX_BYTES ?? 2 * 1024 * 1024);
+const NOTEBOOK_PRUNE_TARGET_BYTES = Math.floor(MAX_NOTEBOOK_SCOPE_BYTES * 0.75);
+
+function getNotebookScope(scopeId: string): NotebookScopeState {
+    let scope = notebookScopes.get(scopeId);
+    if (!scope) {
+        scope = {
+            values: Object.create(null) as Record<string, unknown>,
+            functionSources: Object.create(null) as Record<string, string>,
+            lastUsedAt: Date.now(),
+        };
+        notebookScopes.set(scopeId, scope);
+    }
+    scope.lastUsedAt = Date.now();
+    return scope;
+}
+
+function resetNotebookScope(scopeId: string): void {
+    notebookScopes.delete(scopeId);
+}
+
+function hasOwn(obj: Record<string, unknown>, key: string): boolean {
+    return Object.prototype.hasOwnProperty.call(obj, key);
+}
+
+function assertNotebookNameAllowed(name: string, runtimeBindings?: Record<string, unknown>): void {
+    if (NOTEBOOK_RESERVED_NAMES.has(name) || (runtimeBindings && hasOwn(runtimeBindings, name))) {
+        throw new Error(`"${name}" 是 sandbox 保留 API 名，不能作为顶层变量名使用。`);
+    }
+}
+
+function createNotebookWithObject(
+    scope: NotebookScopeState,
+    runtimeBindings: Record<string, unknown>,
+): object {
+    return new Proxy(scope.values, {
+        has(target, key) {
+            if (key === Symbol.unscopables) return false;
+            if (typeof key !== "string") return key in target;
+            return hasOwn(runtimeBindings, key) || hasOwn(target, key);
+        },
+        get(target, key) {
+            if (key === Symbol.unscopables) return undefined;
+            if (typeof key === "string" && hasOwn(runtimeBindings, key)) {
+                return runtimeBindings[key];
+            }
+            return Reflect.get(target, key);
+        },
+        set(target, key, value) {
+            if (typeof key === "string") {
+                assertNotebookNameAllowed(key, runtimeBindings);
+                target[key] = value;
+                delete scope.functionSources[key];
+                return true;
+            }
+            return Reflect.set(target, key, value);
+        },
+        deleteProperty(target, key) {
+            if (typeof key === "string") {
+                delete scope.functionSources[key];
+            }
+            return Reflect.deleteProperty(target, key);
+        },
+    });
+}
+
+function buildRuntimeBindings(names: string[], values: unknown[]): Record<string, unknown> {
+    const bindings: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+    for (let i = 0; i < names.length; i++) {
+        bindings[names[i]] = values[i];
+    }
+    return bindings;
+}
+
+function rehydrateNotebookFunctions(
+    scope: NotebookScopeState,
+    runtimeBindings: Record<string, unknown>,
+    notebookWith: object,
+    outputLines: string[],
+): void {
+    const runtimeNames = Object.keys(runtimeBindings);
+    const runtimeValues = runtimeNames.map((name) => runtimeBindings[name]);
+    for (const [name, source] of Object.entries(scope.functionSources)) {
+        try {
+            const revive = new Function(
+                ...runtimeNames,
+                "__notebookWith",
+                `with (__notebookWith) { return (${source}); }`,
+            );
+            scope.values[name] = revive(...runtimeValues, notebookWith);
+        } catch (err) {
+            delete scope.values[name];
+            delete scope.functionSources[name];
+            outputLines.push(`[Notebook scope] 无法恢复函数 ${name}，已从本 task 作用域移除: ${err instanceof Error ? err.message : String(err)}`);
+        }
+    }
+}
+
+function estimateNotebookValueSize(value: unknown): number {
+    if (typeof value === "string") return value.length * 2;
+    if (typeof value === "number" || typeof value === "boolean" || value == null) return 16;
+    if (typeof value === "bigint") return value.toString().length;
+    if (typeof value === "function" || typeof value === "symbol") return 0;
+    if (value instanceof ArrayBuffer) return value.byteLength;
+    if (ArrayBuffer.isView(value)) return value.byteLength;
+
+    const seen = new WeakSet<object>();
+    try {
+        const json = JSON.stringify(value, (_key, child) => {
+            if (typeof child === "function" || typeof child === "symbol") return undefined;
+            if (typeof child === "bigint") return child.toString();
+            if (typeof child === "object" && child !== null) {
+                if (seen.has(child)) return "[Circular]";
+                seen.add(child);
+            }
+            return child;
+        });
+        return json ? json.length * 2 : 0;
+    } catch {
+        return 1024;
+    }
+}
+
+function enforceNotebookScopeLimit(scope: NotebookScopeState): string | null {
+    const entries = Object.entries(scope.values)
+        .map(([name, value]) => ({
+            name,
+            size: estimateNotebookValueSize(value) + (scope.functionSources[name]?.length ?? 0),
+        }))
+        .sort((a, b) => b.size - a.size);
+    let total = entries.reduce((sum, entry) => sum + entry.size, 0);
+    if (total <= MAX_NOTEBOOK_SCOPE_BYTES) return null;
+
+    const removed: string[] = [];
+    for (const entry of entries) {
+        if (total <= NOTEBOOK_PRUNE_TARGET_BYTES) break;
+        delete scope.values[entry.name];
+        delete scope.functionSources[entry.name];
+        total -= entry.size;
+        removed.push(entry.name);
+    }
+
+    if (removed.length === 0) return null;
+    return `[Notebook scope] 本 task 作用域超过 ${MAX_NOTEBOOK_SCOPE_BYTES} bytes，已移除较大的临时变量: ${removed.join(", ")}`;
+}
 
 // ─── 全局上下文（跨 turn 持久化） ───
 
@@ -242,6 +412,24 @@ function callHost(method: string, args: unknown[] = []): Promise<unknown> {
     });
 }
 
+function getExecutionOutput(index: number): SandboxQuoteOutput | null {
+    const found = outputLedger.find((item) => item.index === index);
+    return found ? { ...found } : null;
+}
+
+function recordExecutionOutput(output: string, error: boolean): void {
+    outputLedger.push({
+        index: outputLedgerCounter++,
+        output,
+        error,
+        timestamp: new Date().toISOString(),
+        source: "subagent",
+    });
+    while (outputLedger.length > MAX_OUTPUT_LEDGER_ITEMS) {
+        outputLedger.shift();
+    }
+}
+
 // ─── 后台任务管理（通过 BackgroundManager 统一管理） ───
 
 /** 持久化任务存储路径 */
@@ -269,9 +457,12 @@ function getWorkspace(): string {
 
 // ─── 代码执行 ───
 
-async function executeCode(id: string, code: string): Promise<void> {
+async function executeCode(id: string, code: string, scopeId?: string): Promise<void> {
     const outputLines: string[] = [];
     const executionControl: { extendSteps: number; timeoutMs?: number } = { extendSteps: 0 };
+    let activeNotebookScope: NotebookScopeState | null = null;
+    let activeExecGuard = "";
+    const execGuardId = `exec_${id}`;
 
     const originalConsole = {
         log: console.log,
@@ -300,8 +491,7 @@ async function executeCode(id: string, code: string): Promise<void> {
         // 导致 tracker.flush() 无法等到所有 sendText 调用。这些"逃逸"的调用
         // 会在 executeCode 返回后继续执行，产生不受追踪的副作用（如重复发消息）。
         // 通过 execGuardId 标记当前执行，结束后使旧 guard 失效，阻止逃逸调用。
-        const execGuardId = `exec_${id}`;
-        let activeExecGuard = execGuardId;
+        activeExecGuard = execGuardId;
 
         const guardedCallHost = (method: string, args?: unknown[]) => {
             if (activeExecGuard !== execGuardId) {
@@ -392,29 +582,76 @@ async function executeCode(id: string, code: string): Promise<void> {
         // 构造参数列表：固定参数 + 平台 API + 动态 Skill 参数
         // ctx 保留为纯用户 state bag（LLM 可跨 turn 存取任意属性）
         const sh = installShell();
-        const fixedArgNames = ["ctx", "runtime", "scene", "skills", "fs", "mcp", "cron", "todo", "vision", "memory", "shell", "telegram", "discord", "onebot", "qq"];
-        const fixedArgValues = [ctx, rt, scene, sk, filesystem, mcpBridge, tracker.wrap(cronModule as unknown as Record<string, unknown>), tracker.wrap(todoModule as unknown as Record<string, unknown>), tracker.wrap(visionModule as unknown as Record<string, unknown>), tracker.wrap(memoryModule as unknown as Record<string, unknown>), sh, tg, dc, ob, ob];
+        const fixedArgNames = ["ctx", "runtime", "scene", "skills", "fs", "mcp", "cron", "todo", "vision", "memory", "dispatch", "shell", "telegram", "discord", "onebot", "qq"];
+        const fixedArgValues = [ctx, rt, scene, sk, filesystem, mcpBridge, tracker.wrap(cronModule as unknown as Record<string, unknown>), tracker.wrap(todoModule as unknown as Record<string, unknown>), tracker.wrap(visionModule as unknown as Record<string, unknown>), tracker.wrap(memoryModule as unknown as Record<string, unknown>), tracker.wrap(dispatchModule as unknown as Record<string, unknown>), sh, tg, dc, ob, ob];
         const allArgNames = [...fixedArgNames, ...skillArgNames];
         const allArgValues = [...fixedArgValues, ...skillArgValues];
 
+        let functionArgNames = allArgNames;
+        let functionArgValues = allArgValues;
+        let executableCode = code;
+
+        if (scopeId) {
+            const transformed = transformNotebookCode(code);
+            if (transformed.errors.length > 0) {
+                throw new Error(`[Notebook scope] ${transformed.errors.join(" ")}`);
+            }
+
+            activeNotebookScope = getNotebookScope(scopeId);
+            const runtimeBindings = buildRuntimeBindings(allArgNames, allArgValues);
+            const notebookWith = createNotebookWithObject(activeNotebookScope, runtimeBindings);
+            rehydrateNotebookFunctions(activeNotebookScope, runtimeBindings, notebookWith, outputLines);
+
+            const notebookAssign = (name: string, value: unknown): unknown => {
+                assertNotebookNameAllowed(name, runtimeBindings);
+                activeNotebookScope!.values[name] = value;
+                delete activeNotebookScope!.functionSources[name];
+                return value;
+            };
+            const notebookDefine = (name: string, value: unknown, source: string): unknown => {
+                assertNotebookNameAllowed(name, runtimeBindings);
+                activeNotebookScope!.values[name] = value;
+                activeNotebookScope!.functionSources[name] = source;
+                return value;
+            };
+
+            functionArgNames = [
+                ...allArgNames,
+                "__notebookScope",
+                "__notebookWith",
+                "__notebookAssign",
+                "__notebookDefine",
+            ];
+            functionArgValues = [
+                ...allArgValues,
+                activeNotebookScope.values,
+                notebookWith,
+                notebookAssign,
+                notebookDefine,
+            ];
+            executableCode = `with (__notebookWith) {\n${transformed.code}\n}`;
+        }
+
         const asyncFn = new Function(
-            ...allArgNames,
-            `return (async () => { ${code} })()`
+            ...functionArgNames,
+            `return (async () => { ${executableCode} })()`
         );
 
-        await asyncFn(...allArgValues);
+        await asyncFn(...functionArgValues);
 
         // 兜底：等待所有未被 await 的 API 调用完成
         const { warning } = await tracker.flush();
         if (warning) outputLines.push(warning);
 
-        // 使执行守卫失效：此后任何逃逸的 async 调用将被 guardedCallHost 拦截
-        activeExecGuard = "";
+        const notebookWarning = activeNotebookScope ? enforceNotebookScopeLimit(activeNotebookScope) : null;
+        if (notebookWarning) outputLines.push(notebookWarning);
 
+        const output = outputLines.join("\n");
+        recordExecutionOutput(output, false);
         sendToHost({
             type: "result",
             id,
-            output: outputLines.join("\n"),
+            output,
             error: false,
             ...(executionControl.extendSteps > 0 ? { extendSteps: executionControl.extendSteps } : {}),
             ...(executionControl.timeoutMs != null ? { timeoutMs: executionControl.timeoutMs } : {}),
@@ -431,15 +668,22 @@ async function executeCode(id: string, code: string): Promise<void> {
 
         outputLines.push(errorMsg);
 
+        const notebookWarning = activeNotebookScope ? enforceNotebookScopeLimit(activeNotebookScope) : null;
+        if (notebookWarning) outputLines.push(notebookWarning);
+
+        const output = outputLines.join("\n");
+        recordExecutionOutput(output, true);
         sendToHost({
             type: "result",
             id,
-            output: outputLines.join("\n"),
+            output,
             error: true,
             ...(executionControl.extendSteps > 0 ? { extendSteps: executionControl.extendSteps } : {}),
             ...(executionControl.timeoutMs != null ? { timeoutMs: executionControl.timeoutMs } : {}),
         });
     } finally {
+        // 使执行守卫失效：此后任何逃逸的 async 调用将被 guardedCallHost 拦截。
+        activeExecGuard = "";
         console.log = originalConsole.log;
         console.warn = originalConsole.warn;
         console.error = originalConsole.error;
@@ -460,7 +704,15 @@ rl.on("line", async (line: string) => {
         const msg: IncomingMessage = JSON.parse(line);
 
         if (msg.type === "execute") {
-            await executeCode(msg.id, msg.code);
+            await executeCode(msg.id, msg.code, msg.scopeId);
+        } else if (msg.type === "reset_scope") {
+            resetNotebookScope(msg.scopeId);
+            sendToHost({
+                type: "result",
+                id: msg.id,
+                output: "",
+                error: false,
+            });
         } else if (msg.type === "input_response") {
             // 用户输入响应 — 唤醒等待中的 runtime.input()
             const resolver = pendingInputs.get(msg.id);
@@ -524,6 +776,7 @@ async function initWorker(): Promise<void> {
     setTodoCallbacks({ callHost });
     setVisionCallbacks({ callHost });
     setMemoryCallbacks({ callHost });
+    setDispatchCallbacks({ callHost, getOutput: getExecutionOutput });
 
     // 注入 Runtime 扩展回调（spawnPersistent, home, workspace, callHost）
     setRuntimeCallbacks({

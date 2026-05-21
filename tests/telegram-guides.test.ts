@@ -360,4 +360,75 @@ describe("Telegram builtin guides", () => {
         await adapter.stop();
         nc.dispose();
     });
+
+    it("resolves file: media paths for mtcute profile-photo calls before invoking the client", async () => {
+        const nc = makeNC();
+        const mediaDir = join(process.cwd(), "workspace", "media");
+        mkdirSync(mediaDir, { recursive: true });
+        const fileName = `profile-${randomUUID()}.png`;
+        const relativePath = join("media", fileName);
+        const absolutePath = join(mediaDir, fileName);
+        writeFileSync(absolutePath, "fake image bytes");
+
+        const calls: Array<Record<string, unknown>> = [];
+        const fakeClient = {
+            async start() {
+                return { id: 99, displayName: "Userbot", isBot: false };
+            },
+            onNewMessage: { add() {}, remove() {} },
+            async setMyProfilePhoto(params: Record<string, unknown>) {
+                calls.push(params);
+                return { id: "photo-id", media: params.media };
+            },
+            async destroy() {},
+        };
+
+        const adapter = new TelegramAdapter(makeConfig(), nc, async () => "", () => {}, async () => fakeClient);
+        try {
+            await adapter.start();
+            const result = await adapter.handleCall("telegram.mtcute", [
+                "setMyProfilePhoto",
+                { type: "photo", media: `file:${relativePath}` },
+            ]) as any;
+
+            assert.equal(calls[0].media, `file:${absolutePath}`);
+            assert.equal(result.media, `file:${absolutePath}`);
+        } finally {
+            await adapter.stop();
+            nc.dispose();
+            rmSync(absolutePath, { force: true });
+        }
+    });
+
+    it("rejects missing file: mtcute media before the client can create a read stream", async () => {
+        const nc = makeNC();
+        const calls: Array<Record<string, unknown>> = [];
+        const fakeClient = {
+            async start() {
+                return { id: 99, displayName: "Userbot", isBot: false };
+            },
+            onNewMessage: { add() {}, remove() {} },
+            async setMyProfilePhoto(params: Record<string, unknown>) {
+                calls.push(params);
+                return { id: "photo-id" };
+            },
+            async destroy() {},
+        };
+
+        const adapter = new TelegramAdapter(makeConfig(), nc, async () => "", () => {}, async () => fakeClient);
+        try {
+            await adapter.start();
+            await assert.rejects(
+                () => adapter.handleCall("telegram.mtcute", [
+                    "setMyProfilePhoto",
+                    { type: "photo", media: "file:media/definitely-missing-profile-photo.png" },
+                ]),
+                /mtcute 文件不存在/,
+            );
+            assert.equal(calls.length, 0);
+        } finally {
+            await adapter.stop();
+            nc.dispose();
+        }
+    });
 });

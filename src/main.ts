@@ -341,6 +341,11 @@ async function main(): Promise<void> {
 
     const nc = new NotificationCenter(EVENTS_PATH);
     let shuttingDown = false;
+    let sandboxDispatchApi: {
+        taskToGroup: (chatId: string, taskSpec: any) => Promise<unknown>;
+        getTask: (taskId: string) => Promise<unknown>;
+        listTasks: (options?: any) => Promise<unknown>;
+    } | null = null;
 
     // ─── 自动检查并安装 Skills 依赖 ───
     await installSkillsDependencies(join(process.cwd(), "workspace", "skills"));
@@ -364,6 +369,26 @@ async function main(): Promise<void> {
                 sandboxPool,
                 mcpBridge,
                 accumulator,
+                dispatchApi: {
+                    taskToGroup: async (targetChatId, taskSpec) => {
+                        if (!sandboxDispatchApi) {
+                            throw new Error("dispatch API not initialized");
+                        }
+                        return sandboxDispatchApi.taskToGroup(targetChatId, taskSpec);
+                    },
+                    getTask: async (taskId) => {
+                        if (!sandboxDispatchApi) {
+                            throw new Error("dispatch API not initialized");
+                        }
+                        return sandboxDispatchApi.getTask(taskId);
+                    },
+                    listTasks: async (options) => {
+                        if (!sandboxDispatchApi) {
+                            throw new Error("dispatch API not initialized");
+                        }
+                        return sandboxDispatchApi.listTasks(options);
+                    },
+                },
                 buildEnvPlan,
                 getCurrentEnvPlan: () => currentEnvPlan,
                 setCurrentEnvPlan: (plan) => {
@@ -415,7 +440,7 @@ async function main(): Promise<void> {
     }
 
     if (appConfig.discord) {
-        const discordAdapter = new DiscordAdapter(appConfig.discord, nc);
+        const discordAdapter = new DiscordAdapter(appConfig.discord, nc, memory);
         adapters.push(discordAdapter);
     }
 
@@ -922,6 +947,7 @@ async function main(): Promise<void> {
     };
 
     let activeUserProfilesForDispatch = new Map<string, ActiveUserProfile[]>();
+    let metaSandbox: MetaSandbox | null = null;
     const metaApiContext = buildMetaApiContext({
         memory,
         subagentManager,
@@ -929,6 +955,8 @@ async function main(): Promise<void> {
         accumulator,
         groundingConfig: appConfig.grounding,
         getActiveUserProfilesForChat: (chatId) => activeUserProfilesForDispatch.get(chatId),
+        getQuoteOutput: (index) => metaSandbox?.getOutput(index),
+        workspaceRoot: process.cwd(),
         onTaskDispatched: (task) => {
             metricsInstance?.groupCollector.onAttend(task.chatId, "REPLY");
         },
@@ -974,7 +1002,8 @@ async function main(): Promise<void> {
             );
         },
     });
-    const metaSandbox = new MetaSandbox(metaApiContext);
+    sandboxDispatchApi = metaApiContext.dispatch;
+    metaSandbox = new MetaSandbox(metaApiContext);
 
     mainLoop.setMetaSessionHandler(createMetaSessionHandler({
         getPersona: () => loadConfig().persona,

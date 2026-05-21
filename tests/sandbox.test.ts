@@ -95,6 +95,77 @@ describe("Sandbox", () => {
         assert.equal(r2.output, "42");
     });
 
+    it("should maintain notebook variables within a task scope", async () => {
+        const sb = await makeSandbox();
+        const scopeId = "test-task-scope";
+
+        const r1 = await sb.execute("const messages = ['a', 'b']; console.log(messages.length)", 30000, { scopeId });
+        assert.equal(r1.error, false);
+        assert.equal(r1.output, "2");
+
+        const r2 = await sb.execute("console.log(messages.join(','))", 30000, { scopeId });
+        assert.equal(r2.error, false);
+        assert.equal(r2.output, "a,b");
+    });
+
+    it("should allow repeated top-level const names in notebook scope", async () => {
+        const sb = await makeSandbox();
+        const scopeId = "test-repeat-const";
+
+        const r1 = await sb.execute("const result = 1; console.log(result)", 30000, { scopeId });
+        assert.equal(r1.error, false);
+        assert.equal(r1.output, "1");
+
+        const r2 = await sb.execute("const result = result + 1; console.log(result)", 30000, { scopeId });
+        assert.equal(r2.error, false);
+        assert.equal(r2.output, "2");
+    });
+
+    it("should isolate notebook variables by task scope and reset them", async () => {
+        const sb = await makeSandbox();
+
+        await sb.execute("const token = 'alpha';", 30000, { scopeId: "scope-a" });
+
+        const isolated = await sb.execute("console.log(typeof token)", 30000, { scopeId: "scope-b" });
+        assert.equal(isolated.error, false);
+        assert.equal(isolated.output, "undefined");
+
+        const retained = await sb.execute("console.log(token)", 30000, { scopeId: "scope-a" });
+        assert.equal(retained.error, false);
+        assert.equal(retained.output, "alpha");
+
+        await sb.resetNotebookScope("scope-a");
+        const cleared = await sb.execute("console.log(typeof token)", 30000, { scopeId: "scope-a" });
+        assert.equal(cleared.error, false);
+        assert.equal(cleared.output, "undefined");
+    });
+
+    it("should rehydrate notebook functions with the current execution API bindings", async () => {
+        const sb = await makeSandbox();
+        const scopeId = "test-function-rehydrate";
+
+        const defined = await sb.execute(`
+          async function ping() {
+            runtime.notify({ type: "notebook.ping", data: "ok" });
+          }
+          console.log("defined");
+        `, 30000, { scopeId });
+        assert.equal(defined.error, false);
+        assert.equal(defined.output, "defined");
+
+        const notifyPromise = new Promise<Record<string, unknown>>((resolve) => {
+            sb.once("notify", resolve);
+        });
+
+        const called = await sb.execute("await ping(); console.log('called')", 30000, { scopeId });
+        assert.equal(called.error, false);
+        assert.equal(called.output, "called");
+
+        const event = await notifyPromise;
+        assert.equal(event.type, "notebook.ping");
+        assert.equal(event.data, "ok");
+    });
+
     it("should support top-level await", async () => {
         const sb = await makeSandbox();
         const result = await sb.execute(`

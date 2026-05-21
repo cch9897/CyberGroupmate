@@ -15,6 +15,14 @@ export interface MetaSandboxExecutionResult {
     logs: MetaSandboxConsoleEntry[];
 }
 
+export interface MetaSandboxOutputRecord {
+    index: number;
+    output: string;
+    error: boolean;
+    timestamp: string;
+    source: "meta";
+}
+
 export interface MetaSandboxOptions {
     timeoutMs?: number;
 }
@@ -26,6 +34,7 @@ export class MetaSandbox {
     private readonly apiGlobalNames: Set<string>;
     private readonly scopeUnscopables: Record<string, true>;
     private activeSessionId: string | null = null;
+    private outputLedger: MetaSandboxOutputRecord[] = [];
 
     constructor(apiContext: Record<string, unknown>) {
         const metaApi = Object.freeze(this.decorateApiContext({ ...apiContext }));
@@ -106,6 +115,7 @@ export class MetaSandbox {
 
     beginSession(sessionId: string): void {
         this.activeSessionId = sessionId;
+        this.outputLedger = [];
         (this.context as Record<string, unknown>).__metaScope = this.createSessionScope();
     }
 
@@ -115,6 +125,11 @@ export class MetaSandbox {
         }
         this.activeSessionId = null;
         (this.context as Record<string, unknown>).__metaScope = this.createSessionScope();
+        this.outputLedger = [];
+    }
+
+    getOutput(index: number): MetaSandboxOutputRecord | null {
+        return this.outputLedger[index] ? { ...this.outputLedger[index] } : null;
     }
 
     async execute(code: string, options?: MetaSandboxOptions): Promise<MetaSandboxExecutionResult> {
@@ -139,22 +154,36 @@ export class MetaSandbox {
                 if (timeout) clearTimeout(timeout);
             });
 
+            const output = formatOutput(result, logs);
+            this.recordOutput(output, false);
             return {
-                output: formatOutput(result, logs),
+                output,
                 error: false,
                 logs,
             };
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             log.warn("Meta sandbox execution failed", { error: message });
+            const output = formatErrorOutput(message, logs);
+            this.recordOutput(output, true);
             return {
-                output: formatErrorOutput(message, logs),
+                output,
                 error: true,
                 logs,
             };
         } finally {
             this.installLogBuffer(null);
         }
+    }
+
+    private recordOutput(output: string, error: boolean): void {
+        this.outputLedger.push({
+            index: this.outputLedger.length,
+            output,
+            error,
+            timestamp: new Date().toISOString(),
+            source: "meta",
+        });
     }
 
     private wrapCode(code: string): string {

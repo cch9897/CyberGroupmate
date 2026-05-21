@@ -9,6 +9,7 @@
 import type { NotificationCenter } from "../event/notification-center.js";
 import type { DiscordConfig } from "../core/config.js";
 import type { PlatformAdapter } from "./platform-adapter.js";
+import type { IMemoryStoreV2 } from "../memory-v2/types.js";
 import { composeChatId } from "../core/chat-id.js";
 import { createLogger } from "../core/logger.js";
 import { existsSync, readFileSync, statSync } from "node:fs";
@@ -65,6 +66,7 @@ export class DiscordAdapter implements PlatformAdapter {
     constructor(
         private config: DiscordConfig,
         private nc: NotificationCenter,
+        private memory?: Pick<IMemoryStoreV2, "getPersonIdentity">,
     ) {}
 
     async start(): Promise<void> {
@@ -224,11 +226,11 @@ export class DiscordAdapter implements PlatformAdapter {
             switch (method) {
             case "discord.sendText": {
                 // args: [chatId, text, opts?]
-                const target = this.parseTarget(String(args[0] ?? ""));
+                const target = this.parseTarget(this.stripDiscordMentionDisplayLabels(String(args[0] ?? "")));
                 log.info("discord.sendText:start", { requestId, target: target.raw, channelId: target.channelId });
                 const channel = await this.resolveTextChannel(target, "sendText", requestId);
                 const channelId = channel.id ?? target.channelId;
-                const text = String(args[1] ?? "");
+                const text = this.stripDiscordMentionDisplayLabels(String(args[1] ?? ""));
                 const opts = (args[2] ?? {}) as Record<string, unknown>;
 
                 const sendOpts: Record<string, unknown> = { content: text };
@@ -251,7 +253,7 @@ export class DiscordAdapter implements PlatformAdapter {
             }
             case "discord.sendMedia": {
                 // args: [chatId, media, opts?]
-                const target = this.parseTarget(String(args[0] ?? ""));
+                const target = this.parseTarget(this.stripDiscordMentionDisplayLabels(String(args[0] ?? "")));
                 log.info("discord.sendMedia:start", { requestId, target: target.raw, channelId: target.channelId });
 
                 const fetchChannelStart = Date.now();
@@ -267,9 +269,9 @@ export class DiscordAdapter implements PlatformAdapter {
 
                 const sendOpts: Record<string, unknown> = {};
                 if (typeof media.caption === "string") {
-                    sendOpts.content = media.caption;
+                    sendOpts.content = this.stripDiscordMentionDisplayLabels(media.caption);
                 } else if (typeof opts.caption === "string") {
-                    sendOpts.content = opts.caption;
+                    sendOpts.content = this.stripDiscordMentionDisplayLabels(opts.caption);
                 }
                 if (opts.replyTo) {
                     sendOpts.reply = { messageReference: String(opts.replyTo) };
@@ -466,6 +468,65 @@ export class DiscordAdapter implements PlatformAdapter {
             };
         }
         return {};
+    }
+
+    private enrichDiscordMentionDisplayNames(text: string, message?: any): string {
+        if (!text.includes("<@")) return text;
+
+        return text.replace(/<@!?(\d+)>/g, (mention: string, rawUserId: string, offset: number, fullText: string) => {
+            if (this.hasMentionDisplayLabel(fullText, offset + mention.length)) return mention;
+
+            const displayName = this.resolveMentionDisplayName(rawUserId, message);
+            if (!displayName) return mention;
+
+            return `${mention}(${displayName})`;
+        });
+    }
+
+    private stripDiscordMentionDisplayLabels(text: string): string {
+        if (!text.includes("<@")) return text;
+        return text.replace(/(<@!?\d+>)\([^)\r\n]{1,120}\)/g, "$1");
+    }
+
+    private hasMentionDisplayLabel(text: string, start: number): boolean {
+        return /^\([^)\r\n]{1,120}\)/.test(text.slice(start));
+    }
+
+    private resolveMentionDisplayName(rawUserId: string, message?: any): string | undefined {
+        const compositeUserId = composeChatId("discord", rawUserId);
+        try {
+            const identityName = this.cleanMentionDisplayName(this.memory?.getPersonIdentity?.(compositeUserId)?.displayName);
+            if (identityName) return identityName;
+        } catch (err) {
+            log.warn("discord.mentionEnrich:memoryLookupFailed", {
+                userId: compositeUserId,
+                error: err instanceof Error ? err.message : String(err),
+            });
+        }
+
+        const member = message?.mentions?.members?.get?.(rawUserId);
+        const memberName = this.cleanMentionDisplayName(member?.displayName);
+        if (memberName) return memberName;
+
+        const mentionedUser = message?.mentions?.users?.get?.(rawUserId);
+        const mentionedUserName = this.cleanMentionDisplayName(
+            mentionedUser?.displayName ?? mentionedUser?.globalName ?? mentionedUser?.username,
+        );
+        if (mentionedUserName) return mentionedUserName;
+
+        if (this.selfUserId === rawUserId) {
+            return this.cleanMentionDisplayName(this.client?.user?.displayName ?? this.client?.user?.globalName ?? this.client?.user?.username);
+        }
+
+        const cachedUser = this.client?.users?.cache?.get?.(rawUserId);
+        return this.cleanMentionDisplayName(cachedUser?.displayName ?? cachedUser?.globalName ?? cachedUser?.username);
+    }
+
+    private cleanMentionDisplayName(value: unknown): string | undefined {
+        if (typeof value !== "string") return undefined;
+        const cleaned = value.replace(/[()\r\n]+/g, " ").replace(/\s+/g, " ").trim();
+        if (!cleaned) return undefined;
+        return cleaned.length > 80 ? `${cleaned.slice(0, 77)}...` : cleaned;
     }
 
     private async buildAttachment(source: unknown, fileName: string | undefined, requestId: string, channelId: string): Promise<PreparedDiscordAttachment> {
@@ -822,6 +883,8 @@ export class DiscordAdapter implements PlatformAdapter {
 
         // Skip messages with no text and no attachments
         if (!text && !message.attachments?.size) return null;
+
+        text = this.enrichDiscordMentionDisplayNames(text, message);
 
         // Chat title
         let chatTitle: string;
