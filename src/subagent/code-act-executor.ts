@@ -1380,6 +1380,13 @@ export class CodeActExecutor {
      * 调用 context-manager.compact() 生成 LLM Context Briefing，
      * 支持话题保护和 reply chain 保护。
      */
+    /** Maximum characters for the compact summary (prevents unbounded growth) */
+    private static readonly COMPACT_MAX_CHARS = 30000;
+    /** Maximum execution records to include in compact summary */
+    private static readonly COMPACT_MAX_RECORDS = 30;
+    /** Maximum characters for rebuilt interaction history */
+    private static readonly COMPACT_MAX_HISTORY_CHARS = 15000;
+
     private async compactSession(): Promise<void> {
         const keep = Math.max(4, Math.floor(this.config.maxSessionMessages * 0.4));
         if (this.session.length <= keep) return;
@@ -1387,9 +1394,10 @@ export class CodeActExecutor {
         const recentMessages = this.session.slice(-keep);
 
         // ═══ Layer 1: 结构化快速 compact ═══
-        // 从 executionRecords 构建摘要
+        // 从 executionRecords 构建摘要（限制最近 N 条）
+        const recordsToSummarize = this.executionRecords.slice(-CodeActExecutor.COMPACT_MAX_RECORDS);
         const recordSummaries: string[] = [];
-        for (const rec of this.executionRecords) {
+        for (const rec of recordsToSummarize) {
             const summary = formatExecutionRecordForCompact(rec);
             if (summary) recordSummaries.push(summary);
         }
@@ -1403,19 +1411,38 @@ export class CodeActExecutor {
             }
         }
 
-        const rebuiltInteractionHistory = this.rebuildCompactedInteractionHistory(compactedMessages);
+        let rebuiltInteractionHistory = this.rebuildCompactedInteractionHistory(compactedMessages);
+        // Truncate interaction history if too long
+        if (rebuiltInteractionHistory && rebuiltInteractionHistory.length > CodeActExecutor.COMPACT_MAX_HISTORY_CHARS) {
+            rebuiltInteractionHistory = rebuiltInteractionHistory.slice(-CodeActExecutor.COMPACT_MAX_HISTORY_CHARS);
+            rebuiltInteractionHistory = "...（历史已截断）\n" + rebuiltInteractionHistory.slice(rebuiltInteractionHistory.indexOf("\n") + 1);
+        }
 
         // 构建 compact 摘要
+        const omittedCount = this.executionRecords.length - recordsToSummarize.length;
         let compactContent = `[SESSION_HISTORY_COMPACT]\n== 之前执行了 ${this.executionCount} 次任务 ==`;
+        if (omittedCount > 0) {
+            compactContent += `\n（更早的 ${omittedCount} 条记录已省略）`;
+        }
         if (recordSummaries.length > 0) {
             compactContent += `\n${recordSummaries.join("\n")}`;
         }
         if (sentConfirmations.length > 0 && recordSummaries.length === 0) {
             // 如果没有 executionRecords（旧数据），用 session 中提取的兜底
-            compactContent += `\n\n== 历史已发消息 ==\n${sentConfirmations.join("\n")}`;
+            compactContent += `\n\n== 历史已发消息 ==\n${sentConfirmations.slice(-20).join("\n")}`;
         }
         if (rebuiltInteractionHistory) {
             compactContent += `\n\n${rebuiltInteractionHistory}`;
+        }
+
+        // Final safety cap: hard-truncate if still over budget
+        if (compactContent.length > CodeActExecutor.COMPACT_MAX_CHARS) {
+            log.warn("compactSession Layer 1: compact summary exceeds max chars, truncating", {
+                chatId: this.chatId,
+                originalLength: compactContent.length,
+                maxChars: CodeActExecutor.COMPACT_MAX_CHARS,
+            });
+            compactContent = compactContent.slice(0, CodeActExecutor.COMPACT_MAX_CHARS) + "\n...（摘要已截断）";
         }
 
         const compactMsg: SessionMessage = {
@@ -1437,6 +1464,7 @@ export class CodeActExecutor {
             chatId: this.chatId,
             remaining: this.session.length,
             executionRecords: this.executionRecords.length,
+            compactChars: compactContent.length,
         });
 
         // ═══ Layer 2: token-budget LLM compact (context-manager) ═══
@@ -1463,9 +1491,22 @@ export class CodeActExecutor {
                         afterMessages: this.session.length,
                     });
                 } catch (err) {
-                    log.warn("compactSession Layer 2 失败，保留 Layer 1 结果", {
+                    log.warn("compactSession Layer 2 失败，执行 emergency truncation", {
                         chatId: this.chatId,
                         error: String(err),
+                    });
+                    // ═══ Layer 3: Emergency truncation ═══
+                    // Layer 2 也失败说明内容本身超过 LLM 上下文窗口，强制截断
+                    const emergencyKeep = Math.max(4, Math.floor(keep * 0.5));
+                    const minimalCompact: SessionMessage = {
+                        role: "user",
+                        content: `[SESSION_HISTORY_COMPACT]\n== 之前执行了 ${this.executionCount} 次任务（因 overflow 已强制截断） ==`,
+                        timestamp: new Date().toISOString(),
+                    };
+                    this.session = [minimalCompact, ...this.session.slice(-emergencyKeep)];
+                    log.warn("compactSession Layer 3: emergency truncation applied", {
+                        chatId: this.chatId,
+                        afterMessages: this.session.length,
                     });
                 }
             }
