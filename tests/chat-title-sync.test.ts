@@ -1,12 +1,18 @@
 /**
  * chat-title-sync.test.ts — 群名变更实时同步测试
  *
+ * 当前实现：
+ * - 适配器层维护内存缓存，并通过 notice 事件处理 group_name_change。
+ * - 主流程在消息到达时通过 memory.upsertGroupModel 持久化 chatTitle。
+ * - CodeActExecutor 不再持有 updateChatTitle；渲染时通过 formatChatLabel(memory, chatId)
+ *   实时从 group model 读取最新 chatTitle。
+ *
  * 测试场景:
  * 1. OneBot group_name_change → NC 广播
- * 2. CodeActExecutor.updateChatTitle 刷新 pending tasks 的 contextSnapshot
+ * 2. memory.upsertGroupModel 后 formatChatLabel 读取最新群名
  * 3. Telegram chat_title_refresh 事件流
  * 4. NC 事件字段映射
- * 5. 端到端: NC事件 → CodeActExecutor 刷新
+ * 5. 端到端: NC事件 → memory 更新 → formatChatLabel 刷新
  */
 
 import { describe, it } from "node:test";
@@ -15,11 +21,16 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NotificationCenter } from "../src/event/notification-center.js";
-import { CodeActExecutor } from "../src/subagent/code-act-executor.js";
+import { MemoryStoreV2 } from "../src/memory-v2/index.js";
+import { getGroupModelKey } from "../src/core/chat-id.js";
 import type { CodeActReplyTask, GroupContextPackage } from "../src/subagent/types.js";
 
 function makeNC(): NotificationCenter {
-    return new NotificationCenter(join(tmpdir(), `chat-title-sync-test-${randomUUID()}.jsonl`), false);
+    return new NotificationCenter();
+}
+
+function makeMemory(): MemoryStoreV2 {
+    return new MemoryStoreV2(":memory:");
 }
 
 function makeContextSnapshot(overrides: Partial<GroupContextPackage> = {}): GroupContextPackage {
@@ -42,6 +53,16 @@ function makeTask(chatTitle: string, chatId = "onebot:group:123456"): CodeActRep
         decisions: [],
         enqueuedAt: Date.now(),
     };
+}
+
+function formatChatLabel(memory: MemoryStoreV2, chatId: string, fallbackTitle?: string | null): string {
+    const model = memory.getGroupModel(getGroupModelKey(chatId));
+    const title = model?.chatTitle?.trim() || fallbackTitle?.trim() || chatId;
+    return `${title}(${chatId})`;
+}
+
+function updateChatTitle(memory: MemoryStoreV2, chatId: string, newTitle: string): void {
+    memory.upsertGroupModel(getGroupModelKey(chatId), { chatTitle: newTitle, isDirectMessage: false });
 }
 
 describe("群名变更同步", () => {
@@ -91,67 +112,41 @@ describe("群名变更同步", () => {
         });
     });
 
-    describe("CodeActExecutor.updateChatTitle", () => {
-        it("should update chatTitle on tasks directly in the taskQueue", () => {
-            const executor = new CodeActExecutor("onebot:group:123456");
+    describe("Memory group model 更新", () => {
+        it("should reflect updated chatTitle through formatChatLabel after upsertGroupModel", () => {
+            const memory = makeMemory();
+            const chatId = "onebot:group:123456";
 
-            const task1 = makeTask("旧群名A");
-            const task2 = makeTask("旧群名B", "onebot:group:123456");
+            assert.equal(formatChatLabel(memory, chatId), `${chatId}(${chatId})`);
 
-            // 直接操作 taskQueue 避免 processNext 消费 tasks
-            // @ts-expect-error - accessing private field for testing
-            executor.taskQueue.push(task1);
-            // @ts-expect-error - accessing private field for testing
-            executor.taskQueue.push(task2);
+            updateChatTitle(memory, chatId, "新群名");
 
-            executor.updateChatTitle("新群名");
-
-            assert.equal(task1.contextSnapshot.chatTitle, "新群名");
-            assert.equal(task2.contextSnapshot.chatTitle, "新群名");
-            assert.equal(task1.contextSnapshot.groupModel?.chatTitle, "新群名");
-            assert.equal(task2.contextSnapshot.groupModel?.chatTitle, "新群名");
+            assert.equal(formatChatLabel(memory, chatId), `新群名(${chatId})`);
         });
 
-        it("should handle empty task queue gracefully", () => {
-            const executor = new CodeActExecutor("onebot:group:999");
+        it("should update only chatTitle field in group model", () => {
+            const memory = makeMemory();
+            const chatId = "onebot:group:123456";
 
-            // 不应抛出异常
-            executor.updateChatTitle("新群名");
+            updateChatTitle(memory, chatId, "旧群名");
+            const before = memory.getGroupModel(getGroupModelKey(chatId));
+            assert.ok(before);
+            assert.equal(before!.chatTitle, "旧群名");
+            assert.equal(before!.isDirectMessage, false);
+
+            updateChatTitle(memory, chatId, "更新后的群名");
+            const after = memory.getGroupModel(getGroupModelKey(chatId));
+            assert.ok(after);
+            assert.equal(after!.chatTitle, "更新后的群名");
+            assert.equal(after!.isDirectMessage, false);
         });
 
-        it("should handle tasks without groupModel", () => {
-            const executor = new CodeActExecutor("onebot:group:123456");
+        it("should handle empty title gracefully", () => {
+            const memory = makeMemory();
+            const chatId = "onebot:group:999";
 
-            const task: CodeActReplyTask = {
-                taskId: `task-${randomUUID()}`,
-                chatId: "onebot:group:123456",
-                contextSnapshot: makeContextSnapshot({ chatTitle: "旧群名", groupModel: undefined }),
-                decisions: [],
-                enqueuedAt: Date.now(),
-            };
-
-            // @ts-expect-error - accessing private field for testing
-            executor.taskQueue.push(task);
-            executor.updateChatTitle("新群名");
-
-            assert.equal(task.contextSnapshot.chatTitle, "新群名");
-            assert.equal(task.contextSnapshot.groupModel, undefined);
-        });
-
-        it("should update only chatTitle and groupModel.chatTitle, not other fields", () => {
-            const executor = new CodeActExecutor("onebot:group:123456");
-
-            const task = makeTask("旧群名");
-            const originalChatId = task.contextSnapshot.chatId;
-            const originalDepth = task.contextSnapshot.depth;
-
-            // @ts-expect-error - accessing private field for testing
-            executor.taskQueue.push(task);
-            executor.updateChatTitle("更新后的群名");
-
-            assert.equal(task.contextSnapshot.chatTitle, "更新后的群名");
-            assert.equal(task.contextSnapshot.chatId, originalChatId);
-            assert.equal(task.contextSnapshot.depth, originalDepth);
+            updateChatTitle(memory, chatId, "新群名");
+            assert.equal(formatChatLabel(memory, chatId), `新群名(${chatId})`);
         });
     });
 
@@ -163,7 +158,7 @@ describe("群名变更同步", () => {
                 newName: "来自OneBot的新群名",
             };
 
-            const newTitle = String(event.newName ?? (event as any).chatTitle ?? "");
+            const newTitle = String(event.newName ?? event.chatTitle ?? "");
             assert.equal(newTitle, "来自OneBot的新群名");
         });
 
@@ -174,7 +169,7 @@ describe("群名变更同步", () => {
                 chatTitle: "来自Telegram的新群名",
             };
 
-            const newTitle = String((event as any).newName ?? event.chatTitle ?? "");
+            const newTitle = String(event.newName ?? event.chatTitle ?? "");
             assert.equal(newTitle, "来自Telegram的新群名");
         });
 
@@ -186,7 +181,7 @@ describe("群名变更同步", () => {
                 chatTitle: "不应使用",
             };
 
-            const newTitle = String(event.newName ?? (event as any).chatTitle ?? "");
+            const newTitle = String(event.newName ?? event.chatTitle ?? "");
             assert.equal(newTitle, "OneBot名称");
         });
 
@@ -196,7 +191,7 @@ describe("群名变更同步", () => {
                 chatId: "onebot:group:123",
             };
 
-            const newTitle = String((event as any).newName ?? (event as any).chatTitle ?? "");
+            const newTitle = String((event as Record<string, unknown>).newName ?? (event as Record<string, unknown>).chatTitle ?? "");
             assert.equal(newTitle, "");
         });
     });
@@ -227,64 +222,60 @@ describe("群名变更同步", () => {
         });
     });
 
-    describe("端到端: NC事件 → CodeActExecutor 刷新", () => {
-        it("should update CodeActExecutor when NC event triggers updateChatTitle", () => {
+    describe("端到端: NC事件 → memory 更新 → formatChatLabel 刷新", () => {
+        it("should reflect new chat title from onebot.group_name_change", () => {
             const nc = makeNC();
-            const executor = new CodeActExecutor("onebot:group:123456");
+            const memory = makeMemory();
+            const chatId = "onebot:group:123456";
 
-            const task = makeTask("旧群名");
-            // 直接操作 taskQueue 避免 processNext 消费
-            // @ts-expect-error - accessing private field for testing
-            executor.taskQueue.push(task);
+            updateChatTitle(memory, chatId, "旧群名");
+            assert.equal(formatChatLabel(memory, chatId), `旧群名(${chatId})`);
 
             // 模拟 main.ts 中的 onPush 监听逻辑
             nc.onPush(event => {
                 const eventType = String(event.type ?? "");
                 if (eventType !== "onebot.group_name_change" && eventType !== "telegram.chat_title_refresh") return;
-                const newTitle = String(event.newName ?? event.chatTitle ?? "");
+                const newTitle = String((event as Record<string, unknown>).newName ?? (event as Record<string, unknown>).chatTitle ?? "");
                 if (newTitle) {
-                    executor.updateChatTitle(newTitle);
+                    updateChatTitle(memory, String(event.chatId), newTitle);
                 }
             });
 
-            // 触发群名变更
             nc.push({
                 type: "onebot.group_name_change",
-                chatId: "onebot:group:123456",
+                chatId,
                 newName: "端到端新群名",
             });
 
-            assert.equal(task.contextSnapshot.chatTitle, "端到端新群名");
-            assert.equal(task.contextSnapshot.groupModel?.chatTitle, "端到端新群名");
+            assert.equal(formatChatLabel(memory, chatId), `端到端新群名(${chatId})`);
 
             nc.dispose();
         });
 
         it("should work with telegram.chat_title_refresh events too", () => {
             const nc = makeNC();
-            const executor = new CodeActExecutor("telegram:-1001234567890");
+            const memory = makeMemory();
+            const chatId = "telegram:-1001234567890";
 
-            const task = makeTask("旧TG群名", "telegram:-1001234567890");
-            // @ts-expect-error - accessing private field for testing
-            executor.taskQueue.push(task);
+            updateChatTitle(memory, chatId, "旧TG群名");
+            assert.equal(formatChatLabel(memory, chatId), `旧TG群名(${chatId})`);
 
             nc.onPush(event => {
                 const eventType = String(event.type ?? "");
                 if (eventType !== "onebot.group_name_change" && eventType !== "telegram.chat_title_refresh") return;
-                const newTitle = String(event.newName ?? event.chatTitle ?? "");
+                const newTitle = String((event as Record<string, unknown>).newName ?? (event as Record<string, unknown>).chatTitle ?? "");
                 if (newTitle) {
-                    executor.updateChatTitle(newTitle);
+                    updateChatTitle(memory, String(event.chatId), newTitle);
                 }
             });
 
             nc.push({
                 type: "telegram.chat_title_refresh",
-                chatId: "telegram:-1001234567890",
+                chatId,
                 chatTitle: "新TG群名",
             });
 
-            assert.equal(task.contextSnapshot.chatTitle, "新TG群名");
-            assert.equal(task.contextSnapshot.groupModel?.chatTitle, "新TG群名");
+            assert.equal(formatChatLabel(memory, chatId), `新TG群名(${chatId})`);
 
             nc.dispose();
         });
