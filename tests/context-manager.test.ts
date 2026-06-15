@@ -24,6 +24,7 @@ import {
     type ContextBudget,
 } from "../src/memory-v2/context-manager.js";
 import type { ChatMessage } from "../src/core/llm.js";
+import type { LLMConfig } from "../src/core/config.js";
 
 // ─── 辅助工具 ───
 
@@ -304,6 +305,33 @@ describe("compact", () => {
         // 因为所有非-system 消息都落入 recent，candidates=0，应跳过
         assert.ok(result.length <= msgs.length);
     });
+
+    it("targetLlmConfig 控制压缩阈值，摘要模型只负责生成", async () => {
+        const msgs: ChatMessage[] = [
+            { role: "system", content: "system" },
+            ...makeMessages(12, 300),
+        ];
+        const compactProfile: LLMConfig = {
+            provider: "openai",
+            baseUrl: "http://127.0.0.1:1/v1",
+            apiKey: "test",
+            model: "compact-small-window",
+            temperature: 0,
+            maxTokens: 100,
+            maxContextTokens: 1,
+        };
+        const targetSessionProfile: LLMConfig = {
+            ...compactProfile,
+            model: "session-large-window",
+            maxContextTokens: 1_000_000,
+        };
+
+        const result = await compact(msgs, [compactProfile], DEFAULT_CONTEXT_BUDGET, {
+            targetLlmConfig: targetSessionProfile,
+        });
+
+        assert.equal(result, msgs, "未超过目标 session 窗口时应跳过 compact LLM 调用");
+    });
 });
 
 // ─── 7. mergeContextBudget ───
@@ -347,33 +375,33 @@ describe("ContextBudget 配置集成", () => {
     });
 });
 
-// ─── 9. context compaction wiring ───
+// ─── 9. session compaction wiring 回归验证 ───
 
-describe("context compaction wiring", () => {
-    it("旧的 rolling truncation 逻辑已删除", async () => {
+describe("session rolling truncation 已替换", () => {
+    it("code-act-executor 不含 'messages.length > 25' 旧逻辑", async () => {
         const { readFileSync } = await import("node:fs");
-        const mainContent = readFileSync("src/main.ts", "utf-8");
+        const executorContent = readFileSync("src/subagent/code-act-executor.ts", "utf-8");
         assert.ok(
-            !mainContent.includes("messages.length > 25"),
-            "main.ts 不应包含旧的 rolling truncation 逻辑"
+            !executorContent.includes("messages.length > 25"),
+            "code-act-executor 不应包含旧的 rolling truncation 逻辑"
         );
     });
 
-    it("当前由 code-act-executor 接入 shouldCompact", async () => {
+    it("code-act-executor 包含 shouldCompact 调用", async () => {
         const { readFileSync } = await import("node:fs");
         const executorContent = readFileSync("src/subagent/code-act-executor.ts", "utf-8");
         assert.ok(
             executorContent.includes("shouldCompact"),
-            "code-act-executor.ts 应包含 shouldCompact 调用"
+            "code-act-executor 应包含 shouldCompact 调用"
         );
     });
 
-    it("当前由 code-act-executor 接入 compact", async () => {
+    it("code-act-executor 包含 context-manager compact 调用", async () => {
         const { readFileSync } = await import("node:fs");
         const executorContent = readFileSync("src/subagent/code-act-executor.ts", "utf-8");
         assert.ok(
             executorContent.includes("await contextManagerCompact("),
-            "code-act-executor.ts 应包含 context-manager compact 调用"
+            "code-act-executor 应包含 context-manager compact 调用"
         );
     });
 });

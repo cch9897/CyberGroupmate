@@ -613,6 +613,10 @@ export async function runReflection(
         log.warn("Reflection Step 6: agent-state 写入失败", { error: String(err) });
     }
 
+    // NOTE: background-dreaming.md 不再由 reflection 生成。
+    // 做梦上下文改由 harness 启动前从本周期 subagent 任务 + 群关系画像重建，
+    // 见 src/harness/dreaming-context.ts。
+
     return result;
 }
 

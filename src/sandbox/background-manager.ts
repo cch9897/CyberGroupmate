@@ -115,7 +115,7 @@ export class BackgroundManager {
             endedAt: null,
         };
 
-        const promise = this.guardedRun(name, fn, abortController.signal);
+        const promise = this.guardedRun(name, info, fn, abortController.signal);
 
         this.tasks.set(name, { info, abortController, promise });
     }
@@ -188,26 +188,21 @@ export class BackgroundManager {
      */
     private async guardedRun(
         name: string,
+        info: TaskInfo,
         fn: (signal: AbortSignal) => Promise<void>,
         signal: AbortSignal
     ): Promise<void> {
-        const record = () => this.tasks.get(name);
-
+        // 直接持有本任务自己的 info 引用，避免按名查找：
+        // 同名任务被替换后，按名查找会拿到后继任务的记录并被误改。
         try {
             await fn(signal);
 
-            const r = record();
-            if (r) {
-                r.info.status = "done";
-                r.info.endedAt = new Date().toISOString();
-            }
+            info.status = "done";
+            info.endedAt = new Date().toISOString();
         } catch (err: unknown) {
-            const r = record();
-            if (!r) return;
-
             if (signal.aborted) {
-                r.info.status = "cancelled";
-                r.info.endedAt = new Date().toISOString();
+                info.status = "cancelled";
+                info.endedAt = new Date().toISOString();
             } else {
                 const errorMsg =
                     err instanceof Error
@@ -215,9 +210,9 @@ export class BackgroundManager {
                         : String(err);
                 const stack = err instanceof Error ? err.stack : undefined;
 
-                r.info.status = "error";
-                r.info.error = errorMsg;
-                r.info.endedAt = new Date().toISOString();
+                info.status = "error";
+                info.error = errorMsg;
+                info.endedAt = new Date().toISOString();
 
                 this.notifyCallback({
                     type: "system.background_error",

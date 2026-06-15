@@ -14,7 +14,7 @@ await onebot.useUsersAndProfile();
 await onebot.useSystemUtilities();
 ```
 
-`useXxx()` 本身不会执行 QQ 操作，只会触发 Pass 2 注入完整说明。真正执行时，Agent 调用 guide 中披露的：
+`useXxx()` 本身不会执行 QQ 操作，而是把完整说明作为执行输出返回给 Agent。真正执行时，Agent 调用 guide 中披露的：
 
 ```ts
 await onebot.callApi("get_group_info", { group_id: 123456 });

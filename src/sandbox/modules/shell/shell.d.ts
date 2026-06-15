@@ -64,6 +64,23 @@ declare const shell: {
     read(tabId?: string, lines?: number): Promise<string>;
 
     /**
+     * 短命令用 ```bash``` 阻塞拿输出；长任务才用本方法后台启动。立即返回 tabId，完成或超时时自动唤醒；不会 kill 进程。
+     *
+     * @param command 要在后台运行的命令
+     * @param opts.tabId 后台终端名（省略则自动命名 bg-N；不可为 "default"）
+     * @param opts.idleTimeout 多久无输出判定空闲并唤醒，毫秒（默认 120000；传 0 关闭）
+     * @param opts.maxDuration 运行硬上限并唤醒，毫秒（默认 1800000=30 分钟；传 0 关闭）
+     * @returns 立即返回 { tabId }，命令已在后台启动
+     *
+     * @example
+     * const { tabId } = await shell.runBackground("npm run build", { idleTimeout: 60000, maxDuration: 1800000 });
+     */
+    runBackground(
+        command: string,
+        opts?: { tabId?: string; idleTimeout?: number; maxDuration?: number },
+    ): Promise<{ tabId: string }>;
+
+    /**
      * 向指定终端注入按键输入。
      *
      * 用于应对交互式 CLI 的确认提示（如 "Is this ok? (y/N)"）。

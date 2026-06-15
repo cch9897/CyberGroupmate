@@ -12,7 +12,7 @@
 import { createInterface } from "node:readline";
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
-import { installCapabilityRegistry, setDuplicateMessageBlocking, setPlatform } from "./capability-registry.js";
+import { installCapabilityRegistry, setDuplicateMessageBlocking, setPlatform, setBannedWords } from "./capability-registry.js";
 import { BackgroundManager } from "./background-manager.js";
 import { createPromiseTracker } from "./promise-tracker.js";
 import { filesystem } from "./modules/filesystem/index.js";
@@ -41,6 +41,7 @@ const MAX_OUTPUT_LEDGER_ITEMS = 50;
 // ─── 暴露 setPlatform 到全局，供 host 通过 sandbox.execute 调用 ───
 (globalThis as Record<string, unknown>).__setPlatform = setPlatform;
 (globalThis as Record<string, unknown>).__setDuplicateMessageBlocking = setDuplicateMessageBlocking;
+(globalThis as Record<string, unknown>).__setBannedWords = setBannedWords;
 
 // ─── 顶层安全网：防止未捕获的异常导致 worker 进程崩溃 ───
 
@@ -86,6 +87,8 @@ interface HostCallResultMessage {
     ok: boolean;
     value?: unknown;
     error?: string;
+    method?: string;
+    stack?: string;
 }
 
 /** Worker → Host: 代码执行结果 */
@@ -412,6 +415,16 @@ function callHost(method: string, args: unknown[] = []): Promise<unknown> {
     });
 }
 
+function buildHostCallError(msg: HostCallResultMessage): Error {
+    const method = msg.method ?? "unknown";
+    const message = msg.error ?? "Unknown host call error";
+    const err = new Error(`[host_call:${method}] ${message}`);
+    if (msg.stack) {
+        err.stack = `${err.name}: ${err.message}\n--- Host stack ---\n${msg.stack}`;
+    }
+    return err;
+}
+
 function getExecutionOutput(index: number): SandboxQuoteOutput | null {
     const found = outputLedger.find((item) => item.index === index);
     return found ? { ...found } : null;
@@ -727,7 +740,7 @@ rl.on("line", async (line: string) => {
                 if (msg.ok) {
                     pending.resolve(msg.value);
                 } else {
-                    pending.reject(new Error(msg.error ?? "Unknown host call error"));
+                    pending.reject(buildHostCallError(msg));
                 }
             }
         }

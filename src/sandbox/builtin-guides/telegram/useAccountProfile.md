@@ -6,6 +6,7 @@ TelegramGuide: useAccountProfile
 ## 使用要点
 - 这些方法通常会直接修改当前登录账号。调用前确认目标字段和值，尤其是用户名、头像和生日。
 - 需要 peer 的地方优先使用 `InputPeerLike`：`'me'`、`'self'`、username、marked ID 或 mtcute raw/input peer 都可以。
+- mtcute 返回的对象在 sandbox 中会带 `__mtcuteRef`，可直接传回其他 mtcute 方法；`downloadAsBuffer` 的二进制返回会序列化为 `{ buffer, size }`。
 ## mtcute high-level API
 ### telegram.updateProfile
 Update your profile details.
@@ -197,6 +198,18 @@ telegram.iterProfilePhotos(userId: InputPeerLike, params?: Parameters<typeof get
         chunkSize?: number;
     }): AsyncIterableIterator<Photo>;
 ```
+### telegram.downloadAsBuffer
+Download a file and return its contents as a Buffer.
+
+> **Note**: This method _will_ download the entire file
+> into memory at once. This might cause an issue, so use wisely!
+
+**Available**: ✅ both users and bots
+
+@param params  File download parameters
+```ts
+telegram.downloadAsBuffer(location: FileDownloadLocation, params?: FileDownloadParameters): Promise<Uint8Array>;
+```
 ### telegram.editCloseFriends
 Edit "close friends" list using `InputPeerLike`s
 
@@ -209,6 +222,67 @@ telegram.editCloseFriends(ids: InputPeerLike[]): Promise<void>;
 ## Referenced mtcute input types
 
 这些声明由生成脚本从本地 mtcute `.d.ts` 摘录，用来解释上面签名里出现的输入类型。遇到更深的嵌套类型时，按 Source 路径继续查本地 mtcute 声明。
+
+### FileDownloadLocation
+
+Source: `node_modules/@mtcute/core/highlevel/types/files/utils.d.ts`
+
+```ts
+/**
+ * File location which should be downloaded.
+ * You can also provide TDLib and Bot API compatible File ID
+ */
+export type FileDownloadLocation = tl.TypeInputFileLocation | tl.TypeInputWebFileLocation | FileLocation | string;
+```
+
+### FileDownloadParameters
+
+Source: `node_modules/@mtcute/core/highlevel/types/files/utils.d.ts`
+
+```ts
+export interface FileDownloadParameters {
+    /**
+     * Total file size, if known.
+     * Used to determine upload part size.
+     * In some cases can be inferred from `file` automatically.
+     */
+    fileSize?: number;
+    /**
+     * Download part size (in KB).
+     * By default, automatically selected depending on the file size
+     * (or 64, if not provided). Must not be bigger than 512,
+     * must not be a fraction, and must be divisible by 4.
+     */
+    partSize?: number;
+    /**
+     * DC id from which the file will be downloaded.
+     *
+     * If provided DC is not the one storing the file,
+     * redirection will be handled automatically.
+     */
+    dcId?: number;
+    /**
+     * Offset in bytes. Must be divisible by 4096 (4 KB).
+     */
+    offset?: number;
+    /**
+     * Number of bytes to be downloaded.
+     * By default, downloads the entire file
+     */
+    limit?: number;
+    /**
+     * Function that will be called after some part has been downloaded.
+     *
+     * @param uploaded  Number of bytes already downloaded
+     * @param total  Total file size (`Infinity` if not available)
+     */
+    progressCallback?: (downloaded: number, total: number) => void;
+    /**
+     * Abort signal that can be used to cancel the download.
+     */
+    abortSignal?: AbortSignal;
+}
+```
 
 ### InputFileLike
 

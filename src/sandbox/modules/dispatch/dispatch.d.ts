@@ -1,7 +1,8 @@
 /**
- * dispatch.d.ts — Subagent 任务派发 API
+ * dispatch.d.ts — Subagent 跨聊天会话派发 API
  *
- * 当前 Subagent 可以把任务派发给另一个群/私聊绑定的 Subagent。
+ * 任何需要在其他聊天执行操作的场景都必须通过 dispatch 派发，由目标聊天的 Subagent 执行。
+ * 绝对禁止用平台 API（sendText / sendMedia 等）直接向非当前聊天发送消息。
  * 派发后目标 Subagent 会收到同一套 quote 解析后的任务上下文。
  */
 
@@ -54,6 +55,9 @@ interface DispatchTaskResult {
 interface DispatchedTaskStatus {
     taskId: string;
     chatId: string;
+    sourceType?: "meta" | "subagent";
+    sourceChatId?: string;
+    sourceTaskId?: string;
     contentDirection: string;
     toneGuidance?: string;
     quotes?: string[];
@@ -73,11 +77,12 @@ interface DispatchedTaskStatus {
 
 declare const dispatch: {
     /**
-     * 向指定群组派发一个任务，由目标群的 Subagent 执行回复、reaction 或其他群内行动。
+     * 向指定聊天派发一个任务，由目标聊天的 Subagent 在其绑定的聊天中执行。
      *
+     * 这是跨聊天操作的唯一正确方式。绝对禁止用平台 API 直接向其他聊天发送消息。
      * chatId 必须使用 composite chatId，例如 "telegram:-1001234567890"。
-     * 当前 Subagent 不能用 dispatch 给自己派任务；当前群内行动直接调用平台 API。
-     * 不要使用已废弃的 context 字段；需要搬运材料时写 quotes 或 inline quote。
+     * 当前 Subagent 不能用 dispatch 给自己派任务；当前聊天内行动直接调用平台 API。
+     * 目标任务完成后，结果会作为内部通知发回发起方 Subagent；全局 session digest 也会记录 source -> target -> result。
      *
      * @param chatId 目标 composite chatId。
      * @param taskSpec 任务方向、语气、quote、技能和跟踪信息。

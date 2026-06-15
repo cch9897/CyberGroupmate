@@ -70,6 +70,22 @@ export function formatTsForDisplay(isoUtc: string | undefined | null, tz?: strin
 }
 
 /**
+ * 返回配置时区下「现在」是星期几，如 "星期五"。
+ * @param tz - 可选，覆盖全局时区；缺省用全局时区，再缺省 fallback 到系统时区
+ * @param reference - 可选，覆盖参考时刻（默认当前时间），便于测试
+ */
+export function getWeekdayLabel(tz?: string, reference: Date = new Date()): string {
+    try {
+        return new Intl.DateTimeFormat("zh-CN", {
+            timeZone: tz ?? _globalTimezone,
+            weekday: "long",
+        }).format(reference);
+    } catch {
+        return "";
+    }
+}
+
+/**
  * Convert any supported timestamp value to Unix epoch milliseconds.
  */
 export function toUnixTimestampMs(value: string | number | Date | null | undefined): number | null {

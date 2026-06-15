@@ -38,6 +38,16 @@ export interface DispatchTaskResult {
     reminderId?: string;
 }
 
+export interface DispatchSource {
+    type: "meta" | "subagent";
+    chatId?: string;
+    taskId?: string;
+}
+
+export interface DispatchTaskOptions {
+    source?: DispatchSource;
+}
+
 export type DispatchedTaskStatusForPrompt = Omit<
     DispatchedSubagentTaskRecord,
     "createdAt" | "updatedAt" | "completedAt" | "sentMessages"
@@ -74,7 +84,8 @@ export interface DispatchApiDeps {
         "recordDispatchedSubagentTask" |
         "getDispatchedSubagentTask" |
         "listDispatchedSubagentTasks" |
-        "getSessionDigests"
+        "getSessionDigests" |
+        "addSessionDigest"
     >;
     accumulator: AttentionAccumulator;
     onTaskDispatched?: (task: CodeActReplyTask) => void | Promise<void>;
@@ -93,8 +104,9 @@ export interface DispatchApiDeps {
 
 export function createDispatchApi(deps: DispatchApiDeps) {
     return {
-        taskToGroup: async (chatId: string, taskSpec: DispatchTaskSpec): Promise<DispatchTaskResult> => {
+        taskToGroup: async (chatId: string, taskSpec: DispatchTaskSpec, options?: DispatchTaskOptions): Promise<DispatchTaskResult> => {
             assertNoLegacyContext(taskSpec);
+            const source = normalizeDispatchSource(options?.source);
             const subagent = deps.subagentManager.getOrCreate(chatId) as SubagentLike;
             const executor = await ensureExecutor(subagent, chatId, deps);
             const taskId = deps.taskIdFactory?.() ?? shortUuid();
@@ -129,6 +141,9 @@ export function createDispatchApi(deps: DispatchApiDeps) {
             deps.globalState?.recordDispatchedSubagentTask?.({
                 taskId,
                 chatId,
+                sourceType: source.type,
+                sourceChatId: source.chatId,
+                sourceTaskId: source.taskId,
                 contentDirection: taskSpec.contentDirection,
                 toneGuidance: taskSpec.toneGuidance,
                 quotes: taskSpec.quotes,
@@ -138,6 +153,7 @@ export function createDispatchApi(deps: DispatchApiDeps) {
                 tracking: taskSpec.tracking,
                 createdAt: task.createdAt,
             });
+            deps.globalState?.addSessionDigest?.(formatDispatchCreatedDigest(source, chatId, taskId, taskSpec));
 
             executor.enqueue(task);
             deps.accumulator.markActioned(chatId);
@@ -162,6 +178,35 @@ export function createDispatchApi(deps: DispatchApiDeps) {
             };
         },
     };
+}
+
+function normalizeDispatchSource(source?: DispatchSource): DispatchSource {
+    if (source?.type === "subagent" && source.chatId) {
+        return {
+            type: "subagent",
+            chatId: source.chatId,
+            taskId: source.taskId,
+        };
+    }
+    return { type: "meta" };
+}
+
+function formatDispatchCreatedDigest(
+    source: DispatchSource,
+    targetChatId: string,
+    taskId: string,
+    taskSpec: DispatchTaskSpec,
+): string {
+    const sourceLabel = source.type === "subagent"
+        ? `Subagent ${source.chatId}${source.taskId ? ` task=${source.taskId}` : ""}`
+        : "Meta";
+    const quoteCount = taskSpec.quotes?.length ?? 0;
+    return [
+        `[DISPATCH] ${sourceLabel} -> ${targetChatId}: task=${taskId}`,
+        `direction=${taskSpec.contentDirection.slice(0, 180)}`,
+        quoteCount ? `quotes=${quoteCount}` : "",
+        taskSpec.tracking ? "tracking=true" : "",
+    ].filter(Boolean).join("；");
 }
 
 function assertNoLegacyContext(taskSpec: DispatchTaskSpec): void {

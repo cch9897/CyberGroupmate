@@ -45,6 +45,27 @@ declare const fs: {
     writeFile(path: string, content: string): void;
 
     /**
+     * 以二进制模式写入文件（base64 字符串 → 二进制字节）。
+     *
+     * **保存 Telegram 下载媒体时必须用这个方法**，不能用 writeFile()。
+     * `telegram.downloadMedia()` / `telegram.downloadAsBuffer()` 返回的 `data.buffer` 是 base64 字符串；
+     * 若用 `fs.writeFile(path, data.buffer)` 写入，会把 base64 文本当 UTF-8 存储，导致图片/文件损坏。
+     *
+     * @param path - 文件路径（自动创建父目录）
+     * @param base64 - base64 编码的文件内容（即 `data.buffer`）
+     *
+     * @example
+     * // ✅ 正确：保存 Telegram 下载的图片
+     * const data = await telegram.downloadMedia(msg.mediaInfo.fileId, chatId, msg.id, msg.mediaInfo.uniqueFileId);
+     * fs.writeFileBinary("workspace/Downloads/photo.jpg", data.buffer);
+     *
+     * @example
+     * // ❌ 错误：writeFile 写入 base64 字符串，文件会损坏
+     * // fs.writeFile("workspace/Downloads/photo.jpg", data.buffer);
+     */
+    writeFileBinary(path: string, base64: string): void;
+
+    /**
      * 追加写入文件。文件不存在时会自动创建。
      * @param path - 文件路径
      * @param content - 追加的内容

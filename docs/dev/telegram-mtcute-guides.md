@@ -4,7 +4,7 @@
 
 ## 设计目标
 
-Telegram / MTProto 能力很大，不适合把所有 API 都常驻放进 Agent 的 brief。项目把低频、流程型、成组使用的能力收束成 `telegram.useXxx()` guide 入口。`useXxx()` 本身不会执行实际平台操作，只会触发 Pass 2 注入完整说明；真正执行时，Agent 直接调用 guide 中披露的 `telegram.<method>(...)`。
+Telegram / MTProto 能力很大，不适合把所有 API 都常驻放进 Agent 的 brief。项目把低频、流程型、成组使用的能力收束成 `telegram.useXxx()` guide 入口。`useXxx()` 本身不会执行实际平台操作，而是把完整说明作为执行输出返回给 Agent；真正执行时，Agent 直接调用 guide 中披露的 `telegram.<method>(...)`。如果后续调用报运行时错误，session-runner 也会按需把相关 guide / d.ts 文档注入到 observation 中。
 
 例子：
 
@@ -127,7 +127,7 @@ npm run gen:telegram-mtcute-guides
 3. `src/sandbox/builtin-guides.ts`：注册 guide 文件、方法名和 Pass 1 brief。
 4. `src/sandbox/modules/telegram/telegram.d.ts`：新增 `useXxx(): Promise<string>` 和 JSDoc。
 5. `src/sandbox/modules/telegram/index.ts`：新增 activator。
-6. `tests/telegram-guides.test.ts`：按需补 brief、Pass 2 注入或关键签名测试。
+6. `tests/telegram-guides.test.ts`：按需补 brief、guide 输出或关键签名测试。
 7. 运行生成命令和测试。
 
 ## 只同步 mtcute 类型/JSDoc 变化

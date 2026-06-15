@@ -6,6 +6,22 @@ import { describe, it, after } from "node:test";
 import assert from "node:assert/strict";
 import { Sandbox } from "../src/sandbox/sandbox.js";
 
+/**
+ * 从执行输出中取出 JSON 行。
+ * 执行输出末尾会附加运行时诊断行（如 "异步方法调用数：N"），
+ * 故不能直接 JSON.parse 整段输出，需从后往前找第一行可解析的 JSON。
+ */
+function parseJsonLine(output: string): any {
+    const lines = output.split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+        const t = lines[i].trim();
+        if (t.startsWith("{") || t.startsWith("[")) {
+            try { return JSON.parse(t); } catch { /* keep scanning */ }
+        }
+    }
+    throw new Error(`no JSON line found in output: ${JSON.stringify(output)}`);
+}
+
 describe("Sandbox", () => {
     const sandboxes: Sandbox[] = [];
 
@@ -192,65 +208,52 @@ describe("Sandbox", () => {
         assert.equal(event.data, "hello");
     });
 
-    it("should bridge memory and actions calls to host", async () => {
+    it("should bridge memory module calls to host", async () => {
         const sb = await makeSandbox();
 
         sb.setHostCallHandler(async (method, args) => {
             if (method === "mcp.list") {
                 return [];
             }
-            if (method === "memory.recall") {
-                return { topics: [{ id: "topic_1", label: args[0] }], facts: [], persons: [] };
+            if (method === "memory.searchTopics") {
+                return [{ id: "topic_1", label: String(args[0]) }];
             }
-            if (method === "actions.getTopicContext") {
-                return { id: args[0], label: "测试话题" };
+            if (method === "memory.searchFacts") {
+                return [{ id: "fact_1", subject: String(args[0]) }];
             }
             throw new Error(`unexpected method: ${method}`);
         });
 
         const result = await sb.execute(`
-          const recall = await memory.recall("京都");
-          const topic = await actions.getTopicContext("topic_1");
-          console.log(JSON.stringify({ recall, topic }));
+          const topics = await memory.searchTopics("京都");
+          const facts = await memory.searchFacts("京都");
+          console.log(JSON.stringify({ topics, facts }));
         `);
 
-        assert.equal(result.error, false);
-        const parsed = JSON.parse(result.output);
-        assert.equal(parsed.recall.topics[0].label, "京都");
-        assert.equal(parsed.topic.label, "测试话题");
+        assert.equal(result.error, false, result.output);
+        const parsed = parseJsonLine(result.output);
+        assert.equal(parsed.topics[0].label, "京都");
+        assert.equal(parsed.facts[0].subject, "京都");
     });
 
-    it("should expose code-based social skill helpers", async () => {
+    it("should include host call method and stack in proxied errors", async () => {
         const sb = await makeSandbox();
-        sb.setHostCallHandler(async (method, args) => {
+
+        sb.setHostCallHandler(async (method) => {
             if (method === "mcp.list") {
                 return [];
             }
-            if (method === "telegram.sendText") {
-                return {
-                    id: "sent_1",
-                    chat: { id: String(args[0]), type: "group" },
-                    sender: null,
-                    text: String(args[1]),
-                    date: new Date().toISOString(),
-                    isMention: false,
-                };
+            if (method === "memory.searchFacts") {
+                throw new Error("boom from host");
             }
             throw new Error(`unexpected method: ${method}`);
         });
 
-        const result = await sb.execute(`
-          const sent = await skills.social.replyInTelegram(123, "hello", { replyTo: 9 });
-          console.log(JSON.stringify(sent));
-        `);
+        const result = await sb.execute(`await memory.searchFacts("京都");`);
 
-        assert.equal(result.error, false);
-        const lines = result.output.split("\n");
-        assert.ok(lines.some(line => line.includes("[Telegram] sendText ok chat=123 msg=sent_1 text=hello")));
-        const parsed = JSON.parse(lines[lines.length - 1]);
-        assert.equal(parsed.chat.id, "123");
-        assert.equal(parsed.text, "hello");
-        assert.equal(parsed.id, "sent_1");
+        assert.equal(result.error, true);
+        assert.match(result.output, /\[host_call:memory\.searchFacts\] boom from host/);
+        assert.match(result.output, /--- Host stack ---/);
     });
 
     it("should expose host-backed telegram proxy as top-level variable", async () => {
@@ -284,7 +287,7 @@ describe("Sandbox", () => {
         assert.equal(result.error, false);
         const lines = result.output.split("\n");
         assert.ok(lines.some(line => line.includes("[Telegram] sendText ok chat=100 msg=msg_1 text=ping")));
-        const parsed = JSON.parse(lines[lines.length - 1]);
+        const parsed = parseJsonLine(result.output);
         assert.equal(parsed.me.id, "42");
         assert.equal(parsed.sent.id, "msg_1");
         assert.equal(parsed.sent.chat.id, "100");
@@ -345,18 +348,32 @@ describe("Sandbox", () => {
     });
 
 
-    it("should warn about bare async IIFE that is not awaited", async () => {
+    it("flushes and counts un-awaited API calls via runtime promise tracking", async () => {
+        // 旧的"正则检测未 await IIFE"告警已被运行时 Promise 追踪取代
+        // （commit 6d56082）。现在即使忘记 await，注入 API 的调用仍会被 flush 完成，
+        // 并在输出末尾附加 "异步方法调用数：N" 诊断行。
         const sb = await makeSandbox();
+        const calls: string[] = [];
+        sb.setHostCallHandler(async (method, args) => {
+            if (method === "mcp.list") return [];
+            if (method === "memory.searchFacts") {
+                calls.push(String(args[0]));
+                return [];
+            }
+            throw new Error(`unexpected method: ${method}`);
+        });
+
         const result = await sb.execute(`
-          (async () => {
-            console.log("inside");
-          })();
+          memory.searchFacts("kyoto");   // 故意不 await
           console.log("outside");
         `);
 
-        assert.equal(result.error, false);
-        assert.ok(result.output.includes("[Warning] 检测到未 await 的 async IIFE"));
+        assert.equal(result.error, false, result.output);
         assert.ok(result.output.includes("outside"));
+        // 未 await 的调用仍抵达 host（被 flush）
+        assert.deepEqual(calls, ["kyoto"]);
+        // 诊断行出现，表明运行时追踪生效
+        assert.ok(result.output.includes("异步方法调用数"), `output: ${JSON.stringify(result.output)}`);
     });
 
     it("should stop cleanly", async () => {
@@ -386,7 +403,11 @@ describe("Sandbox", () => {
         const sb = await makeSandbox();
         const result = await sb.executeShell('echo "hello from bash"');
         assert.equal(result.error, false);
-        assert.equal(result.output, "hello from bash");
+        // 应捕获到 stdout，附加 [cwd: ...]，且绝不泄漏 PTY 握手/完成 sentinel。
+        // （命令回显是否被剥离取决于 PTY chunk 时序，属尽力而为，不强断言）
+        assert.ok(result.output.includes("hello from bash"), `output: ${JSON.stringify(result.output)}`);
+        assert.ok(!result.output.includes("__SANDBOX_DONE_"), `sentinel leaked: ${JSON.stringify(result.output)}`);
+        assert.ok(result.output.includes("[cwd:"));
     });
 
     it("should capture shell stderr", async () => {
@@ -398,16 +419,17 @@ describe("Sandbox", () => {
 
     it("should handle shell execution errors (non-zero exit)", async () => {
         const sb = await makeSandbox();
-        const result = await sb.executeShell('exit 1');
+        // 用 `false`（返回码 1 但不会像 `exit` 那样杀掉持久 shell 进程）
+        const result = await sb.executeShell('false');
         assert.equal(result.error, true);
     });
 
-    it("should handle shell execution timeout", async () => {
+    it("should resolve with a timeout marker (not reject) when a command exceeds its timeout", async () => {
         const sb = await makeSandbox();
-        await assert.rejects(
-            () => sb.executeShell("sleep 30", 500),
-            { message: /timed out/ }
-        );
+        // executeShell 超时不抛错：保留进程在后台，返回带超时标记的部分输出，供 agent 决策（detach/kill）
+        const result = await sb.executeShell("sleep 30", 500);
+        assert.equal(result.error, true);
+        assert.ok(result.output.includes("timed out"), `output: ${JSON.stringify(result.output)}`);
     });
 
     it("should execute multi-command shell script", async () => {
@@ -416,5 +438,83 @@ describe("Sandbox", () => {
         assert.equal(result.error, false);
         assert.ok(result.output.includes("line1"));
         assert.ok(result.output.includes("line2"));
+    });
+
+    it("shell.runBackground launches non-blocking and emits shell_wake 'exit' on completion", async () => {
+        const sb = await makeSandbox();
+        const wake = new Promise<any>((resolve) => sb.once("shell_wake", resolve));
+        // 立即返回（非阻塞），命令仍在后台跑
+        const { tabId } = await sb.runShellBackground("sleep 1; echo RUN_DONE", { idleTimeout: 0 });
+        assert.ok(tabId && tabId !== "default");
+        const ev = await wake;
+        assert.equal(ev.reason, "exit");
+        assert.equal(ev.tabId, tabId);
+        assert.equal(ev.exitCode, 0);
+        assert.ok(ev.recentOutput.includes("RUN_DONE"), `recentOutput: ${JSON.stringify(ev.recentOutput)}`);
+        assert.ok(!ev.recentOutput.includes("__SANDBOX_DONE_"));
+    });
+
+    it("shell.runBackground emits shell_wake 'exit' with the real non-zero exit code", async () => {
+        const sb = await makeSandbox();
+        const wake = new Promise<any>((resolve) => sb.once("shell_wake", resolve));
+        await sb.runShellBackground("false", { idleTimeout: 0 });
+        const ev = await wake;
+        assert.equal(ev.reason, "exit");
+        assert.equal(ev.exitCode, 1);
+    });
+
+    it("shell.runBackground wakes with 'idle' when output goes quiet, without killing the process", async () => {
+        const sb = await makeSandbox();
+        const wake = new Promise<any>((resolve) => sb.once("shell_wake", resolve));
+        // 打印一行后长时间静默；idleTimeout 很短 → 触发 idle 唤醒
+        const { tabId } = await sb.runShellBackground("echo HELLO_IDLE; sleep 30", { idleTimeout: 5000, maxDuration: 0 });
+        const ev = await wake;
+        assert.equal(ev.reason, "idle");
+        assert.equal(ev.tabId, tabId);
+        // 进程未被 kill：tab 仍存活且 busy
+        const tabs = sb.listShellTabs();
+        const t = tabs.find((x) => x.id === tabId);
+        assert.ok(t && t.state === "busy", "idle 唤醒不应 kill 进程");
+    });
+
+    it("shell.runBackground wakes with 'hard' when maxDuration elapses while still printing, without killing", async () => {
+        const sb = await makeSandbox();
+        const wake = new Promise<any>((resolve) => sb.once("shell_wake", resolve));
+        // 持续刷输出，所以 idle 不会触发；maxDuration 很短 → 触发 hard
+        const { tabId } = await sb.runShellBackground(
+            "while true; do echo tick; sleep 0.2; done",
+            { idleTimeout: 0, maxDuration: 10000 },
+        );
+        const ev = await wake;
+        assert.equal(ev.reason, "hard");
+        assert.equal(ev.tabId, tabId);
+        const t = sb.listShellTabs().find((x) => x.id === tabId);
+        assert.ok(t && t.state === "busy", "hard 唤醒不应 kill 进程");
+        await sb.killShellTab(tabId);
+    });
+
+    it("shell.runBackground rejects 'default' as a background tab id", async () => {
+        const sb = await makeSandbox();
+        await assert.rejects(() => sb.runShellBackground("echo x", { tabId: "default" }), /default/);
+    });
+
+    it("shell.read does not leak internal sentinel lines", async () => {
+        const sb = await makeSandbox();
+        const wake = new Promise<any>((resolve) => sb.once("shell_wake", resolve));
+        const { tabId } = await sb.runShellBackground("echo READ_VISIBLE", { idleTimeout: 0 });
+        await wake; // 等命令跑完（含 sentinel 写入 scrollback）
+        const out = await sb.readShellTab(tabId, 100);
+        assert.ok(out.includes("READ_VISIBLE"), `read output: ${JSON.stringify(out)}`);
+        assert.ok(!out.includes("__SANDBOX_DONE_"), `sentinel leaked into read(): ${JSON.stringify(out)}`);
+    });
+
+    it("hasActiveBackgroundTasks tracks the background monitor lifecycle", async () => {
+        const sb = await makeSandbox();
+        assert.equal(sb.hasActiveBackgroundTasks(), false);
+        const wake = new Promise<any>((resolve) => sb.once("shell_wake", resolve));
+        await sb.runShellBackground("sleep 1; echo done", { idleTimeout: 0 });
+        assert.equal(sb.hasActiveBackgroundTasks(), true);
+        await wake;
+        assert.equal(sb.hasActiveBackgroundTasks(), false);
     });
 });

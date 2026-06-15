@@ -100,7 +100,7 @@ export interface EmbeddingConfig {
 }
 
 /** 组件路由中可配置超时的组件名 */
-export type RoutingComponentKey = 'meta' | 'session' | 'recording_cluster' | 'recording_triage' | 'reflection' | 'compact' | 'memory' | 'vision';
+export type RoutingComponentKey = 'meta' | 'session' | 'recording_cluster' | 'recording_triage' | 'post_task_followup' | 'reflection' | 'compact' | 'memory' | 'vision';
 
 /** 组件级 LLM 路由 — 每个组件可指定一个或多个 profile（fallback chain） */
 export interface LLMRoutingConfig {
@@ -112,6 +112,8 @@ export interface LLMRoutingConfig {
     recording_cluster?: string | string[];
     /** 话题摘要 + Triage（recording-pipeline Step 2） */
     recording_triage?: string | string[];
+    /** Post-task window 内 5 秒批量 follow-up 判定 */
+    post_task_followup?: string | string[];
     /** 反思引擎（reflection） */
     reflection?: string | string[];
     /** 上下文压缩（context-manager compact） */
@@ -155,6 +157,8 @@ export interface TelegramConfig {
     phone: string;
     /** 入站白名单（可选） */
     whitelist?: TelegramWhitelistConfig;
+    /** bot 模式 mtcute pts 预热群列表（独立于白名单，用于无白名单时也能预热指定群） */
+    prewarm?: { groups: string[] };
     /** 拟人化发送延迟配置 */
     humanizedDelay?: {
         /** 是否启用 */
@@ -264,10 +268,22 @@ export interface SubagentExternalConfig {
     alertEngagementThreshold?: number;
     /** Subagent 发言后等待群聊自然发酵并接管 L0 追问的窗口时长 (ms)。默认 120000 */
     postTaskWindowMs?: number;
+    /**
+     * post-task follow-up 判定器是否识别新消息中的图片。
+     * 开启时会下载并识别新批次图片（判定 profile 支持 vision 时内联图片）；
+     * 关闭时仅用占位文本，跳过识别以节省开销。默认 true。
+     */
+    postTaskFollowUpImageRecognition?: boolean;
     /** 是否限制 sandbox 只能对其绑定的 chatId 执行 adapter 写操作。默认 false */
     restrictAdapterWritesToBoundChat?: boolean;
     /** 是否启用 session 内重复发送拦截。默认 true */
     deduplicateSentMessages?: boolean;
+    /**
+     * Subagent 发言前禁用词列表。
+     * 若文本消息中包含列表中的任一词语，发送将被拦截并向 LLM 发出警告提示改写。
+     * 若不配置，使用内置默认词表（见 src/core/banned-words.ts DEFAULT_BANNED_WORDS）。
+     */
+    bannedWords?: string[];
     cosineDecay?: {
         defaultCyclePeriod?: number;
     };
@@ -340,6 +356,8 @@ export interface VisionConfig {
     stickerSendingMode?: "allow_all" | "allow_listed" | "disallow_all";
     /** 新收集的贴纸默认状态。默认 "enabled" */
     newStickerDefault?: "enabled" | "disabled";
+    /** 动态贴纸（WebM/TGS）抽帧数量上限。默认 3，设为 0 禁用动态贴纸识别 */
+    animatedStickerFrames?: number;
     /** 是否启用偷表情包（ImageCatalog + StickerDetector 管线）。默认 true */
     stickerStealingEnabled?: boolean;
     /** 图片出现次数达到此阈值后才进行表情包分类。默认 3 */
@@ -440,6 +458,12 @@ export interface GroundingConfig {
     model?: string;
 }
 
+/**
+ * 维护约定：这里能配置的，dashboard 也必须能配置。
+ * 每新增一个字段，请同步三处：① 上面对应的解析函数（parseXxxConfig）；
+ * ② serializeConfigToObject 的序列化（写回 yaml）；③ dashboard UI（src/dashboard/ui/src/panels/config/ 下对应的 *Tab.svelte）。
+ * 漏掉 ③ 会导致用户在 dashboard 存一次配置就把该字段清空。
+ */
 export interface AppConfig {
     llmProfiles: Record<string, LLMConfig>;
     llmRouting: LLMRoutingConfig;
@@ -468,6 +492,23 @@ export interface AppConfig {
     grounding?: GroundingConfig;
     /** LLM 请求限速配置 */
     rateLimiting?: import("./llm-rate-limiter.js").RateLimitConfig;
+    /** Background Agent 配置 */
+    backgroundAgent?: {
+        enabled?: boolean;
+        mcpPort?: number;
+        mcpToken?: string;
+        harness?: "claude-code" | "copilot";
+        claudeCodePath?: string;
+        copilotPath?: string;
+        harnessModel?: string;
+        schedule?: string;
+        /** 定时做梦的强制最小间隔（小时）。距上次做梦不足此值时，定时触发被忽略。默认 6，设 0 关闭。 */
+        minIntervalHours?: number;
+        maxBudgetUsd?: number;
+        extraArgs?: string[];
+        /** @deprecated use harnessModel */
+        claudeModel?: string;
+    };
 }
 
 // ─── 默认值 ───
@@ -526,7 +567,7 @@ export function loadConfig(configPath?: string, forceReload?: boolean): AppConfi
     // 解析 per-component timeouts
     const rawTimeouts = (fileRouting.timeouts ?? {}) as Record<string, unknown>;
     const parsedTimeouts: LLMRoutingConfig['timeouts'] = {};
-    for (const key of ['meta', 'session', 'recording_cluster', 'recording_triage', 'recording', 'reflection', 'compact', 'memory', 'vision'] as const) {
+    for (const key of ['meta', 'session', 'recording_cluster', 'recording_triage', 'post_task_followup', 'recording', 'reflection', 'compact', 'memory', 'vision'] as const) {
         if (rawTimeouts[key] != null) {
             parsedTimeouts[key] = num(rawTimeouts[key], 60000);
         }
@@ -539,6 +580,7 @@ export function loadConfig(configPath?: string, forceReload?: boolean): AppConfi
         session: parseRoutingValue(fileRouting.session),
         recording_cluster: parseRoutingValue(fileRouting.recording_cluster) ?? recordingFallback,
         recording_triage: parseRoutingValue(fileRouting.recording_triage) ?? recordingFallback,
+        post_task_followup: parseRoutingValue(fileRouting.post_task_followup),
         reflection: parseRoutingValue(fileRouting.reflection),
         compact: parseRoutingValue(fileRouting.compact),
         memory: parseRoutingValue(fileRouting.memory),
@@ -597,6 +639,7 @@ export function loadConfig(configPath?: string, forceReload?: boolean): AppConfi
             apiHash: str(fileTG.api_hash) ?? "",
             phone: str(fileTG.phone) ?? "",
             whitelist: parseTelegramWhitelist(fileTG),
+            prewarm: parseTelegramPrewarm(fileTG),
             humanizedDelay: parseHumanizedDelay(fileTG),
         } : undefined,
         discord: Object.keys(fileDC).length > 0 ? {
@@ -641,6 +684,7 @@ export function loadConfig(configPath?: string, forceReload?: boolean): AppConfi
         mcpServers: parseMcpServersConfig(fileConfig),
         grounding: parseGroundingConfig(fileConfig),
         rateLimiting: parseRateLimitingConfig(fileConfig),
+        backgroundAgent: parseBackgroundAgentConfig(fileConfig),
     };
 
     _cached = config;
@@ -824,8 +868,10 @@ function parseSubagentConfig(fileConfig: Record<string, unknown>): SubagentExter
         pollInterval: raw.poll_interval != null ? num(raw.poll_interval, 5000) : undefined,
         alertEngagementThreshold: raw.alert_engagement_threshold != null ? num(raw.alert_engagement_threshold, 60) : undefined,
         postTaskWindowMs: raw.post_task_window_ms != null ? num(raw.post_task_window_ms, 120000) : undefined,
+        postTaskFollowUpImageRecognition: raw.post_task_followup_image_recognition != null ? Boolean(raw.post_task_followup_image_recognition) : undefined,
         restrictAdapterWritesToBoundChat: raw.restrict_adapter_writes_to_bound_chat != null ? Boolean(raw.restrict_adapter_writes_to_bound_chat) : undefined,
         deduplicateSentMessages: raw.deduplicate_sent_messages != null ? Boolean(raw.deduplicate_sent_messages) : undefined,
+        bannedWords: Array.isArray(raw.banned_words) ? (raw.banned_words as unknown[]).map(String) : undefined,
         cosineDecay: Object.keys(rawCD).length > 0 ? {
             defaultCyclePeriod: rawCD.default_cycle_period != null ? num(rawCD.default_cycle_period, 20) : undefined,
         } : undefined,
@@ -891,6 +937,7 @@ function parseVisionConfig(fileConfig: Record<string, unknown>): VisionConfig | 
         mediaRetentionDays: raw.media_retention_days != null ? num(raw.media_retention_days, 3) : undefined,
         stickerSendingMode: (str(raw.sticker_sending_mode) as VisionConfig["stickerSendingMode"]) ?? undefined,
         newStickerDefault: (str(raw.new_sticker_default) as VisionConfig["newStickerDefault"]) ?? undefined,
+        animatedStickerFrames: raw.animated_sticker_frames != null ? num(raw.animated_sticker_frames, 3) : undefined,
         stickerStealingEnabled: raw.sticker_stealing_enabled != null ? !!raw.sticker_stealing_enabled : undefined,
         stickerStealingMinFrequency: raw.sticker_stealing_min_frequency != null ? num(raw.sticker_stealing_min_frequency, 3) : undefined,
         stickerStealingIntervalMin: raw.sticker_stealing_interval_min != null ? num(raw.sticker_stealing_interval_min, 10) : undefined,
@@ -948,6 +995,29 @@ function parseRateLimitingConfig(fileConfig: Record<string, unknown>): import(".
         maxConcurrency: num(raw.max_concurrency, 0),
         requestsPerMinute: num(raw.requests_per_minute, 0),
         perProfile: Object.keys(perProfile).length > 0 ? perProfile : undefined,
+    };
+}
+
+function parseBackgroundAgentConfig(fileConfig: Record<string, unknown>): AppConfig["backgroundAgent"] {
+    const raw = fileConfig.background_agent as Record<string, unknown> | undefined;
+    if (!raw || typeof raw !== "object") return undefined;
+    const harnessStr = str(raw.harness);
+    const harness = harnessStr === "claude-code" ? "claude-code" as const
+        : harnessStr === "copilot" ? "copilot" as const
+        : undefined;
+    return {
+        enabled: raw.enabled !== false,
+        mcpPort: raw.mcp_port != null ? num(raw.mcp_port, 3100) : undefined,
+        mcpToken: str(raw.mcp_token) ?? undefined,
+        harness,
+        claudeCodePath: str(raw.claude_code_path) ?? undefined,
+        copilotPath: str(raw.copilot_path) ?? undefined,
+        harnessModel: str(raw.harness_model) ?? str(raw.claude_model) ?? undefined,
+        claudeModel: str(raw.claude_model) ?? undefined,
+        schedule: str(raw.schedule) ?? undefined,
+        minIntervalHours: raw.min_interval_hours != null ? num(raw.min_interval_hours, 6) : undefined,
+        maxBudgetUsd: raw.max_budget_usd != null ? num(raw.max_budget_usd, 5) : undefined,
+        extraArgs: Array.isArray(raw.extra_args) ? (raw.extra_args as unknown[]).map(String) : undefined,
     };
 }
 
@@ -1092,6 +1162,15 @@ function parseTelegramWhitelist(fileTG: Record<string, unknown>): TelegramWhitel
     };
 }
 
+function parseTelegramPrewarm(fileTG: Record<string, unknown>): TelegramConfig["prewarm"] | undefined {
+    const raw = fileTG.prewarm as Record<string, unknown> | undefined;
+    if (!raw || typeof raw !== "object") return undefined;
+    const groups = Array.isArray(raw.groups)
+        ? (raw.groups as unknown[]).map(x => String(x).trim()).filter(Boolean)
+        : [];
+    return groups.length > 0 ? { groups } : undefined;
+}
+
 function parseOneBotWhitelist(fileOB: Record<string, unknown>): OneBotConfig["whitelist"] | undefined {
     const raw = fileOB.whitelist as Record<string, unknown> | undefined;
     if (!raw || typeof raw !== "object") return undefined;
@@ -1210,6 +1289,9 @@ export function serializeConfigToObject(config: AppConfig): Record<string, unkno
                 groups: config.telegram.whitelist.groups,
                 users: config.telegram.whitelist.users,
             };
+        }
+        if (config.telegram.prewarm) {
+            tg.prewarm = { groups: config.telegram.prewarm.groups };
         }
         obj.telegram = tg;
     }
@@ -1355,11 +1437,17 @@ export function serializeConfigToObject(config: AppConfig): Record<string, unkno
         if (sa.pollInterval != null) s.poll_interval = sa.pollInterval;
         if (sa.alertEngagementThreshold != null) s.alert_engagement_threshold = sa.alertEngagementThreshold;
         if (sa.postTaskWindowMs != null) s.post_task_window_ms = sa.postTaskWindowMs;
+        if (sa.postTaskFollowUpImageRecognition != null) {
+            s.post_task_followup_image_recognition = sa.postTaskFollowUpImageRecognition;
+        }
         if (sa.restrictAdapterWritesToBoundChat != null) {
             s.restrict_adapter_writes_to_bound_chat = sa.restrictAdapterWritesToBoundChat;
         }
         if (sa.deduplicateSentMessages != null) {
             s.deduplicate_sent_messages = sa.deduplicateSentMessages;
+        }
+        if (sa.bannedWords != null) {
+            s.banned_words = sa.bannedWords;
         }
         if (sa.cosineDecay) s.cosine_decay = { default_cycle_period: sa.cosineDecay.defaultCyclePeriod };
         if (sa.stickiness) {
@@ -1472,6 +1560,24 @@ export function serializeConfigToObject(config: AppConfig): Record<string, unkno
             rl.per_profile = pp;
         }
         obj.rate_limiting = rl;
+    }
+
+    // background_agent
+    if (config.backgroundAgent) {
+        const ba: Record<string, unknown> = {};
+        if (config.backgroundAgent.enabled != null) ba.enabled = config.backgroundAgent.enabled;
+        if (config.backgroundAgent.mcpPort != null) ba.mcp_port = config.backgroundAgent.mcpPort;
+        if (config.backgroundAgent.mcpToken != null) ba.mcp_token = config.backgroundAgent.mcpToken;
+        if (config.backgroundAgent.harness != null) ba.harness = config.backgroundAgent.harness;
+        if (config.backgroundAgent.claudeCodePath != null) ba.claude_code_path = config.backgroundAgent.claudeCodePath;
+        if (config.backgroundAgent.copilotPath != null) ba.copilot_path = config.backgroundAgent.copilotPath;
+        if (config.backgroundAgent.harnessModel != null) ba.harness_model = config.backgroundAgent.harnessModel;
+        if (config.backgroundAgent.claudeModel != null) ba.claude_model = config.backgroundAgent.claudeModel;
+        if (config.backgroundAgent.schedule != null) ba.schedule = config.backgroundAgent.schedule;
+        if (config.backgroundAgent.minIntervalHours != null) ba.min_interval_hours = config.backgroundAgent.minIntervalHours;
+        if (config.backgroundAgent.maxBudgetUsd != null) ba.max_budget_usd = config.backgroundAgent.maxBudgetUsd;
+        if (config.backgroundAgent.extraArgs && config.backgroundAgent.extraArgs.length > 0) ba.extra_args = config.backgroundAgent.extraArgs;
+        if (Object.keys(ba).length > 0) obj.background_agent = ba;
     }
 
     return obj;

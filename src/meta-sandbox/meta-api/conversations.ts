@@ -1,4 +1,5 @@
 import { getGroupModelKey, getPlatform } from "../../core/chat-id.js";
+import { formatMessageBody } from "../../core/message-enricher.js";
 import type {
     GroupModel,
     IMemoryStoreV2,
@@ -124,7 +125,8 @@ type ConversationsReader = Pick<IMemoryStoreV2,
     "getGroupModel" |
     "searchByAlias" |
     "getPersonIdentity" |
-    "listGroupModels"
+    "listGroupModels" |
+    "getStickerDescription"
 >;
 
 type ExecutorReader = {
@@ -266,7 +268,7 @@ function buildInboxItem(
     const groupModel = resolveGroupModel(memory, chatId);
     const chatTitle = groupModel?.chatTitle || resolveChatTitle(memory, chatId);
     const latest = memory.getRecentMessages(chatId, 1)[0];
-    const latestMessage = latest ? recentMessageToInboxMessage(latest) : undefined;
+    const latestMessage = latest ? recentMessageToInboxMessage(memory, latest) : undefined;
     const lastAttendedAt = subagent?.lastAttendedAt ?? null;
     const observerUnreadCount = subagent?.observer?.getBufferSize?.() ?? 0;
     const unread = isUnread(latestMessage, lastAttendedAt, observerUnreadCount);
@@ -305,13 +307,13 @@ function resolveGroupModel(memory: ConversationsReader, chatId: string): GroupMo
     }
 }
 
-function recentMessageToInboxMessage(message: RecentMessageEntry): ConversationInboxMessage {
+function recentMessageToInboxMessage(memory: ConversationsReader, message: RecentMessageEntry): ConversationInboxMessage {
     return {
         messageId: message.messageId,
         chatId: message.chatId,
         userId: message.userId,
         displayName: message.displayName,
-        content: message.text,
+        content: formatConversationMessageContent(memory, message),
         timestamp: message.timestamp,
     };
 }
@@ -538,6 +540,8 @@ function queryMessages(
                 displayName: row.displayName,
                 content: row.text,
                 timestamp: row.timestamp,
+                mediaType: row.mediaType,
+                mediaInfo: row.mediaInfo,
             }));
         merged.push(...rows);
     }
@@ -655,11 +659,40 @@ function enrichMessages(
 ): ConversationMessageResult[] {
     return rows.map((row) => {
         const chatTitle = resolveChatTitle(memory, row.chatId);
+        const { mediaType: _mediaType, mediaInfo: _mediaInfo, ...publicRow } = row;
         return {
-            ...row,
+            ...publicRow,
+            content: formatConversationMessageContent(memory, row),
             chatTitle,
             chatLabel: formatChatLabel(chatTitle, row.chatId),
         };
+    });
+}
+
+function formatConversationMessageContent(
+    memory: ConversationsReader,
+    row: {
+        messageId: string;
+        chatId: string;
+        displayName: string;
+        timestamp: string;
+        content?: string;
+        text?: string;
+        mediaType?: string;
+        mediaInfo?: string;
+    },
+): string {
+    const content = row.content ?? row.text ?? "";
+    return formatMessageBody({
+        id: row.messageId,
+        sender: row.displayName,
+        text: content,
+        timestamp: row.timestamp,
+        mediaType: row.mediaType,
+        mediaInfo: row.mediaInfo,
+    }, {
+        includeMediaTags: true,
+        stickerDescriptionLookup: memory,
     });
 }
 

@@ -1,9 +1,9 @@
 /**
  * api-intent-extractor.ts — 从 LLM 生成的代码中提取 API 方法调用
  *
- * 用于 Two-pass Code Generation 的第一阶段解析：
- * 从 Agent 初次生成的代码中识别出它打算调用哪些模块方法，
- * 以便后续按需注入对应的完整 TypeDoc 文档。
+ * 用于运行时错误后的文档恢复：
+ * 从 Agent 生成的代码中识别出它调用了哪些模块方法，
+ * 以便在运行时报错后按需注入对应的完整 TypeDoc / d.ts 文档。
  *
  * 模块前缀列表从 modules-docs.json 动态读取，无需硬编码。
  * 使用正则而非 AST 解析，因为 LLM 生成的代码不一定合法。
@@ -123,9 +123,9 @@ export function extractApiCalls(code: string, prefixMap: Record<string, string>)
 /**
  * 过滤出真正需要查阅完整文档的 API 调用。
  *
- * Two-pass 的触发和文档注入必须使用同一批 filtered calls；
- * 否则当代码同时包含 trivial 与 non-trivial API 时，non-trivial API
- * 会触发 Two-pass，而 trivial API 也会被当成 missing doc 一起注入。
+ * 文档注入的触发和缺失判断必须使用同一批 filtered calls；
+ * 否则当代码同时包含 trivial 与 non-trivial API 时，trivial API
+ * 也会被当成 missing doc 一起注入。
  */
 export function getDocLookupMethods(calls: string[]): string[] {
     return [...new Set(calls.filter(c => !TRIVIAL_CALLS.has(c)))];
@@ -134,11 +134,11 @@ export function getDocLookupMethods(calls: string[]): string[] {
 /**
  * 判断代码是否调用了需要查阅完整文档的 API
  *
- * 简单的调用（如 console.log、基本变量操作）不需要触发 Pass 2。
- * 只有当代码调用了 sandbox 注入的模块 API 时，才需要补充文档。
+ * 简单的调用（如 console.log、基本变量操作）不需要查阅完整文档。
+ * 只有当代码调用了 sandbox 注入的模块 API 时，运行时错误后才需要补充文档。
  *
  * @param calls extractApiCalls() 的返回值
- * @returns 是否需要触发 Pass 2
+ * @returns 是否需要查阅完整文档
  */
 export function needsDocLookup(calls: string[]): boolean {
     return getDocLookupMethods(calls).length > 0;

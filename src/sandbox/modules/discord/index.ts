@@ -10,6 +10,7 @@
 import type { CapabilityRegistryEnv } from "../../capability-registry.js";
 import { resolve as pathResolve } from "node:path";
 import { existsSync } from "node:fs";
+import { DEFAULT_BANNED_WORDS, findBannedWords, buildBannedWordWarning } from "../../../core/banned-words.js";
 
 // ─── 工具函数 ───
 
@@ -32,6 +33,7 @@ export function createDiscordClientProxy(
     env: CapabilityRegistryEnv,
     sentHistory: Map<string, Set<string>>,
     deduplicateSentMessages = true,
+    bannedWords: string[] = DEFAULT_BANNED_WORDS,
 ) {
     /**
      * 将可能的工作区相对路径解析为绝对路径。
@@ -108,6 +110,23 @@ export function createDiscordClientProxy(
 
     return {
         sendText: async (channelId: string, text: string, opts?: { replyTo?: string }) => {
+            // ── 禁用词拦截 ──
+            if (bannedWords.length > 0) {
+                const found = findBannedWords(text, bannedWords);
+                if (found.length > 0) {
+                    const warning = buildBannedWordWarning(found, text);
+                    env.emitOutput(warning);
+                    env.notifyHost({
+                        type: "system.banned_word_blocked",
+                        scene: "discord",
+                        chatId: channelId,
+                        text,
+                        foundWords: found,
+                        timestamp: Date.now(),
+                    });
+                    return null;
+                }
+            }
             // ── 重复消息拦截 ──
             if (shouldBlockDuplicate(channelId, text)) {
                 const warning = `[⚠ 运行时警告: 重复消息已拦截] 目标 channel=${channelId} 的消息 "${text.length > 80 ? text.slice(0, 80) + '...' : text}" 与本次 session 中已发送的消息内容完全一致，已自动拦截，不会重复发送。`;
@@ -177,6 +196,10 @@ export function createDiscordClientProxy(
                 timestamp: Date.now(),
             });
             return sent;
+        },
+        sendReaction: async (channelId: string, messageId: string, emoji: string) => {
+            await env.callHost("discord.sendReaction", [channelId, messageId, emoji]);
+            env.emitOutput(`[Discord] sendReaction ok channel=${channelId} msg=${messageId} emoji=${emoji}`);
         },
         sendTyping: async (channelId: string) => {
             await env.callHost("discord.sendTyping", [channelId]);

@@ -231,7 +231,21 @@ type NormalizedIncomingMessage = {
 
 type PreparedTelegramSticker =
     | { kind: "static"; path: string; buffer: Buffer; fileName: string; mimeType: "image/webp" }
-    | { kind: "video"; path: string; fileName: string; mimeType: "video/webm" };
+    | { kind: "video"; path: string; fileName: string; mimeType: "video/webm" }
+    | { kind: "animated"; path: string; fileName: string; mimeType: "application/x-tgsticker" };
+
+interface MtcuteObjectRefRecord {
+    value: object;
+    createdAt: number;
+    lastAccessAt: number;
+    type?: string;
+}
+
+const MTCUTE_OBJECT_REF_KEY = "__mtcuteRef";
+const MTCUTE_OBJECT_TYPE_KEY = "__mtcuteType";
+const MTCUTE_BYTES_KEY = "__mtcuteBytes";
+const MTCUTE_LONG_KEY = "__mtcuteLong";
+const MAX_MTCUTE_OBJECT_REFS = 1000;
 
 export class TelegramAdapter implements PlatformAdapter {
     readonly platform = "telegram";
@@ -240,6 +254,9 @@ export class TelegramAdapter implements PlatformAdapter {
     private selfUser: PlainUser | null = null;
     private messageHandler: ((msg: any) => Promise<void>) | null = null;
     private mediaCache = new MediaFileCache();
+    private mtcuteObjectRefCounter = 0;
+    private mtcuteObjectRefs = new Map<string, MtcuteObjectRefRecord>();
+    private mtcuteObjectRefByValue = new WeakMap<object, string>();
 
     // ─── 拟人化延迟状态 ───
     private lastSendTimes = new Map<string, number>();
@@ -287,6 +304,25 @@ export class TelegramAdapter implements PlatformAdapter {
         this.selfUser = this.normalizeUser(self);
         this.rememberPeerObject(self);
 
+        // Bot mode: mtcute lazily registers channel pts/cpts. Pre-warm known groups
+        // via getChat so the update loop sees their pts before any messages arrive.
+        // Use prewarm.groups if configured (independent of whitelist), else fall back to whitelist.groups.
+        if (this.config.mode === "bot" && typeof client.getChat === "function") {
+            const prewarmIds = this.config.prewarm?.groups?.length
+                ? new Set(this.config.prewarm.groups.map(normalizeWhitelistId))
+                : this.whitelistGroupIds;
+            for (const rawId of prewarmIds) {
+                const numericId = Number(rawId);
+                if (!Number.isSafeInteger(numericId)) continue;
+                try {
+                    await client.getChat(numericId);
+                    log.debug("bot 模式预热群组 pts", { rawId });
+                } catch (err) {
+                    log.warn("bot 模式预热群组 pts 失败（非关键）", { rawId, error: String(err).slice(0, 100) });
+                }
+            }
+        }
+
         this.messageHandler = async (msg: any) => {
             const normalized = await this.normalizeIncomingMessage(msg);
             if (!normalized || !normalized.messageId || !normalized.text) return;
@@ -305,10 +341,6 @@ export class TelegramAdapter implements PlatformAdapter {
             if (this.invisibleUsers.has(normalized.userId)) {
                 log.debug("invisible 用户消息已丢弃", { userId: normalized.userId, chatId: normalized.chatId });
                 return;
-            }
-
-            if (normalized.mediaInfo && normalized.messageId) {
-                await this.downloadIncomingMedia(normalized.mediaInfo, normalized.chatId, normalized.messageId);
             }
 
             log.debug("接收 Telegram 消息", {
@@ -677,7 +709,8 @@ export class TelegramAdapter implements PlatformAdapter {
                 const fileIdOrMedia = args[0];
                 if (!fileIdOrMedia) throw new Error("downloadMedia: fileId is required");
                 const uniqueFileId = typeof args[3] === "string" ? args[3] : undefined;
-                const buffer = await this.downloadMediaBuffer(fileIdOrMedia, args[1], args[2], uniqueFileId);
+                const normalized = this.normalizeDownloadMediaInput(fileIdOrMedia, uniqueFileId);
+                const buffer = await this.downloadMediaBuffer(normalized.location, args[1], args[2], normalized.uniqueFileId);
                 return { buffer: buffer.toString("base64"), size: buffer.length };
             }
             case "telegram.sendSticker": {
@@ -694,13 +727,32 @@ export class TelegramAdapter implements PlatformAdapter {
                 if (!fs.existsSync(stickerPath)) throw new Error(`sendSticker: 文件不存在 ${stickerPath}`);
                 const preparedSticker = this.prepareOutgoingStickerForTelegram(stickerPath);
                 const stickerOpts = args[2] ?? undefined;
-                if (preparedSticker.kind === "video") {
-                    const videoStickerMedia = await this.buildTelegramVideoStickerMedia(preparedSticker);
-                    return this.handleCall("telegram.sendMedia", [
-                        stickerTarget,
-                        videoStickerMedia,
-                        stickerOpts,
-                    ]);
+                if (preparedSticker.kind === "video" || preparedSticker.kind === "animated") {
+                    try {
+                        const dynamicStickerMedia = await this.buildTelegramDynamicStickerMedia(preparedSticker);
+                        return this.handleCall("telegram.sendMedia", [
+                            stickerTarget,
+                            dynamicStickerMedia,
+                            stickerOpts,
+                        ]);
+                    } catch (err) {
+                        log.warn("sendSticker: 动态贴纸发送失败，降级为静态 webp", {
+                            stickerPath,
+                            kind: preparedSticker.kind,
+                            error: String(err).slice(0, 200),
+                        });
+                        const fallbackSticker = await this.prepareOutgoingStaticStickerFallbackForTelegram(stickerPath);
+                        return this.handleCall("telegram.sendMedia", [
+                            stickerTarget,
+                            {
+                                type: "sticker",
+                                file: fallbackSticker.buffer,
+                                fileName: fallbackSticker.fileName,
+                                fileMime: fallbackSticker.mimeType,
+                            },
+                            stickerOpts,
+                        ]);
+                    }
                 }
                 return this.handleCall("telegram.sendMedia", [
                     stickerTarget,
@@ -945,39 +997,13 @@ export class TelegramAdapter implements PlatformAdapter {
                 return null;
             }
             case "telegram.canSendStory": {
-                if (typeof this.client.canSendStory !== "function") {
-                    throw new Error("canSendStory is not supported by the current Telegram client");
-                }
-                const storyPeer = await this.resolveStoryPeer(args[0] ?? "me");
-                return this.toPlainTelegramValue(await this.client.canSendStory(storyPeer));
+                return this.handleMtcutePassthrough(["canSendStory", ...args]);
             }
             case "telegram.sendStory": {
-                if (typeof this.client.sendStory !== "function") {
-                    throw new Error("sendStory is not supported by the current Telegram client");
-                }
-                const rawStoryParams = args.length > 1 && args[1] && typeof args[1] === "object"
-                    ? { ...(args[1] as Record<string, unknown>), peer: args[0] }
-                    : args[0];
-                const storyParams = await this.prepareSendStoryParams(rawStoryParams);
-                const story = await this.client.sendStory(storyParams);
-                return this.toPlainTelegramValue(story);
+                return this.handleMtcutePassthrough(["sendStory", ...args]);
             }
             case "telegram.sendStoryReaction": {
-                if (typeof this.client.sendStoryReaction !== "function") {
-                    throw new Error("sendStoryReaction is not supported by the current Telegram client");
-                }
-                const storyPeer = await this.resolveStoryPeer(args[0]);
-                const storyId = Number(args[1]);
-                if (!Number.isFinite(storyId)) throw new Error("sendStoryReaction: storyId must be a number");
-                const reaction = this.normalizeStoryReaction(args[2]);
-                const storyReactionOpts = (args[3] ?? {}) as Record<string, unknown>;
-                await this.client.sendStoryReaction({
-                    peerId: storyPeer,
-                    storyId,
-                    reaction,
-                    addToRecent: storyReactionOpts.addToRecent === true,
-                });
-                return null;
+                return this.handleMtcutePassthrough(["sendStoryReaction", ...args]);
             }
             default:
                 throw new Error(`Unsupported TelegramAdapter call: ${method}`);
@@ -1006,11 +1032,30 @@ export class TelegramAdapter implements PlatformAdapter {
             throw new Error(`mtcute client does not support ${methodName}`);
         }
 
-        const callArgs = await Promise.all(
-            args.slice(1).map(arg => this.prepareMtcutePassthroughArg(arg)),
-        );
-        const result = (fn as (...callArgs: unknown[]) => unknown).apply(this.client, callArgs);
-        return this.toPlainTelegramValue(await this.materializeMtcutePassthroughResult(result));
+        const rawArgs = args.slice(1);
+        const primaryArgs = rawArgs.map(arg => this.hydrateMtcuteArg(arg));
+
+        try {
+            const result = await this.invokeMtcuteMethod(fn as (...callArgs: unknown[]) => unknown, primaryArgs);
+            return this.toSandboxMtcuteValue(result);
+        } catch (primaryErr) {
+            const fallbackArgs = await Promise.all(
+                rawArgs.map(arg => this.prepareMtcutePassthroughArg(arg)),
+            );
+            try {
+                const result = await this.invokeMtcuteMethod(fn as (...callArgs: unknown[]) => unknown, fallbackArgs);
+                return this.toSandboxMtcuteValue(result);
+            } catch (fallbackErr) {
+                const primaryMsg = primaryErr instanceof Error ? primaryErr.message : String(primaryErr);
+                const fallbackMsg = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+                throw new Error(`${fallbackMsg}\n\n[原始 mtcute 调用错误] ${primaryMsg}`);
+            }
+        }
+    }
+
+    private async invokeMtcuteMethod(fn: (...callArgs: unknown[]) => unknown, callArgs: unknown[]): Promise<unknown> {
+        const result = fn.apply(this.client, callArgs);
+        return this.materializeMtcutePassthroughResult(result);
     }
 
     private async materializeMtcutePassthroughResult(result: unknown): Promise<unknown> {
@@ -1027,7 +1072,78 @@ export class TelegramAdapter implements PlatformAdapter {
         return items;
     }
 
+    private hydrateMtcuteArg(value: unknown, key?: string): unknown {
+        if (!value || typeof value !== "object") return value;
+        if (value instanceof Date || Buffer.isBuffer(value) || value instanceof Uint8Array || Long.isLong(value)) {
+            return value;
+        }
+        if (Array.isArray(value)) {
+            let changed = false;
+            const hydrated = value.map((item) => {
+                const next = this.hydrateMtcuteArg(item, key);
+                if (next !== item) changed = true;
+                return next;
+            });
+            return changed ? hydrated : value;
+        }
+
+        const raw = value as Record<string, unknown>;
+        const ref = raw[MTCUTE_OBJECT_REF_KEY];
+        if (typeof ref === "string") {
+            const found = this.mtcuteObjectRefs.get(ref);
+            if (!found) {
+                throw new Error(`mtcute object ref expired or unknown: ${ref}`);
+            }
+            found.lastAccessAt = Date.now();
+            return found.value;
+        }
+
+        const bytes = raw[MTCUTE_BYTES_KEY];
+        if (typeof bytes === "string") {
+            return Buffer.from(bytes, "base64");
+        }
+        if (
+            typeof raw.buffer === "string"
+            && (key === "fileReference" || key === "bytes")
+            && (raw.size == null || Number(raw.size) === Buffer.from(raw.buffer, "base64").length)
+        ) {
+            return Buffer.from(raw.buffer, "base64");
+        }
+
+        const longString = raw[MTCUTE_LONG_KEY];
+        if (typeof longString === "string" && longString.trim()) {
+            return Long.fromString(longString.trim(), false, 10);
+        }
+        if (
+            typeof raw.low === "number"
+            && typeof raw.high === "number"
+            && Object.keys(raw).every(k => k === "low" || k === "high" || k === "unsigned")
+        ) {
+            return Long.fromBits(raw.low, raw.high, raw.unsigned === true);
+        }
+
+        let changed = false;
+        const output: Record<string, unknown> = {};
+        for (const [childKey, childValue] of Object.entries(raw)) {
+            const next = this.hydrateMtcuteArg(childValue, childKey);
+            if (next !== childValue) changed = true;
+            output[childKey] = next;
+        }
+        return changed ? output : value;
+    }
+
     private async prepareMtcutePassthroughArg(value: unknown, key?: string): Promise<unknown> {
+        const hydrated = this.hydrateMtcuteArg(value, key);
+        if (
+            value
+            && typeof value === "object"
+            && !Array.isArray(value)
+            && typeof (value as Record<string, unknown>)[MTCUTE_OBJECT_REF_KEY] === "string"
+        ) {
+            return hydrated;
+        }
+        value = hydrated;
+
         if (typeof value === "string") {
             const normalized = this.normalizeMtcuteStringArg(value, key);
             return this.isFileLikeKey(key) ? this.prepareMtcuteFileLike(normalized) : normalized;
@@ -1040,9 +1156,6 @@ export class TelegramAdapter implements PlatformAdapter {
             return value;
         }
         const raw = value as Record<string, unknown>;
-        if (typeof raw.low === "number" && typeof raw.high === "number" && Object.keys(raw).every(k => k === "low" || k === "high" || k === "unsigned")) {
-            return Long.fromBits(raw.low, raw.high, raw.unsigned === true);
-        }
 
         const output: Record<string, unknown> = {};
         for (const [childKey, childValue] of Object.entries(raw)) {
@@ -1143,44 +1256,6 @@ export class TelegramAdapter implements PlatformAdapter {
         return "";
     }
 
-    private async resolveStoryPeer(peer: unknown): Promise<unknown> {
-        if (peer == null) return "me";
-        if (typeof peer === "string") {
-            const trimmed = peer.trim();
-            if (!trimmed || trimmed === "me" || trimmed === "self") return "me";
-        }
-        return this.ensurePeerCached(peer);
-    }
-
-    private async prepareSendStoryParams(rawParams: unknown): Promise<Record<string, unknown>> {
-        if (!rawParams || typeof rawParams !== "object" || Array.isArray(rawParams)) {
-            throw new Error("sendStory: params object is required");
-        }
-        const params = rawParams as Record<string, unknown>;
-        if (!("media" in params)) throw new Error("sendStory: media is required");
-        return {
-            ...params,
-            peer: await this.resolveStoryPeer(params.peer ?? "me"),
-            media: this.prepareMtcuteMediaLike(params.media),
-        };
-    }
-
-    private prepareMtcuteMediaLike(media: unknown): unknown {
-        if (typeof media === "string") {
-            return this.prepareMtcuteFileLike(media);
-        }
-        if (media && typeof media === "object" && !Array.isArray(media)) {
-            const input = media as Record<string, unknown>;
-            return {
-                ...input,
-                file: this.prepareMtcuteFileLike(input.file),
-                thumb: this.prepareMtcuteFileLike(input.thumb),
-                videoCover: this.prepareMtcuteFileLike(input.videoCover),
-            };
-        }
-        return media;
-    }
-
     private prepareMtcuteFileLike(file: unknown): unknown {
         if (typeof file !== "string") return file;
         const trimmed = file.trim();
@@ -1243,13 +1318,87 @@ export class TelegramAdapter implements PlatformAdapter {
         return [...new Set(candidates)];
     }
 
-    private normalizeStoryReaction(reaction: unknown): unknown {
-        if (reaction && typeof reaction === "object" && !Array.isArray(reaction)) {
-            const raw = reaction as Record<string, unknown>;
-            if (typeof raw.emoji === "string") return raw.emoji;
-            if (typeof raw.emoticon === "string") return raw.emoticon;
+    private rememberMtcuteObjectRef(value: object): string {
+        const existing = this.mtcuteObjectRefByValue.get(value);
+        if (existing && this.mtcuteObjectRefs.has(existing)) {
+            const found = this.mtcuteObjectRefs.get(existing);
+            if (found) found.lastAccessAt = Date.now();
+            return existing;
         }
-        return reaction;
+        if (existing) this.mtcuteObjectRefByValue.delete(value);
+
+        this.pruneMtcuteObjectRefs();
+        const ref = `mtcute_${Date.now().toString(36)}_${++this.mtcuteObjectRefCounter}`;
+        const now = Date.now();
+        this.mtcuteObjectRefByValue.set(value, ref);
+        this.mtcuteObjectRefs.set(ref, {
+            value,
+            createdAt: now,
+            lastAccessAt: now,
+            type: this.describeMtcuteObjectType(value),
+        });
+        return ref;
+    }
+
+    private pruneMtcuteObjectRefs(): void {
+        if (this.mtcuteObjectRefs.size < MAX_MTCUTE_OBJECT_REFS) return;
+        const overflow = this.mtcuteObjectRefs.size - MAX_MTCUTE_OBJECT_REFS + 100;
+        const oldest = [...this.mtcuteObjectRefs.entries()]
+            .sort((a, b) => a[1].lastAccessAt - b[1].lastAccessAt)
+            .slice(0, Math.max(overflow, 1));
+        for (const [ref] of oldest) {
+            this.mtcuteObjectRefs.delete(ref);
+        }
+    }
+
+    private describeMtcuteObjectType(value: object): string | undefined {
+        const raw = value as Record<string, unknown>;
+        if (typeof raw.type === "string") return raw.type;
+        if (typeof raw._ === "string") return raw._;
+        const ctorName = value.constructor?.name;
+        return ctorName && ctorName !== "Object" ? ctorName : undefined;
+    }
+
+    private toSandboxMtcuteValue(value: unknown, seen = new WeakMap<object, string>()): unknown {
+        if (value == null) return value;
+        if (Long.isLong(value)) {
+            const text = value.toString();
+            return { [MTCUTE_LONG_KEY]: text, value: text };
+        }
+        if (typeof value === "bigint") return value.toString();
+        if (typeof value !== "object") return value;
+        if (value instanceof Date) return value.toISOString();
+        if (Buffer.isBuffer(value)) {
+            const text = value.toString("base64");
+            return { [MTCUTE_BYTES_KEY]: text, buffer: text, size: value.length };
+        }
+        if (value instanceof Uint8Array) {
+            const buffer = Buffer.from(value);
+            const text = buffer.toString("base64");
+            return { [MTCUTE_BYTES_KEY]: text, buffer: text, size: value.byteLength };
+        }
+        if (Array.isArray(value)) {
+            return value.map(item => this.toSandboxMtcuteValue(item, seen));
+        }
+
+        const circularRef = seen.get(value);
+        if (circularRef) {
+            return { [MTCUTE_OBJECT_REF_KEY]: circularRef, circular: true };
+        }
+
+        const ref = this.rememberMtcuteObjectRef(value);
+        seen.set(value, ref);
+        const output: Record<string, unknown> = {
+            [MTCUTE_OBJECT_REF_KEY]: ref,
+        };
+        const type = this.mtcuteObjectRefs.get(ref)?.type;
+        if (type) output[MTCUTE_OBJECT_TYPE_KEY] = type;
+
+        for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+            if (typeof item === "function" || typeof item === "symbol") continue;
+            output[key] = this.toSandboxMtcuteValue(item, seen);
+        }
+        return output;
     }
 
     private toPlainTelegramValue(value: unknown, seen = new WeakSet<object>()): unknown {
@@ -1295,7 +1444,12 @@ export class TelegramAdapter implements PlatformAdapter {
     private prepareOutgoingStickerForTelegram(sourcePath: string): PreparedTelegramSticker {
         const lowerPath = sourcePath.toLowerCase();
         if (lowerPath.endsWith(".tgs")) {
-            throw new Error(`sendSticker: 暂不支持发送 TGS 动态贴纸 (${path.basename(sourcePath)})`);
+            return {
+                kind: "animated",
+                path: sourcePath,
+                fileName: this.ensureFileNameExtension(path.basename(sourcePath), ".tgs"),
+                mimeType: "application/x-tgsticker",
+            };
         }
         if (lowerPath.endsWith(".webm")) {
             return {
@@ -1333,6 +1487,20 @@ export class TelegramAdapter implements PlatformAdapter {
         }
 
         const webpPath = this.convertStickerImageToTelegramWebp(sourcePath);
+        return {
+            kind: "static",
+            path: webpPath,
+            buffer: fs.readFileSync(webpPath),
+            fileName: path.basename(webpPath),
+            mimeType: "image/webp",
+        };
+    }
+
+    private async prepareOutgoingStaticStickerFallbackForTelegram(sourcePath: string): Promise<Extract<PreparedTelegramSticker, { kind: "static" }>> {
+        const fallbackSourcePath = sourcePath.toLowerCase().endsWith(".tgs")
+            ? await this.renderTgsStickerFirstFrameToPng(sourcePath)
+            : sourcePath;
+        const webpPath = this.convertStickerImageToTelegramWebp(fallbackSourcePath);
         return {
             kind: "static",
             path: webpPath,
@@ -1430,43 +1598,50 @@ export class TelegramAdapter implements PlatformAdapter {
         throw new Error(`sendSticker: GIF 贴纸转 WebM 失败: ${String(lastError ?? "unknown error").slice(0, 200)}`);
     }
 
-    private async buildTelegramVideoStickerMedia(sticker: Extract<PreparedTelegramSticker, { kind: "video" }>): Promise<Record<string, unknown>> {
+    private async buildTelegramDynamicStickerMedia(sticker: Extract<PreparedTelegramSticker, { kind: "video" | "animated" }>): Promise<Record<string, unknown>> {
         const normalizeInputFile = this.client?._normalizeInputFile?.bind(this.client);
         if (typeof normalizeInputFile !== "function") {
-            throw new Error("sendSticker: 当前 Telegram client 不支持上传 video sticker");
+            throw new Error("sendSticker: 当前 Telegram client 不支持上传动态贴纸");
         }
 
         const stat = fs.statSync(sticker.path);
-        const inputFile = await normalizeInputFile(sticker.path, {
+        const inputFile = await normalizeInputFile(`file:${sticker.path}`, {
             fileName: sticker.fileName,
             fileMime: sticker.mimeType,
             fileSize: stat.size,
         });
-        const metadata = this.probeVideoMetadata(sticker.path);
-        return {
+        const attributes: Array<Record<string, unknown>> = [
+            { _: "documentAttributeFilename", fileName: sticker.fileName },
+            {
+                _: "documentAttributeSticker",
+                stickerset: { _: "inputStickerSetEmpty" },
+                alt: "",
+            },
+        ];
+        if (sticker.kind === "video") {
+            const metadata = this.probeVideoMetadata(sticker.path);
+            attributes.push({
+                _: "documentAttributeVideo",
+                duration: metadata.duration ?? 0,
+                w: metadata.width ?? 512,
+                h: metadata.height ?? 512,
+                supportsStreaming: true,
+            });
+        }
+
+        const media: Record<string, unknown> = {
             _: "inputMediaUploadedDocument",
             file: inputFile,
             mimeType: sticker.mimeType,
-            nosoundVideo: true,
-            attributes: [
-                { _: "documentAttributeFilename", fileName: sticker.fileName },
-                {
-                    _: "documentAttributeSticker",
-                    stickerset: { _: "inputStickerSetEmpty" },
-                    alt: "",
-                },
-                {
-                    _: "documentAttributeVideo",
-                    duration: metadata.duration ?? 0,
-                    w: metadata.width ?? 512,
-                    h: metadata.height ?? 512,
-                    supportsStreaming: true,
-                },
-            ],
+            attributes,
         };
+        if (sticker.kind === "video") {
+            media.nosoundVideo = true;
+        }
+        return media;
     }
 
-    private outgoingTelegramStickerPath(sourcePath: string, variant: string, ext: ".webp" | ".webm"): string {
+    private outgoingTelegramStickerPath(sourcePath: string, variant: string, ext: ".webp" | ".webm" | ".png"): string {
         const stat = fs.statSync(sourcePath);
         const hash = createHash("sha1")
             .update(`${sourcePath}:${stat.size}:${stat.mtimeMs}:${variant}`)
@@ -1477,6 +1652,22 @@ export class TelegramAdapter implements PlatformAdapter {
         const rawBase = path.basename(sourcePath, path.extname(sourcePath));
         const safeBase = rawBase.replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 80) || "sticker";
         return path.join(outDir, `${safeBase}_${hash}${ext}`);
+    }
+
+    private async renderTgsStickerFirstFrameToPng(sourcePath: string): Promise<string> {
+        const outPath = this.outgoingTelegramStickerPath(sourcePath, "tgs-first-frame-v1", ".png");
+        if (this.hasUsableFile(outPath)) return outPath;
+
+        const { createCanvas, LottieAnimation } = await import("@napi-rs/canvas");
+        const { gunzipSync } = await import("node:zlib");
+        const lottieJson = gunzipSync(fs.readFileSync(sourcePath)).toString("utf-8");
+        const anim = LottieAnimation.loadFromData(lottieJson);
+        const canvas = createCanvas(anim.width || 512, anim.height || 512);
+        const ctx = canvas.getContext("2d");
+        anim.seekFrame(0);
+        anim.render(ctx as any);
+        fs.writeFileSync(outPath, Buffer.from(canvas.toBuffer("image/png")));
+        return outPath;
     }
 
     private isAnimatedStickerSource(sourcePath: string): boolean {
@@ -1525,7 +1716,7 @@ export class TelegramAdapter implements PlatformAdapter {
         }
     }
 
-    private ensureFileNameExtension(fileName: string, ext: ".webp" | ".webm"): string {
+    private ensureFileNameExtension(fileName: string, ext: ".webp" | ".webm" | ".tgs"): string {
         return fileName.toLowerCase().endsWith(ext) ? fileName : `${fileName}${ext}`;
     }
 
@@ -1635,6 +1826,16 @@ export class TelegramAdapter implements PlatformAdapter {
     ): Promise<boolean> {
         const text = normalized.text.trim();
 
+        // ── 检查命令目标：若带 @username，必须与自己的用户名匹配 ──
+        const cmdMentionMatch = text.match(/^\/(\S+?)@(\S+)/);
+        if (cmdMentionMatch) {
+            const mentionedUsername = cmdMentionMatch[2].toLowerCase();
+            const selfUsername = this.selfUser?.username?.toLowerCase();
+            if (selfUsername && mentionedUsername !== selfUsername) {
+                return false;
+            }
+        }
+
         // ── /invisible ──
         if (/^\/invisible(?:@\S+)?$/i.test(text)) {
             const userId = normalized.userId;
@@ -1642,12 +1843,12 @@ export class TelegramAdapter implements PlatformAdapter {
                 this.invisibleUsers.delete(userId);
                 saveInvisibleUsers(this.invisibleUsers);
                 log.info("/invisible OFF", { userId, chatId: normalized.chatId });
-                await this.replySafe(normalized.chatId, `👁 你已取消隐身。Bot 将正常处理你的消息。`);
+                await this.replySafe(normalized.chatId, `👁 你已取消隐身。Bot 将正常处理你的消息。`, 8000);
             } else {
                 this.invisibleUsers.add(userId);
                 saveInvisibleUsers(this.invisibleUsers);
                 log.info("/invisible ON", { userId, chatId: normalized.chatId });
-                await this.replySafe(normalized.chatId, `🫥 你已开启隐身。你的所有消息将对 Bot 完全不可见（不处理、不记录）。再次发送 /invisible 可取消。`);
+                await this.replySafe(normalized.chatId, `🫥 你已开启隐身。你的所有消息将对 Bot 完全不可见（不处理、不记录）。再次发送 /invisible 可取消。`, 8000);
             }
             return true;
         }
@@ -1688,12 +1889,25 @@ export class TelegramAdapter implements PlatformAdapter {
 
     /**
      * 安全回复：尝试用 client.sendText 发送确认消息，失败时只记日志不抛异常。
+     * @param autoDeleteMs 若指定，则在该毫秒数后自动删除所发送的消息（适用于临时提示）。
      */
-    private async replySafe(chatId: string, text: string): Promise<void> {
+    private async replySafe(chatId: string, text: string, autoDeleteMs?: number): Promise<void> {
         try {
             if (this.client?.sendText) {
                 const peer = await this.ensurePeerCached(chatId);
-                await this.client.sendText(peer, text);
+                const sent = await this.client.sendText(peer, text);
+                if (autoDeleteMs && autoDeleteMs > 0 && typeof this.client.deleteMessagesById === "function") {
+                    const msgId = Number((sent as any)?.id);
+                    if (Number.isFinite(msgId) && msgId > 0) {
+                        setTimeout(async () => {
+                            try {
+                                await this.client!.deleteMessagesById!(peer, [msgId], { revoke: true });
+                            } catch (delErr) {
+                                log.debug("replySafe 自动删除失败", { chatId, msgId, error: String(delErr) });
+                            }
+                        }, autoDeleteMs);
+                    }
+                }
             }
         } catch (err) {
             log.warn("replySafe 发送失败", { chatId, error: String(err) });
@@ -2091,8 +2305,10 @@ export class TelegramAdapter implements PlatformAdapter {
             }
         }
 
+        const downloadLocation = this.hydrateMtcuteArg(fileIdOrMedia);
+
         try {
-            const uint8 = await this.client.downloadAsBuffer(fileIdOrMedia);
+            const uint8 = await this.client.downloadAsBuffer(downloadLocation);
             const buffer = Buffer.from(uint8);
             if (uniqueFileId) this.mediaCache.set(uniqueFileId, buffer);
             return buffer;
@@ -2122,11 +2338,14 @@ export class TelegramAdapter implements PlatformAdapter {
                 const msg = messages?.[0];
                 if (!msg) throw new Error("refetch 返回空消息");
 
+                const freshMedia = msg?.media;
                 const freshFileId = this.extractFileIdFromMessage(msg);
-                if (!freshFileId) throw new Error("refetch 消息中未找到 fileId");
+                if (!freshMedia && !freshFileId) throw new Error("refetch 消息中未找到媒体");
 
-                log.info("downloadMedia: refetch 成功，重试下载", { freshFileId: freshFileId.slice(0, 30) + "..." });
-                const uint8 = await this.client.downloadAsBuffer(freshFileId);
+                log.info("downloadMedia: refetch 成功，重试下载", {
+                    freshFileId: freshFileId ? freshFileId.slice(0, 30) + "..." : "media-object",
+                });
+                const uint8 = await this.client.downloadAsBuffer(this.hydrateMtcuteArg(freshMedia ?? freshFileId));
                 const buffer = Buffer.from(uint8);
                 if (uniqueFileId) this.mediaCache.set(uniqueFileId, buffer);
                 return buffer;
@@ -2141,7 +2360,52 @@ export class TelegramAdapter implements PlatformAdapter {
         }
     }
 
-    private async downloadIncomingMedia(mediaInfo: MediaInfo, chatId: string, messageId: string): Promise<void> {
+    private normalizeDownloadMediaInput(
+        fileIdOrMedia: unknown,
+        uniqueFileId?: string,
+    ): { location: unknown; uniqueFileId?: string } {
+        if (!fileIdOrMedia || typeof fileIdOrMedia !== "object" || Array.isArray(fileIdOrMedia)) {
+            return { location: fileIdOrMedia, uniqueFileId };
+        }
+        if (fileIdOrMedia instanceof Date || Buffer.isBuffer(fileIdOrMedia) || fileIdOrMedia instanceof Uint8Array || Long.isLong(fileIdOrMedia)) {
+            return { location: fileIdOrMedia, uniqueFileId };
+        }
+
+        const raw = fileIdOrMedia as Record<string, unknown>;
+        if (typeof raw[MTCUTE_OBJECT_REF_KEY] === "string" || typeof raw._ === "string") {
+            return { location: fileIdOrMedia, uniqueFileId };
+        }
+
+        const fileId = raw.fileId;
+        if (typeof fileId !== "string" || !fileId.trim()) {
+            return { location: fileIdOrMedia, uniqueFileId };
+        }
+
+        const looksLikeMediaInfo =
+            typeof raw.type === "string"
+            || "uniqueFileId" in raw
+            || "downloadStatus" in raw
+            || "mimeType" in raw
+            || "fileName" in raw
+            || "fileSize" in raw;
+        if (!looksLikeMediaInfo) {
+            return { location: fileIdOrMedia, uniqueFileId };
+        }
+
+        const mediaUniqueFileId = typeof raw.uniqueFileId === "string" && raw.uniqueFileId.trim()
+            ? raw.uniqueFileId.trim()
+            : undefined;
+        log.warn("downloadMedia: received mediaInfo object, using mediaInfo.fileId", {
+            type: typeof raw.type === "string" ? raw.type : undefined,
+            uniqueFileId: uniqueFileId ?? mediaUniqueFileId,
+        });
+        return {
+            location: fileId.trim(),
+            uniqueFileId: uniqueFileId ?? mediaUniqueFileId,
+        };
+    }
+
+    private async downloadIncomingMedia(mediaInfo: MediaInfo, chatId: string, messageId: string, mediaSource?: unknown): Promise<void> {
         if (!this.mediaDownloader || !mediaInfo.fileId) return;
 
         const uniqueFileId = mediaInfo.uniqueFileId ?? mediaInfo.fileId;
@@ -2159,7 +2423,7 @@ export class TelegramAdapter implements PlatformAdapter {
         }
 
         try {
-            const buffer = await this.downloadMediaBuffer(mediaInfo.fileId, chatId, messageId, uniqueFileId);
+            const buffer = await this.downloadMediaBuffer(mediaSource ?? mediaInfo.fileId, chatId, messageId, uniqueFileId);
             const saved = this.mediaDownloader.saveMedia(buffer, {
                 chatId,
                 messageId,
@@ -2201,6 +2465,9 @@ export class TelegramAdapter implements PlatformAdapter {
 
         // ── 媒体元数据提取 ──
         const mediaInfo = plain.mediaInfo;
+        if (mediaInfo && plain.id) {
+            await this.downloadIncomingMedia(mediaInfo, chatId, plain.id, plain.media);
+        }
 
         // 对纯 media 消息生成占位文本，确保 text 非空
         let text = plain.text ?? "";

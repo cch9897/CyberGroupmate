@@ -7,6 +7,8 @@
   let editEmoji = '';
   let editDesc = '';
   let editModal;
+  let searchQuery = '';
+  let activeSearchQuery = '';
 
   // 全局 sticker 发送模式（从 config 中读取）
   let stickerSendingMode = 'allow_all';
@@ -23,9 +25,25 @@
   }
 
   async function loadStickers() {
-    stickers = await api('/stickers');
+    const query = activeSearchQuery.trim();
+    const path = query ? `/stickers?q=${encodeURIComponent(query)}` : '/stickers';
+    stickers = await api(path);
     // 翻页重置到第一页如果当前页超出范围
     if (currentPage > totalPages) currentPage = Math.max(1, totalPages);
+  }
+
+  function applySearch() {
+    activeSearchQuery = searchQuery.trim();
+    currentPage = 1;
+    loadStickers();
+  }
+
+  function clearSearch() {
+    if (!searchQuery && !activeSearchQuery) return;
+    searchQuery = '';
+    activeSearchQuery = '';
+    currentPage = 1;
+    loadStickers();
   }
 
   async function loadStickerMode() {
@@ -87,9 +105,12 @@
   }
 
   async function batchToggleAll(enabled) {
+    const body = activeSearchQuery
+      ? { enabled, uniqueFileIds: stickers.map(s => s.uniqueFileId) }
+      : { enabled };
     await api('/stickers/batch-enabled', {
       method: 'PATCH',
-      body: { enabled },
+      body,
     });
     for (const s of stickers) s.enabled = enabled;
     stickers = stickers;
@@ -100,6 +121,8 @@
   }
 
   $: enabledCount = stickers.filter(s => s.enabled).length;
+  $: hasActiveSearch = activeSearchQuery.length > 0;
+  $: emptyStateText = hasActiveSearch ? `没有匹配 ${activeSearchQuery} 的贴纸` : '暂无贴纸缓存';
   $: totalPages = Math.max(1, Math.ceil(stickers.length / PAGE_SIZE));
   $: pagedStickers = stickers.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
 
@@ -155,7 +178,23 @@
       <h3 class="card-title text-sm">
         <i class="fa-solid fa-face-laugh-wink opacity-50 mr-1"></i>贴纸描述缓存
       </h3>
-      <div class="flex gap-2 items-center">
+      <div class="flex flex-wrap gap-2 items-center justify-end">
+        <form class="join" on:submit|preventDefault={applySearch}>
+          <input
+            type="search"
+            class="input input-xs input-bordered join-item w-36 sm:w-56"
+            bind:value={searchQuery}
+            placeholder="按 emoji 搜索，如 🧻 🙏"
+          />
+          <button class="btn btn-xs join-item" type="submit" title="搜索">
+            <i class="fa-solid fa-magnifying-glass"></i>
+          </button>
+          {#if hasActiveSearch}
+            <button class="btn btn-xs join-item" type="button" on:click={clearSearch} title="清空搜索">
+              <i class="fa-solid fa-xmark"></i>
+            </button>
+          {/if}
+        </form>
         {#if stickerSendingMode === 'allow_listed'}
           <button class="btn btn-xs btn-outline btn-success" title="全选" on:click={() => batchToggleAll(true)}>
             <i class="fa-solid fa-check-double"></i> 全选
@@ -163,6 +202,9 @@
           <button class="btn btn-xs btn-outline btn-error" title="取消全选" on:click={() => batchToggleAll(false)}>
             <i class="fa-solid fa-xmark"></i> 清空
           </button>
+        {/if}
+        {#if hasActiveSearch}
+          <span class="badge badge-sm badge-outline" title="当前搜索">{activeSearchQuery}</span>
         {/if}
         <span class="badge badge-sm badge-ghost">{stickers.length}</span>
         <button class="btn btn-xs btn-primary" on:click={loadStickers} title="刷新">
@@ -180,7 +222,7 @@
         </tr></thead>
         <tbody>
           {#if !stickers.length}
-            <tr><td colspan={stickerSendingMode === 'allow_listed' ? 7 : 6} class="text-center opacity-60">暂无贴纸缓存</td></tr>
+            <tr><td colspan={stickerSendingMode === 'allow_listed' ? 7 : 6} class="text-center opacity-60">{emptyStateText}</td></tr>
           {:else}
             {#each pagedStickers as s}
               <tr class:opacity-40={stickerSendingMode === 'allow_listed' && !s.enabled}>

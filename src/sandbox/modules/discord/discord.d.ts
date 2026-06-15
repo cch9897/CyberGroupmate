@@ -30,6 +30,15 @@ declare const discord: {
      */
     sendMedia(channelId: string, media: string | { type?: "photo" | "video" | "document" | "audio" | "auto"; url?: string; file?: string; caption?: string; fileName?: string }, opts?: { replyTo?: string; caption?: string }): Promise<{ id: string; text: string; channelId: string; guildId?: string; timestamp: number; }>;
 
+    /**
+     * 对指定消息添加表情反应。支持 Unicode emoji、自定义 emoji ID、name:id 或 Discord emoji mention 格式。
+     * @param channelId 目标频道 ID（由 sandbox 上下文自动填入当前频道）
+     * @param messageId 目标消息 ID
+     * @param emoji 表情字符串
+     * @example sendReaction(channelId, "1234567890123456789", "😄")
+     */
+    sendReaction(channelId: string, messageId: string, emoji: string): Promise<void>;
+
     // ─── 状态操作 ───
 
     /**

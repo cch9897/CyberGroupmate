@@ -1,27 +1,80 @@
 <script>
   import { appState, activeTab } from '../lib/stores.js';
   import { api } from '../lib/api.js';
-  import { shortId, escapeHtml, renderJsonHighlighted, getPlatform, platformLabel } from '../lib/utils.js';
+  import { shortId, getPlatform, platformLabel } from '../lib/utils.js';
 
-  let globalStateEl;
+  const LIST_LIMIT = 100;
+  const GROUP_OVERVIEW_LIMIT = 200;
+  const EMPTY_SCHEDULER = { reminders: [], crons: [], summary: {} };
+
+  let globalStateSummary = { sections: [], recent: {} };
+  let rawGlobalStateText = '';
+  let rawGlobalStateLoading = false;
+  let rawGlobalStateError = '';
+  let showRawGlobalState = false;
+  let systemLoading = false;
+  let systemError = '';
+  let refreshSeq = 0;
   let pool = {};
   let trackingWindows = [];
   let callbacks = [];
-  let scheduler = { reminders: [], crons: [], summary: {} };
+  let scheduler = EMPTY_SCHEDULER;
   let showTriggeredReminders = false;
 
   $: groups = $appState.groups;
+  $: activeReminders = (scheduler.reminders || []).filter(r => !r.triggered);
+  $: triggeredReminders = (scheduler.reminders || []).filter(r => r.triggered);
+  $: visibleActiveReminders = activeReminders.slice(0, LIST_LIMIT);
+  $: visibleTriggeredReminders = triggeredReminders.slice(0, LIST_LIMIT);
+  $: visibleCrons = (scheduler.crons || []).slice(0, LIST_LIMIT);
+  $: poolInstances = (pool.instances || []).slice(0, LIST_LIMIT);
+  $: visibleGroups = groups.slice(0, GROUP_OVERVIEW_LIMIT);
   $: if ($activeTab === 'system') refreshSystem();
 
   async function refreshSystem() {
-    const gs = await api('/global-state');
-    if (globalStateEl) renderJsonHighlighted(globalStateEl, gs);
+    const seq = ++refreshSeq;
+    systemLoading = true;
+    systemError = '';
+    try {
+      const [summary, poolStats, tracking, callbackItems, schedulerState] = await Promise.all([
+        api('/global-state/summary'),
+        api('/sandbox/pool'),
+        api('/dispatch-tracking'),
+        api('/callbacks'),
+        api('/scheduler'),
+      ]);
+      if (seq !== refreshSeq) return;
 
-    pool = await api('/sandbox/pool');
-    const fl = await api('/dispatch-tracking');
-    trackingWindows = fl.activeWindows || [];
-    callbacks = await api('/callbacks') || [];
-    scheduler = await api('/scheduler') || { reminders: [], crons: [], summary: {} };
+      globalStateSummary = summary || { sections: [], recent: {} };
+      pool = poolStats || {};
+      trackingWindows = tracking?.activeWindows || [];
+      callbacks = callbackItems || [];
+      scheduler = schedulerState || EMPTY_SCHEDULER;
+    } catch (err) {
+      if (seq === refreshSeq) systemError = String(err);
+    } finally {
+      if (seq === refreshSeq) systemLoading = false;
+    }
+  }
+
+  async function toggleRawGlobalState() {
+    showRawGlobalState = !showRawGlobalState;
+    if (showRawGlobalState && !rawGlobalStateText && !rawGlobalStateLoading) {
+      await loadRawGlobalState();
+    }
+  }
+
+  async function loadRawGlobalState() {
+    rawGlobalStateLoading = true;
+    rawGlobalStateError = '';
+    try {
+      const gs = await api('/global-state');
+      rawGlobalStateText = JSON.stringify(gs, null, 2);
+    } catch (err) {
+      rawGlobalStateError = String(err);
+    } finally {
+      rawGlobalStateLoading = false;
+    }
   }
 
   function timeUntil(isoDate) {
@@ -58,9 +111,60 @@
   <!-- Global State -->
   <div class="card bg-base-100">
     <div class="card-body p-4">
-      <h3 class="card-title text-sm">全局状态</h3>
-      <pre bind:this={globalStateEl}
-           class="json-display bg-base-300 p-3 rounded-lg overflow-auto max-h-[30vh] text-xs whitespace-pre-wrap"></pre>
+      <h3 class="card-title text-sm">
+        全局状态
+        {#if systemLoading}<span class="loading loading-spinner loading-xs ml-1"></span>{/if}
+        <button class="btn btn-xs btn-ghost ml-auto" title="刷新" on:click={refreshSystem}>
+          <i class="fa-solid fa-rotate"></i>
+        </button>
+        <button class="btn btn-xs btn-ghost" title="查看完整 JSON" on:click={toggleRawGlobalState}>
+          <i class="fa-solid fa-code"></i>
+          {showRawGlobalState ? '收起' : 'JSON'}
+        </button>
+      </h3>
+
+      {#if systemError}
+        <div class="alert alert-error py-2 text-xs">{systemError}</div>
+      {/if}
+
+      <div class="grid grid-cols-2 gap-2">
+        {#each globalStateSummary.sections || [] as section}
+          <div class="rounded bg-base-200 p-2">
+            <div class="text-[10px] uppercase opacity-60">{section.label}</div>
+            <div class="text-lg font-bold leading-tight">{section.count}</div>
+            {#if section.detail}
+              <div class="text-[10px] opacity-60 truncate" title={section.detail}>{section.detail}</div>
+            {/if}
+          </div>
+        {/each}
+      </div>
+
+      {#if globalStateSummary.recent?.metaSessionHistory?.length}
+        <div class="mt-3">
+          <div class="text-xs font-bold mb-1 opacity-70">最近 Meta History</div>
+          <div class="space-y-1">
+            {#each globalStateSummary.recent.metaSessionHistory as entry}
+              <div class="text-xs px-2 py-1 bg-base-200 rounded">
+                <span class="badge badge-xs badge-ghost mr-1">{entry.role}</span>
+                <span class="opacity-50 mr-1">{timeAgo(entry.timestamp)}</span>
+                <span class="opacity-80">{entry.content}</span>
+              </div>
+            {/each}
+          </div>
+        </div>
+      {/if}
+
+      {#if showRawGlobalState}
+        <div class="mt-3">
+          {#if rawGlobalStateLoading}
+            <div class="text-xs opacity-60">加载完整 JSON...</div>
+          {:else if rawGlobalStateError}
+            <div class="alert alert-error py-2 text-xs">{rawGlobalStateError}</div>
+          {:else}
+            <pre class="json-display bg-base-300 p-3 rounded-lg overflow-auto max-h-[30vh] text-xs whitespace-pre-wrap">{rawGlobalStateText}</pre>
+          {/if}
+        </div>
+      {/if}
     </div>
   </div>
 
@@ -76,7 +180,7 @@
       </div>
       {#if (pool.instances || []).length}
         <div class="mt-2 space-y-1">
-          {#each pool.instances as i}
+          {#each poolInstances as i}
             <div class="flex justify-between text-xs px-2 py-1 bg-base-200 rounded">
               <span class="font-mono">
                 {#if getPlatform(i.chatId)}<span class="platform-badge platform-{getPlatform(i.chatId)}">{platformLabel(getPlatform(i.chatId))}</span>{/if}
@@ -87,6 +191,9 @@
               </span>
             </div>
           {/each}
+          {#if (pool.instances || []).length > poolInstances.length}
+            <div class="text-[10px] opacity-50 px-2">仅显示前 {LIST_LIMIT} 个实例，共 {(pool.instances || []).length} 个</div>
+          {/if}
         </div>
       {/if}
     </div>
@@ -118,17 +225,17 @@
       <h3 class="card-title text-sm">
         <i class="fa-solid fa-clock opacity-50 mr-1"></i>定时调度
         <span class="badge badge-sm badge-ghost ml-auto">
-          {scheduler.summary.activeReminders || 0} 提醒 / {scheduler.summary.totalCrons || 0} 周期
+          {(scheduler.summary || {}).activeReminders || 0} 提醒 / {(scheduler.summary || {}).totalCrons || 0} 周期
         </span>
       </h3>
 
       <!-- Reminders -->
-      {#if scheduler.reminders.length}
+      {#if (scheduler.reminders || []).length}
         <div class="text-xs font-bold mt-2 mb-1 opacity-70">
           <i class="fa-solid fa-bell mr-1"></i>Reminders
         </div>
         <div class="space-y-1">
-          {#each scheduler.reminders.filter(r => !r.triggered) as r}
+          {#each visibleActiveReminders as r}
             <div class="flex items-start gap-2 text-xs px-2 py-1.5 bg-base-200 rounded">
               <div class="flex-1 min-w-0">
                 <div class="flex items-center gap-1">
@@ -144,8 +251,11 @@
               </button>
             </div>
           {/each}
+          {#if activeReminders.length > visibleActiveReminders.length}
+            <div class="text-[10px] opacity-50 px-2">仅显示前 {LIST_LIMIT} 个未触发提醒，共 {activeReminders.length} 个</div>
+          {/if}
         </div>
-        {#if scheduler.reminders.filter(r => r.triggered).length > 0}
+        {#if triggeredReminders.length > 0}
           <!-- svelte-ignore a11y_click_events_have_key_events -->
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div
@@ -153,11 +263,11 @@
             on:click={() => showTriggeredReminders = !showTriggeredReminders}
           >
             <i class="fa-solid fa-chevron-right text-[10px] transition-transform" style:transform={showTriggeredReminders ? "rotate(90deg)" : ""}></i>
-            <span>已触发 ({scheduler.reminders.filter(r => r.triggered).length})</span>
+            <span>已触发 ({triggeredReminders.length})</span>
           </div>
           {#if showTriggeredReminders}
             <div class="space-y-1 mt-1">
-              {#each scheduler.reminders.filter(r => r.triggered) as r}
+              {#each visibleTriggeredReminders as r}
                 <div class="flex items-start gap-2 text-xs px-2 py-1.5 bg-base-200 rounded opacity-40">
                   <div class="flex-1 min-w-0">
                     <div class="flex items-center gap-1">
@@ -170,18 +280,21 @@
                   </div>
                 </div>
               {/each}
+              {#if triggeredReminders.length > visibleTriggeredReminders.length}
+                <div class="text-[10px] opacity-50 px-2">仅显示前 {LIST_LIMIT} 个已触发提醒，共 {triggeredReminders.length} 个</div>
+              {/if}
             </div>
           {/if}
         {/if}
       {/if}
 
       <!-- Crons -->
-      {#if scheduler.crons.length}
+      {#if (scheduler.crons || []).length}
         <div class="text-xs font-bold mt-3 mb-1 opacity-70">
           <i class="fa-solid fa-repeat mr-1"></i>Crons
         </div>
         <div class="space-y-1">
-          {#each scheduler.crons as c}
+          {#each visibleCrons as c}
             <div class="flex items-start gap-2 text-xs px-2 py-1.5 bg-base-200 rounded">
               <div class="flex-1 min-w-0">
                 <div class="flex items-center gap-1">
@@ -203,10 +316,13 @@
               </button>
             </div>
           {/each}
+          {#if (scheduler.crons || []).length > visibleCrons.length}
+            <div class="text-[10px] opacity-50 px-2">仅显示前 {LIST_LIMIT} 个周期任务，共 {(scheduler.crons || []).length} 个</div>
+          {/if}
         </div>
       {/if}
 
-      {#if !scheduler.reminders.length && !scheduler.crons.length}
+      {#if !(scheduler.reminders || []).length && !(scheduler.crons || []).length}
         <div class="text-xs opacity-60 mt-2">无调度事件</div>
       {/if}
     </div>
@@ -222,7 +338,7 @@
             <th>ChatId</th><th>Stickiness</th><th>Engagement</th><th>Buffer</th><th>Attend #</th>
           </tr></thead>
           <tbody>
-            {#each groups as g}
+            {#each visibleGroups as g}
               <tr>
                 <td class="font-mono text-xs">
                   {#if getPlatform(g.chatId)}<span class="platform-badge platform-{getPlatform(g.chatId)}">{platformLabel(getPlatform(g.chatId))}</span>{/if}
@@ -237,6 +353,9 @@
           </tbody>
         </table>
       </div>
+      {#if groups.length > visibleGroups.length}
+        <div class="text-[10px] opacity-50 mt-1">仅显示前 {GROUP_OVERVIEW_LIMIT} 个群组，共 {groups.length} 个</div>
+      {/if}
     </div>
   </div>
 

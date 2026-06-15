@@ -389,18 +389,20 @@ export async function compact(
     options?: {
         replyChain?: Map<number, number>;
         engagedIndices?: Set<number>;
+        /** 用于判断目标 session 是否超窗；摘要生成仍使用 llmConfigs。 */
+        targetLlmConfig?: LLMConfig;
     },
 ): Promise<ChatMessage[]> {
     const resolvedBudget = budget ?? getConfiguredBudget();
 
-    // 使用 llmConfigs[0] 中的 maxContextTokens 覆盖 budget 的 effectiveContextWindow
-    const primaryConfig = llmConfigs[0];
-    const effectiveBudget = primaryConfig?.maxContextTokens && primaryConfig.maxContextTokens > 0
-        ? { ...resolvedBudget, effectiveContextWindow: primaryConfig.maxContextTokens }
+    // 使用目标 session 模型的 maxContextTokens 覆盖 budget；摘要生成模型可走独立 compact 路由。
+    const targetConfig = options?.targetLlmConfig ?? llmConfigs[0];
+    const effectiveBudget = targetConfig?.maxContextTokens && targetConfig.maxContextTokens > 0
+        ? { ...resolvedBudget, effectiveContextWindow: targetConfig.maxContextTokens }
         : resolvedBudget;
 
     // 不需要压缩时原样返回
-    if (!shouldCompact(messages, effectiveBudget, primaryConfig)) {
+    if (!shouldCompact(messages, effectiveBudget, targetConfig)) {
         log.debug("compact: 未超预算，跳过压缩");
         return messages;
     }

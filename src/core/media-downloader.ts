@@ -3,7 +3,7 @@
  *
  * 负责：
  * - 将下载的媒体 Buffer 按类型保存到 workspace/Downloads/
- * - 按 uniqueFileId 去重（已存在则跳过）
+ * - 按 uniqueFileId 去重（已存在则跳过）；贴纸额外按文件内容去重
  * - 3 天（可配）自动清理过期文件
  *
  * 目录结构：
@@ -17,6 +17,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import mime from "mime-to-extensions";
 import { createLogger } from "./logger.js";
 
@@ -35,6 +36,8 @@ export interface MediaFileInfo {
     mimeType?: string;
     /** 文件大小 bytes */
     size: number;
+    /** 文件内容 SHA256，仅对需要稳定内容身份的媒体填充 */
+    contentHash?: string;
 }
 
 export interface MediaSaveOptions {
@@ -95,6 +98,24 @@ function resolveExt(mimeType?: string, fileName?: string): string {
     return ".bin";
 }
 
+function sha256(buffer: Buffer): string {
+    return createHash("sha256").update(buffer).digest("hex");
+}
+
+function sha256File(filePath: string): string {
+    return sha256(fs.readFileSync(filePath));
+}
+
+function isStickerPath(filePath: string): boolean {
+    return path.basename(path.dirname(filePath)) === "stickers";
+}
+
+function recordValue(value: unknown): Record<string, unknown> | null {
+    return typeof value === "object" && value !== null && !Array.isArray(value)
+        ? value as Record<string, unknown>
+        : null;
+}
+
 // ─── MediaDownloader ───
 
 export class MediaDownloader {
@@ -105,6 +126,11 @@ export class MediaDownloader {
     private cleanupTimer: ReturnType<typeof setInterval> | null = null;
     /** uniqueFileId → absolute path 索引 (内存) */
     private readonly pathIndex = new Map<string, string>();
+    /** sticker content SHA256 → absolute path 索引 (内存) */
+    private readonly stickerContentIndex = new Map<string, string>();
+    /** uniqueFileId → sticker content SHA256 索引 (内存) */
+    private readonly stickerAliasContentHashes = new Map<string, string>();
+    private readonly indexedStickerPaths = new Set<string>();
 
     constructor(config?: MediaDownloaderConfig) {
         // 始终 resolve 为绝对路径，确保从任意 cwd 都能正确访问
@@ -167,24 +193,58 @@ export class MediaDownloader {
             return null;
         }
 
+        const category = categorize(opts.mediaType);
+        const contentHash = category === "stickers" ? sha256(buffer) : undefined;
+
         // 去重
         const existing = this.pathIndex.get(opts.uniqueFileId);
         if (existing) {
             try {
                 if (fs.existsSync(existing)) {
                     const stat = fs.statSync(existing);
+                    if (contentHash && isStickerPath(existing)) {
+                        this.stickerContentIndex.set(contentHash, existing);
+                        this.stickerAliasContentHashes.set(opts.uniqueFileId, contentHash);
+                        this.indexedStickerPaths.add(existing);
+                    }
                     return {
                         path: existing,
-                        category: categorize(opts.mediaType),
+                        category,
                         mimeType: opts.mimeType,
                         size: stat.size,
+                        contentHash,
                     };
                 }
             } catch { /* 文件可能已被清理 */ }
             this.pathIndex.delete(opts.uniqueFileId);
+            this.stickerAliasContentHashes.delete(opts.uniqueFileId);
         }
 
-        const category = categorize(opts.mediaType);
+        if (contentHash) {
+            const duplicatePath = this.stickerContentIndex.get(contentHash);
+            try {
+                if (duplicatePath && fs.existsSync(duplicatePath)) {
+                    this.pathIndex.set(opts.uniqueFileId, duplicatePath);
+                    this.stickerAliasContentHashes.set(opts.uniqueFileId, contentHash);
+                    this.saveManifest();
+                    log.debug("saveMedia: 贴纸内容已存在，复用文件", {
+                        uniqueFileId: opts.uniqueFileId,
+                        contentHash,
+                        filePath: duplicatePath,
+                        size: buffer.length,
+                    });
+                    return {
+                        path: duplicatePath,
+                        category,
+                        mimeType: opts.mimeType,
+                        size: buffer.length,
+                        contentHash,
+                    };
+                }
+            } catch { /* stale index entry */ }
+            this.stickerContentIndex.delete(contentHash);
+        }
+
         const ext = resolveExt(opts.mimeType, opts.fileName);
         const chatId = (opts.chatId ?? "unknown").replace(/:/g, "_");
         const msgId = opts.messageId ?? "0";
@@ -196,6 +256,11 @@ export class MediaDownloader {
         try {
             fs.writeFileSync(filePath, buffer);
             this.pathIndex.set(opts.uniqueFileId, filePath);
+            if (contentHash) {
+                this.stickerContentIndex.set(contentHash, filePath);
+                this.stickerAliasContentHashes.set(opts.uniqueFileId, contentHash);
+                this.indexedStickerPaths.add(filePath);
+            }
             this.saveManifest();
             log.debug("saveMedia: 已保存", { filePath, size: buffer.length });
             return {
@@ -203,9 +268,39 @@ export class MediaDownloader {
                 category,
                 mimeType: opts.mimeType,
                 size: buffer.length,
+                contentHash,
             };
         } catch (err) {
             log.warn("saveMedia: 写入失败", { filePath, error: String(err) });
+            return null;
+        }
+    }
+
+    private indexStickerContent(filePath: string, contentHash?: string): string | null {
+        if (!isStickerPath(filePath)) return null;
+        if (contentHash) {
+            if (!this.stickerContentIndex.has(contentHash)) {
+                this.stickerContentIndex.set(contentHash, filePath);
+            }
+            this.indexedStickerPaths.add(filePath);
+            return contentHash;
+        }
+        if (this.indexedStickerPaths.has(filePath)) {
+            for (const [hash, indexedPath] of this.stickerContentIndex.entries()) {
+                if (indexedPath === filePath) return hash;
+            }
+        }
+        try {
+            const stat = fs.statSync(filePath);
+            if (!stat.isFile()) return null;
+            const hash = sha256File(filePath);
+            if (!this.stickerContentIndex.has(hash)) {
+                this.stickerContentIndex.set(hash, filePath);
+            }
+            this.indexedStickerPaths.add(filePath);
+            return hash;
+        } catch {
+            /* stale manifest entry */
             return null;
         }
     }
@@ -253,11 +348,19 @@ export class MediaDownloader {
             if (!fs.existsSync(this.manifestPath)) return false;
             const raw = JSON.parse(fs.readFileSync(this.manifestPath, "utf-8"));
             if (typeof raw !== "object" || raw === null) return false;
+            const meta = recordValue((raw as Record<string, unknown>)._meta);
+            const stickerContentHashes = recordValue(meta?.stickerContentHashes);
             let loaded = 0;
             for (const [uniqueFileId, filePath] of Object.entries(raw)) {
+                if (uniqueFileId.startsWith("_")) continue;
                 if (typeof filePath !== "string") continue;
                 if (fs.existsSync(filePath)) {
                     this.pathIndex.set(uniqueFileId, filePath);
+                    const hash = typeof stickerContentHashes?.[uniqueFileId] === "string"
+                        ? stickerContentHashes[uniqueFileId]
+                        : undefined;
+                    const indexedHash = this.indexStickerContent(filePath, hash);
+                    if (indexedHash) this.stickerAliasContentHashes.set(uniqueFileId, indexedHash);
                     loaded++;
                 }
             }
@@ -271,14 +374,33 @@ export class MediaDownloader {
 
     private saveManifest(): void {
         try {
-            const obj: Record<string, string> = {};
+            const obj: Record<string, unknown> = {};
+            const stickerContentHashes: Record<string, string> = {};
             for (const [k, v] of this.pathIndex.entries()) {
                 obj[k] = v;
+                const hash = this.getStickerContentHashForManifest(k, v);
+                if (hash) stickerContentHashes[k] = hash;
+            }
+            if (Object.keys(stickerContentHashes).length > 0) {
+                obj._meta = {
+                    version: 2,
+                    stickerContentHashes,
+                };
             }
             fs.writeFileSync(this.manifestPath, JSON.stringify(obj, null, 2));
         } catch (err) {
             log.warn("saveManifest: 写入失败", { error: String(err) });
         }
+    }
+
+    private getStickerContentHashForManifest(uniqueFileId: string, filePath: string): string | null {
+        if (!isStickerPath(filePath)) return null;
+        const existing = this.stickerAliasContentHashes.get(uniqueFileId);
+        if (existing) return existing;
+        const hash = this.indexStickerContent(filePath);
+        if (!hash) return null;
+        this.stickerAliasContentHashes.set(uniqueFileId, hash);
+        return hash;
     }
 
     /**
@@ -304,6 +426,8 @@ export class MediaDownloader {
                             this.pathIndex.set(uniqueFileId, path.join(dir, file));
                             added++;
                         }
+                        const indexedHash = this.indexStickerContent(path.join(dir, file));
+                        if (indexedHash) this.stickerAliasContentHashes.set(uniqueFileId, indexedHash);
                     }
                 }
             } catch { /* ignore */ }

@@ -38,6 +38,7 @@ describe("Telegram builtin guides", () => {
         assert.ok(brief.includes("useAccountProfile"));
         assert.ok(brief.includes("useChatAdministration"));
         assert.ok(brief.includes("forwardMessage"));
+        assert.ok(brief.includes("useMediaDownload"));
         assert.equal(brief.includes("用于转发、复制、评论"), false);
         assert.ok(brief.includes("用于创建投票/测验、读取投票结果等成组流程"));
         assert.ok(brief.includes("downloadMedia"));
@@ -51,7 +52,6 @@ describe("Telegram builtin guides", () => {
         assert.equal(brief.includes("queryInlineBot("), false);
         assert.equal(brief.includes("sendInlineBotResult("), false);
         assert.equal(brief.includes("sendPoll"), false);
-        assert.equal(brief.includes("useMediaDownload"), false);
     });
 
     it("injects full inline bot guide through two-pass docs", () => {
@@ -266,6 +266,41 @@ describe("Telegram builtin guides", () => {
         assert.equal(notifications[0].text, "[forward:-100:123]");
     });
 
+    it("emits sticker mediaInfo even when the host ack omits it", async () => {
+        const notifications: Array<Record<string, unknown>> = [];
+        const env: CapabilityRegistryEnv = {
+            ctx: {},
+            emitOutput: () => {},
+            notifyHost: (event) => notifications.push(event as Record<string, unknown>),
+            requestInput: async () => "",
+            printToHost: () => {},
+            spawnTask: () => {},
+            killTask: () => {},
+            listTasks: () => [],
+            callHost: async () => ({
+                id: "4014",
+                text: "",
+                date: "2026-05-27T12:17:00.000Z",
+                chat: { id: "-1002450361141", type: "supergroup" },
+                sender: { id: "99", isBot: false },
+                isMention: false,
+            }),
+        };
+
+        const telegram = createTelegramClientProxy(env, new Map()) as {
+            sendSticker(chatId: string, uniqueFileId: string): Promise<any>;
+        };
+        await telegram.sendSticker("-1002450361141", "AgADdg0AAvE2QVQ");
+
+        assert.equal(notifications[0].type, "system.agent_message_sent");
+        assert.equal(notifications[0].text, "[🎭 贴纸: AgADdg0AAvE2QVQ]");
+        assert.deepEqual(notifications[0].mediaInfo, {
+            type: "sticker",
+            fileId: "AgADdg0AAvE2QVQ",
+            uniqueFileId: "AgADdg0AAvE2QVQ",
+        });
+    });
+
     it("supports guide-only story calls and local media paths", async () => {
         const nc = makeNC();
         const tempDir = join(tmpdir(), `tg-story-${randomUUID()}`);
@@ -285,6 +320,9 @@ describe("Telegram builtin guides", () => {
             },
             async sendStory(params: Record<string, unknown>) {
                 storyCalls.push(params);
+                if (storyCalls.length === 1) {
+                    throw new Error("native mtcute failed before fallback");
+                }
                 return { id: 42, peer: params.peer };
             },
             async destroy() {},
@@ -300,12 +338,15 @@ describe("Telegram builtin guides", () => {
             }]) as any;
 
             assert.equal(story.id, 42);
-            assert.equal(storyCalls[0].peer, "me");
+            assert.equal(storyCalls[0].peer, undefined);
             assert.deepEqual(storyCalls[0].media, {
                 type: "photo",
+                file: imagePath,
+            });
+            assert.equal(storyCalls[1].peer, undefined);
+            assert.deepEqual(storyCalls[1].media, {
+                type: "photo",
                 file: `file:${imagePath}`,
-                thumb: undefined,
-                videoCover: undefined,
             });
         } finally {
             await adapter.stop();
@@ -361,7 +402,7 @@ describe("Telegram builtin guides", () => {
         nc.dispose();
     });
 
-    it("resolves file: media paths for mtcute profile-photo calls before invoking the client", async () => {
+    it("keeps mtcute passthrough args native first and only rewrites file paths as fallback", async () => {
         const nc = makeNC();
         const mediaDir = join(process.cwd(), "workspace", "media");
         mkdirSync(mediaDir, { recursive: true });
@@ -370,6 +411,42 @@ describe("Telegram builtin guides", () => {
         const absolutePath = join(mediaDir, fileName);
         writeFileSync(absolutePath, "fake image bytes");
 
+        const calls: Array<Record<string, unknown>> = [];
+        const fakeClient = {
+            async start() {
+                return { id: 99, displayName: "Userbot", isBot: false };
+            },
+            onNewMessage: { add() {}, remove() {} },
+            async setMyProfilePhoto(params: Record<string, unknown>) {
+                calls.push(params);
+                if (calls.length === 1) {
+                    throw new Error("native mtcute failed before fallback");
+                }
+                return { id: "photo-id", media: params.media };
+            },
+            async destroy() {},
+        };
+
+        const adapter = new TelegramAdapter(makeConfig(), nc, async () => "", () => {}, async () => fakeClient);
+        try {
+            await adapter.start();
+            const result = await adapter.handleCall("telegram.mtcute", [
+                "setMyProfilePhoto",
+                { type: "photo", media: `file:${relativePath}` },
+            ]) as any;
+
+            assert.equal(calls[0].media, `file:${relativePath}`);
+            assert.equal(calls[1].media, `file:${absolutePath}`);
+            assert.equal(result.media, `file:${absolutePath}`);
+        } finally {
+            await adapter.stop();
+            nc.dispose();
+            rmSync(absolutePath, { force: true });
+        }
+    });
+
+    it("does not rewrite mtcute passthrough args when the native call succeeds", async () => {
+        const nc = makeNC();
         const calls: Array<Record<string, unknown>> = [];
         const fakeClient = {
             async start() {
@@ -388,15 +465,111 @@ describe("Telegram builtin guides", () => {
             await adapter.start();
             const result = await adapter.handleCall("telegram.mtcute", [
                 "setMyProfilePhoto",
-                { type: "photo", media: `file:${relativePath}` },
+                { type: "photo", media: "file:media/native-first.png" },
             ]) as any;
 
-            assert.equal(calls[0].media, `file:${absolutePath}`);
-            assert.equal(result.media, `file:${absolutePath}`);
+            assert.equal(calls.length, 1);
+            assert.equal(calls[0].media, "file:media/native-first.png");
+            assert.equal(result.media, "file:media/native-first.png");
         } finally {
             await adapter.stop();
             nc.dispose();
-            rmSync(absolutePath, { force: true });
+        }
+    });
+
+    it("preserves mtcute returned objects as host refs that can be passed back", async () => {
+        const nc = makeNC();
+        const downloadTargets: unknown[] = [];
+        const photoLocation = {
+            _: "inputPhotoFileLocation",
+            id: "5388905675888467317",
+            accessHash: "6223377884992484868",
+            fileReference: Buffer.from("file-ref"),
+            thumbSize: "c",
+        };
+        const photo = {
+            type: "photo",
+            location: photoLocation,
+            fileSize: 24714,
+            dcId: 2,
+            raw: { _: "photo", id: "5388905675888467317", fileReference: Buffer.from("file-ref") },
+        };
+        const fakeClient = {
+            async start() {
+                return { id: 99, displayName: "Userbot", isBot: false };
+            },
+            onNewMessage: { add() {}, remove() {} },
+            async getProfilePhotos() {
+                return [photo];
+            },
+            async downloadAsBuffer(location: unknown) {
+                downloadTargets.push(location);
+                return Buffer.from("avatar");
+            },
+            async destroy() {},
+        };
+
+        const adapter = new TelegramAdapter(makeConfig(), nc, async () => "", () => {}, async () => fakeClient);
+        try {
+            await adapter.start();
+            const photos = await adapter.handleCall("telegram.mtcute", ["getProfilePhotos", 123, { limit: 1 }]) as any[];
+            const sandboxPhoto = JSON.parse(JSON.stringify(photos[0]));
+            const sandboxLocation = JSON.parse(JSON.stringify(photos[0].location));
+
+            assert.equal(typeof sandboxPhoto.__mtcuteRef, "string");
+            assert.equal(typeof sandboxLocation.__mtcuteRef, "string");
+
+            const direct = await adapter.handleCall("telegram.downloadMedia", [sandboxPhoto]) as any;
+            const nativePhoto = await adapter.handleCall("telegram.mtcute", ["downloadAsBuffer", sandboxPhoto]) as any;
+            const nativeLocation = await adapter.handleCall("telegram.mtcute", ["downloadAsBuffer", sandboxLocation]) as any;
+
+            assert.equal(downloadTargets[0], photo);
+            assert.equal(downloadTargets[1], photo);
+            assert.equal(downloadTargets[2], photoLocation);
+            assert.equal(direct.buffer, Buffer.from("avatar").toString("base64"));
+            assert.equal(nativePhoto.buffer, Buffer.from("avatar").toString("base64"));
+            assert.equal(nativePhoto.size, Buffer.byteLength("avatar"));
+            assert.equal(nativeLocation.buffer, Buffer.from("avatar").toString("base64"));
+            assert.equal(nativeLocation.size, Buffer.byteLength("avatar"));
+        } finally {
+            await adapter.stop();
+            nc.dispose();
+        }
+    });
+
+    it("treats accidental mediaInfo objects as their fileId for downloadMedia", async () => {
+        const nc = makeNC();
+        const downloadTargets: unknown[] = [];
+        const fakeClient = {
+            async start() {
+                return { id: 99, displayName: "Userbot", isBot: false };
+            },
+            onNewMessage: { add() {}, remove() {} },
+            async downloadAsBuffer(location: unknown) {
+                downloadTargets.push(location);
+                return Buffer.from("image-bytes");
+            },
+            async destroy() {},
+        };
+
+        const adapter = new TelegramAdapter(makeConfig(), nc, async () => "", () => {}, async () => fakeClient);
+        try {
+            await adapter.start();
+
+            const result = await adapter.handleCall("telegram.downloadMedia", [{
+                type: "photo",
+                fileId: "AgAC-media-file-id",
+                uniqueFileId: `AQAD-${randomUUID()}`,
+                downloadStatus: "too_large",
+            }]) as any;
+
+            assert.equal(downloadTargets.length, 1);
+            assert.equal(downloadTargets[0], "AgAC-media-file-id");
+            assert.equal(result.buffer, Buffer.from("image-bytes").toString("base64"));
+            assert.equal(result.size, Buffer.byteLength("image-bytes"));
+        } finally {
+            await adapter.stop();
+            nc.dispose();
         }
     });
 
@@ -410,7 +583,7 @@ describe("Telegram builtin guides", () => {
             onNewMessage: { add() {}, remove() {} },
             async setMyProfilePhoto(params: Record<string, unknown>) {
                 calls.push(params);
-                return { id: "photo-id" };
+                throw new Error("native mtcute failed before fallback");
             },
             async destroy() {},
         };
@@ -425,7 +598,8 @@ describe("Telegram builtin guides", () => {
                 ]),
                 /mtcute 文件不存在/,
             );
-            assert.equal(calls.length, 0);
+            assert.equal(calls.length, 1);
+            assert.equal(calls[0].media, "file:media/definitely-missing-profile-photo.png");
         } finally {
             await adapter.stop();
             nc.dispose();

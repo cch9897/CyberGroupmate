@@ -152,6 +152,7 @@ export class StickerDetector {
             description,
             emojis,
             this.deps.newStickerEnabledByDefault !== false,
+            saved.contentHash ?? entry.contentHash,
         );
 
         this.deps.imageCatalog.markPromoted(

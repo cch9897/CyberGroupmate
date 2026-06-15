@@ -667,7 +667,7 @@ describe("browseHistory", () => {
             keyPoints: ["芙莉莲好看"],
             keywords: ["动漫", "新番", "芙莉莲"],
             participants: ["u1", "u3"],
-            messageRange: { firstMessageId: 50, lastMessageId: 55, count: 6 },
+            messageRange: { messageIds: ["50", "51", "52"], count: 3 },
             startedAt: "2026-01-01T12:00:00Z",
         });
         mem.storeMessageBatch([

@@ -77,6 +77,8 @@ export interface EnrichOptions {
     downloadFn?: DownloadFn;
     /** Sticker 缓存 */
     stickerCache?: StickerCache;
+    /** 只读 Sticker 描述缓存；用于不启用写缓存/vision 的轻量格式化路径 */
+    stickerDescriptionLookup?: StickerDescriptionLookup;
     /** 所属群组 chatId（fallback，当 message 自身无 chatId 时使用） */
     chatId?: string;
     /** 媒体下载管理器（可选，启用后保存文件到磁盘） */
@@ -87,6 +89,10 @@ export interface EnrichOptions {
     mediaTypes?: Array<"photo" | "sticker" | "video" | "document" | "animation" | "audio" | "other">;
     /** 是否启用 URL OpenGraph 预览（默认 true） */
     enableOgPreview?: boolean;
+    /** 是否启用媒体处理管线（默认 true；false 时只做统一格式化和媒体标签/缓存描述 fallback） */
+    enableMediaProcessing?: boolean;
+    /** 是否允许媒体处理管线下载文件（默认 true；false 时不会调用 downloadFn/mediaDownloader） */
+    enableMediaDownload?: boolean;
     /** 强制走文本描述路径，不内联图片到主 LLM（attend describe 模式使用） */
     forceTextDescriptions?: boolean;
 }
@@ -97,6 +103,105 @@ export interface EnrichedResult {
     formattedText: string;
     /** 路径 A: 收集到的 base64 图片 data URI（用于多模态 LLM） */
     imageParts: Array<{ url: string }>;
+}
+
+// ─── 媒体字段归一化 ───
+
+const SENT_STICKER_TEXT_PATTERNS = [
+    /\[🎭\s*贴纸:\s*([A-Za-z0-9_-]{8,})\]/,
+    /\[sticker:([A-Za-z0-9._/-]{3,})\]/i,
+];
+
+function inferStickerIdFromText(text?: string): string | undefined {
+    if (!text) return undefined;
+    for (const pattern of SENT_STICKER_TEXT_PATTERNS) {
+        const match = pattern.exec(text);
+        const id = match?.[1]?.trim();
+        if (id) return id;
+    }
+    return undefined;
+}
+
+function inferStickerFallbackLabelFromText(text?: string): string | undefined {
+    const match = /\[🎭\s*贴纸:\s*([^\]\n]+)\]/.exec(text ?? "");
+    return match?.[1]?.trim();
+}
+
+function addStringCandidate(target: string[], value: unknown): void {
+    if (typeof value !== "string") return;
+    const trimmed = value.trim();
+    if (trimmed && !target.includes(trimmed)) target.push(trimmed);
+}
+
+function inferStickerIdFromFileName(fileName?: string): string | undefined {
+    if (!fileName) return undefined;
+    const base = fileName.split(/[\\/]/).pop() ?? fileName;
+    const withoutExt = base.replace(/\.[^.]+$/, "");
+    const match = /(?:^|_)(AgAD[A-Za-z0-9_-]{6,})$/.exec(withoutExt);
+    return match?.[1];
+}
+
+function stickerLookupCandidates(info?: Record<string, unknown>, text?: string): string[] {
+    const candidates: string[] = [];
+    addStringCandidate(candidates, inferStickerIdFromText(text));
+    addStringCandidate(candidates, info?.sendableFileId);
+    addStringCandidate(candidates, info?.stickerId);
+    addStringCandidate(candidates, info?.stickerUniqueFileId);
+    addStringCandidate(candidates, info?.uniqueFileId);
+    addStringCandidate(candidates, info?.fileId);
+    addStringCandidate(candidates, inferStickerIdFromFileName(typeof info?.fileName === "string" ? info.fileName : undefined));
+    return candidates;
+}
+
+function mediaInfoToPlainObject(mediaInfo: unknown): Record<string, unknown> | undefined {
+    if (!mediaInfo) return undefined;
+    if (typeof mediaInfo === "string") {
+        try {
+            const parsed = JSON.parse(mediaInfo);
+            return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+                ? parsed as Record<string, unknown>
+                : undefined;
+        } catch {
+            return undefined;
+        }
+    }
+    return typeof mediaInfo === "object" && !Array.isArray(mediaInfo)
+        ? { ...(mediaInfo as Record<string, unknown>) }
+        : undefined;
+}
+
+export function normalizeMessageMediaFields(
+    mediaInfo: unknown,
+    text?: string,
+): { mediaType?: string; mediaInfo?: string } {
+    const info = mediaInfoToPlainObject(mediaInfo);
+    const inferredStickerId = inferStickerIdFromText(text);
+    const normalized = info ?? (inferredStickerId ? {} : undefined);
+
+    if (normalized && inferredStickerId) {
+        normalized.type ??= "sticker";
+        normalized.fileId ??= inferredStickerId;
+        normalized.uniqueFileId ??= inferredStickerId;
+        normalized.sendableFileId ??= inferredStickerId;
+        normalized.stickerId ??= inferredStickerId;
+    }
+
+    const mediaType = typeof normalized?.type === "string"
+        ? normalized.type
+        : inferredStickerId
+            ? "sticker"
+            : undefined;
+
+    if (!normalized) return { mediaType };
+
+    try {
+        return {
+            mediaType,
+            mediaInfo: JSON.stringify(normalized),
+        };
+    } catch {
+        return { mediaType };
+    }
 }
 
 // ─── 核心函数 ───
@@ -112,6 +217,11 @@ export async function enrichMessages(
     messages: RawMessage[],
     options: EnrichOptions,
 ): Promise<EnrichedResult> {
+    const stickerDescriptionLookup = options.stickerDescriptionLookup ?? options.stickerCache;
+    const mediaDownloadEnabled = options.enableMediaDownload !== false;
+    const downloadFn = mediaDownloadEnabled ? options.downloadFn : undefined;
+    const mediaDownloader = mediaDownloadEnabled ? options.mediaDownloader : undefined;
+
     // ─── 1. 从 mediaInfo 解析 MediaAttachment[] ───
     let attachments = parseMediaAttachments(messages, options.chatId);
 
@@ -122,7 +232,7 @@ export async function enrichMessages(
     }
 
     // ─── 2. Vision 批量处理 ───
-    if (attachments.length > 0) {
+    if (options.enableMediaProcessing !== false && attachments.length > 0) {
         log.info("媒体富化开始", { count: attachments.length, chatId: options.chatId });
         try {
             const processed = await processMediaBatch(
@@ -130,9 +240,9 @@ export async function enrichMessages(
                 options.visionConfig,
                 options.llmConfig,
                 Array.isArray(options.visionLlmConfig) ? options.visionLlmConfig : options.visionLlmConfig ? [options.visionLlmConfig] : undefined,
-                options.downloadFn,
+                downloadFn,
                 options.stickerCache,
-                options.mediaDownloader,
+                mediaDownloader,
                 options.imageCatalog,
                 { forceTextDescriptions: options.forceTextDescriptions },
             );
@@ -161,7 +271,9 @@ export async function enrichMessages(
 
     // ─── 3. 格式化消息文本 ───
     const imageParts: Array<{ url: string }> = [];
-    const formattedText = formatMessages(messages, imageParts);
+    const formattedText = formatMessages(messages, imageParts, {
+        stickerDescriptionLookup,
+    });
 
     return { formattedText, imageParts };
 }
@@ -176,28 +288,28 @@ export async function enrichMessages(
 function mediaTagFromType(
     mediaType?: string,
     mediaInfo?: string,
-    options?: { stickerDescriptionLookup?: StickerDescriptionLookup },
+    options?: { stickerDescriptionLookup?: StickerDescriptionLookup; text?: string },
 ): string {
     if (!mediaType) return "";
     let emoji = "";
-    let uniqueFileId = "";
+    let info: Record<string, unknown> | undefined;
     try {
         if (mediaInfo) {
-            const info = JSON.parse(mediaInfo);
-            emoji = info.emoji ?? "";
-            uniqueFileId = info.uniqueFileId ?? info.fileId ?? "";
+            info = JSON.parse(mediaInfo);
+            emoji = typeof info?.emoji === "string" ? info.emoji : "";
         }
     } catch { /* ignore */ }
     switch (mediaType) {
         case "photo": return "[📷 图片]";
         case "sticker": {
-            if (uniqueFileId && options?.stickerDescriptionLookup) {
-                const cached = options.stickerDescriptionLookup.getStickerDescription(uniqueFileId);
+            for (const id of stickerLookupCandidates(info, options?.text)) {
+                const cached = options?.stickerDescriptionLookup?.getStickerDescription(id);
                 if (cached) {
                     const emojiTag = formatCachedEmojiTag(cached.emojis?.length ? cached.emojis : (cached.emoji ?? emoji));
                     return `[🎭 贴纸${emojiTag}: ${cached.description}]`;
                 }
             }
+            emoji ||= inferStickerFallbackLabelFromText(options?.text) ?? "";
             return emoji ? `[🎭 贴纸: ${emoji}]` : "[🎭 贴纸]";
         }
         case "video": return "[📹 视频]";
@@ -220,7 +332,7 @@ function formatCachedEmojiTag(value?: string | string[]): string {
 
 function existingMediaTagPattern(mediaType?: string): RegExp | undefined {
     switch (mediaType) {
-        case "photo": return /\[📷 图片\]\s*/;
+        case "photo": return /\[📷 图片[^\]]*\]\s*/;
         case "sticker": return /\[🎭 贴纸[^\]]*\]\s*/;
         case "video": return /\[📹 视频\]\s*/;
         case "animation": return /\[(?:🎬|🎞) (?:视频|GIF)\]\s*/;
@@ -246,6 +358,14 @@ export function formatMessageLine(
     options?: { includeMediaTags?: boolean; stickerDescriptionLookup?: StickerDescriptionLookup },
 ): string {
     const replyTag = buildReplyTag(m);
+    const textPart = formatMessageBody(m, options);
+    return `[${formatTsForPrompt(m.timestamp)}] [msgId:${m.id ?? "?"}] ${m.sender ?? "?"}${replyTag}: ${textPart}`;
+}
+
+export function formatMessageBody(
+    m: RawMessage,
+    options?: { includeMediaTags?: boolean; stickerDescriptionLookup?: StickerDescriptionLookup },
+): string {
     let textPart = m.text ?? "";
 
     // 如果没有 processedMedia（未经 vision 处理）但有 mediaType，追加媒体标签
@@ -254,6 +374,7 @@ export function formatMessageLine(
     if (options?.includeMediaTags && (!m.processedMedia || m.processedMedia.length === 0) && m.mediaType) {
         const tag = mediaTagFromType(m.mediaType, m.mediaInfo, {
             stickerDescriptionLookup: options.stickerDescriptionLookup,
+            text: textPart,
         });
         if (tag && !textPart.includes(tag)) {
             const existingPattern = existingMediaTagPattern(m.mediaType);
@@ -265,7 +386,7 @@ export function formatMessageLine(
         }
     }
 
-    return `[${formatTsForPrompt(m.timestamp)}] [msgId:${m.id ?? "?"}] ${m.sender ?? "?"}${replyTag}: ${textPart}`;
+    return textPart;
 }
 
 /**
@@ -304,28 +425,32 @@ export async function resolveReplyText(
         chatId?: string;
     },
 ): Promise<string | undefined> {
-    // 1. 有文本 → 直接返回
-    if (origMsg.text) return origMsg.text;
+    // 1. 有非媒体占位文本 → 直接返回；媒体占位继续走缓存/vision 富化。
+    if (origMsg.text && (!origMsg.mediaType || !existingMediaTagPattern(origMsg.mediaType)?.test(origMsg.text))) {
+        return origMsg.text;
+    }
 
     // 2. 无媒体 → 无内容
     if (!origMsg.mediaType) return undefined;
-    if (!origMsg.mediaInfo) return mediaTagFromType(origMsg.mediaType);
+    if (!origMsg.mediaInfo) return mediaTagFromType(origMsg.mediaType, undefined, { text: origMsg.text });
 
     // 3. 解析 mediaInfo
     let info: Record<string, unknown>;
     try {
         info = JSON.parse(origMsg.mediaInfo);
     } catch {
-        return mediaTagFromType(origMsg.mediaType, origMsg.mediaInfo);
+        return mediaTagFromType(origMsg.mediaType, origMsg.mediaInfo, { text: origMsg.text });
     }
 
     // 4. 贴纸：优先查缓存
-    if (origMsg.mediaType === "sticker" && deps?.stickerCache && info.uniqueFileId) {
-        const cached = deps.stickerCache.getStickerDescription(info.uniqueFileId as string);
-        if (cached) {
-            const emojiCandidates = cached.emojis?.length ? cached.emojis : [info.emoji as string | undefined].filter(Boolean) as string[];
-            const emoji = emojiCandidates.length ? `${emojiCandidates.join(" ")} ` : "";
-            return `[🎭 贴纸: ${emoji}${cached.description}]`;
+    if (origMsg.mediaType === "sticker" && deps?.stickerCache) {
+        for (const id of stickerLookupCandidates(info, origMsg.text)) {
+            const cached = deps.stickerCache.getStickerDescription(id);
+            if (cached) {
+                const emojiCandidates = cached.emojis?.length ? cached.emojis : [info.emoji as string | undefined].filter(Boolean) as string[];
+                const emoji = emojiCandidates.length ? `${emojiCandidates.join(" ")} ` : "";
+                return `[🎭 贴纸: ${emoji}${cached.description}]`;
+            }
         }
     }
 
@@ -335,7 +460,9 @@ export async function resolveReplyText(
             const attachment: MediaAttachment = {
                 type: ((info.type as string) ?? origMsg.mediaType) as MediaAttachment["type"],
                 fileId: info.fileId as string,
-                uniqueFileId: (info.uniqueFileId as string) ?? (info.fileId as string),
+                uniqueFileId: origMsg.mediaType === "sticker"
+                    ? (stickerLookupCandidates(info, origMsg.text)[0] ?? (info.uniqueFileId as string) ?? (info.fileId as string))
+                    : ((info.uniqueFileId as string) ?? (info.fileId as string)),
                 emoji: info.emoji as string | undefined,
                 mimeType: info.mimeType as string | undefined,
                 fileName: info.fileName as string | undefined,
@@ -365,7 +492,7 @@ export async function resolveReplyText(
     }
 
     // 6. Fallback: 媒体类型标签
-    return mediaTagFromType(origMsg.mediaType, origMsg.mediaInfo);
+    return mediaTagFromType(origMsg.mediaType, origMsg.mediaInfo, { text: origMsg.text });
 }
 
 // ─── 内部函数 ───
@@ -387,7 +514,9 @@ function parseMediaAttachments(messages: RawMessage[], fallbackChatId?: string):
             attachments.push({
                 type: info.type,
                 fileId: info.fileId,
-                uniqueFileId: info.uniqueFileId ?? info.fileId,
+                uniqueFileId: info.type === "sticker"
+                    ? (stickerLookupCandidates(info, m.text)[0] ?? info.uniqueFileId ?? info.fileId)
+                    : (info.uniqueFileId ?? info.fileId),
                 url: info.url,
                 emoji: info.emoji,
                 mimeType: info.mimeType,
@@ -418,6 +547,7 @@ function parseMediaAttachments(messages: RawMessage[], fallbackChatId?: string):
 export function formatMessages(
     messages: RawMessage[],
     imageParts: Array<{ url: string }>,
+    options?: { stickerDescriptionLookup?: StickerDescriptionLookup },
 ): string {
     const lines: string[] = [];
     let prevTimestamp: number | undefined;
@@ -468,7 +598,10 @@ export function formatMessages(
                     textPart = textPart ? `${textPart} [📎 文件: ${pm.filePath}]` : `[📎 文件: ${pm.filePath}]`;
                 } else if (pm.description) {
                     // 路径 B/C: 文本描述
-                    textPart = textPart ? `${textPart} [📷 图片描述: ${pm.description}]` : `[📷 图片描述: ${pm.description}]`;
+                    const mediaText = pm.description.startsWith("[")
+                        ? pm.description
+                        : `[📷 图片描述: ${pm.description}]`;
+                    textPart = textPart ? `${textPart} ${mediaText}` : mediaText;
                 }
             }
         }
@@ -476,9 +609,17 @@ export function formatMessages(
         // 如果有 processedMedia 就不再追加 mediaTag（已处理），否则追加 mediaTag 作兜底
         const hasProcessedMedia = m.processedMedia && m.processedMedia.length > 0;
         if (!hasProcessedMedia && m.mediaType) {
-            const tag = mediaTagFromType(m.mediaType, m.mediaInfo);
+            const tag = mediaTagFromType(m.mediaType, m.mediaInfo, {
+                stickerDescriptionLookup: options?.stickerDescriptionLookup,
+                text: textPart,
+            });
             if (tag && !textPart.includes(tag)) {
-                textPart = textPart ? `${textPart} ${tag}` : tag;
+                const existingPattern = existingMediaTagPattern(m.mediaType);
+                if (existingPattern?.test(textPart)) {
+                    textPart = textPart.replace(existingPattern, `${tag} `).trim();
+                } else {
+                    textPart = textPart ? `${textPart} ${tag}` : tag;
+                }
             }
         }
 

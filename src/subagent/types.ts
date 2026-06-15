@@ -197,6 +197,12 @@ export interface CodeActReplyTask {
     memoryContext?: AdditionalMemoryContext | null;
     /** 轻量续接 prompt：用于 post-task window/L2 前送类消息，不渲染完整任务包 */
     continuationPrompt?: string;
+    /** 轻量续接的结构化消息；执行前由 message-enricher 统一富化后覆盖 continuationPrompt 的消息区块 */
+    continuationMessages?: PostTaskReactionMessage[];
+    /** 续接提示中的触发来源标签 */
+    continuationReason?: string;
+    /** follow-up 判定器给出的原因（如有） */
+    continuationClassifierReason?: string;
     /** 跳过执行前刷新最近消息，避免轻量续接被扩展成完整目标消息包 */
     skipRefreshTaskMessages?: boolean;
 }
@@ -293,6 +299,9 @@ export interface SubagentPostTaskFollowUpCallback {
 export interface DispatchedSubagentTaskRecord {
     taskId: string;
     chatId: string;
+    sourceType?: "meta" | "subagent";
+    sourceChatId?: string;
+    sourceTaskId?: string;
     contentDirection: string;
     toneGuidance?: string;
     suggestedEmojis?: string[];

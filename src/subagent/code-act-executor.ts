@@ -28,12 +28,19 @@ import { buildPrefixMap } from "../sandbox/api-intent-extractor.js";
 import { renderPrompt } from "../context-engine/template-engine.js";
 import { deriveChatType } from "../context-engine/prompt-renderer-utils.js";
 import { ContextEngine } from "../context-engine/context-engine.js";
-import { getExecutorTaskProviders, type ExecutorResolveContext } from "../context-engine/providers/executor-providers.js";
+import { EXECUTOR_FOOTER_TEXT, getExecutorTaskProviders, type ExecutorResolveContext } from "../context-engine/providers/executor-providers.js";
 import type { LLMConfig, VisionConfig } from "../core/config.js";
 import { resolveComponentProfiles, loadConfig } from "../core/config.js";
-import { enrichMessages, formatMessageLine, resolveReplyText } from "../core/message-enricher.js";
+import {
+    enrichMessages,
+    formatMessageLine,
+    resolveReplyText,
+    type EnrichedResult,
+    type RawMessage,
+    type StickerDescriptionLookup,
+} from "../core/message-enricher.js";
 import type { MediaDownloader } from "../core/media-downloader.js";
-import type { ChatMessage } from "../core/llm.js";
+import type { ChatMessage, ImagePart } from "../core/llm.js";
 import { createLogger } from "../core/logger.js";
 import { formatTsForPrompt, normalizeProgrammaticTimestamps, sanitizePromptTimestamps } from "../core/timezone.js";
 import { getRawId, ensureCompositeId, getPlatform, getGroupModelKey } from "../core/chat-id.js";
@@ -42,6 +49,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { shouldCompact, compact as contextManagerCompact } from "../memory-v2/context-manager.js";
+import { DEFAULT_BANNED_WORDS } from "../core/banned-words.js";
 
 const log = createLogger("code-act-executor");
 
@@ -118,13 +126,20 @@ function looksLikePersonProfileContext(rawContext: string | undefined): boolean 
     }
 }
 
-function formatPendingMessageLine(message: PostTaskReactionMessage): string {
-    const mediaSuffix = message.mediaType
-        ? ` [${message.mediaType}${message.mediaInfo ? ` ${message.mediaInfo}` : ""}]`
-        : "";
-    const replySuffix = message.replyToMessageId ? ` (replyTo=${message.replyToMessageId})` : "";
-    const text = message.text || "[non-text message]";
-    return `[${formatTsForPrompt(message.timestamp)}] [msgId:${message.messageId}] ${message.sender}${replySuffix}: ${text}${mediaSuffix}`;
+function formatPendingMessageLine(message: PostTaskReactionMessage, stickerDescriptionLookup?: StickerDescriptionLookup): string {
+    return formatMessageLine({
+        id: message.messageId,
+        sender: message.sender,
+        text: message.text,
+        timestamp: message.timestamp,
+        replyTo: message.replyToMessageId ? `msg#${message.replyToMessageId}` : undefined,
+        replyToMsgId: message.replyToMessageId,
+        mediaType: message.mediaType,
+        mediaInfo: message.mediaInfo,
+    }, {
+        includeMediaTags: true,
+        stickerDescriptionLookup,
+    });
 }
 
 function findLatestDirectAttentionMessage(messages: PostTaskReactionMessage[]): PostTaskReactionMessage | undefined {
@@ -136,22 +151,28 @@ function findLatestDirectAttentionMessage(messages: PostTaskReactionMessage[]): 
     return undefined;
 }
 
-function formatPendingMessages(messages: PostTaskReactionMessage[]): string {
+function formatPendingMessages(messages: PostTaskReactionMessage[], stickerDescriptionLookup?: StickerDescriptionLookup): string {
     const lines = messages.map((message) =>
         formatMessageLine({
             id: message.messageId,
             sender: message.sender,
             text: message.text,
             timestamp: message.timestamp,
+            replyTo: message.replyToMessageId ? `msg#${message.replyToMessageId}` : undefined,
+            replyToMsgId: message.replyToMessageId,
             mediaType: message.mediaType,
             mediaInfo: message.mediaInfo,
-        }, { includeMediaTags: true })
+        }, { includeMediaTags: true, stickerDescriptionLookup })
     ).join("\n");
     return `[📩 新消息到达]\n${lines}`;
 }
 
-function formatMidTurnDirectAttentionPrompt(messages: PostTaskReactionMessage[], directReason: string): string {
-    const lines = messages.map((message) => formatPendingMessageLine(message));
+function formatMidTurnDirectAttentionPrompt(
+    messages: PostTaskReactionMessage[],
+    directReason: string,
+    stickerDescriptionLookup?: StickerDescriptionLookup,
+): string {
+    const lines = messages.map((message) => formatPendingMessageLine(message, stickerDescriptionLookup));
     return [
         "[📩 新消息到达]",
         ...lines,
@@ -160,10 +181,25 @@ function formatMidTurnDirectAttentionPrompt(messages: PostTaskReactionMessage[],
     ].join("\n");
 }
 
+function formatContinuationPromptFromEnrichedMessages(
+    formattedMessages: string,
+    directReason: string,
+    classifierReason?: string,
+): string {
+    return [
+        "[📩 新消息到达]",
+        formattedMessages,
+        "",
+        `[post-task direct attention: ${directReason}]${classifierReason ? ` 判定原因: ${classifierReason}` : ""} 请基于上下文决定如何行动。`,
+    ].join("\n");
+}
+
+type PendingMessageDrainSource = "observation" | "turn";
+
 // ─── API 概览缓存 ───
 const _apiBriefCache = new Map<string, string>();
 
-/** 模块注册表缓存（Two-pass 用） */
+/** 模块注册表缓存（运行时错误后文档注入用） */
 let _moduleRegistryCache: ModuleEntry[] | null = null;
 
 /**
@@ -180,7 +216,7 @@ export function refreshModuleRegistryCache(): void {
 
 /**
  * 获取当前模块注册表缓存（懒加载）。
- * 供外部（如 session-runner Two-pass）使用。
+ * 供外部（如 session-runner 的运行时错误文档注入）使用。
  */
 export function getModuleRegistryCache(): ModuleEntry[] {
     if (!_moduleRegistryCache) {
@@ -202,7 +238,7 @@ const PLATFORM_MODULES: Record<string, string> = {
  * 重要变更：不再读取原始 .d.ts 全文！
  * 改为从 modules-docs.json 提取 Host-coupled APIs，并在运行时动态解析
  * workspace/skills/ 里的 TS Skills 的 .d.ts，提取每个方法的一句话 brief 签名。
- * 完整文档由 Two-pass 机制在 session-runner 中按需注入。
+ * 完整文档由 session-runner 在运行时错误后按需注入。
  */
 export function loadApiTypeDefs(platform: string = "telegram", allowedModules?: Set<string>): string {
     try {
@@ -275,6 +311,27 @@ function formatThinkingTranscript(result: SessionResult): string {
 function formatThinkingPlaceholder(reason: string): string {
     return `本次思考过程：\n\`\`\`text\n${reason}\n\`\`\``;
 }
+
+function isExecutorTaskPrompt(content: string): boolean {
+    return content.startsWith("═══ ") && content.includes(EXECUTOR_FOOTER_TEXT);
+}
+
+function collapseExecutorTaskPrompt(content: string): string {
+    const footerIndex = content.lastIndexOf(EXECUTOR_FOOTER_TEXT);
+    return footerIndex === -1
+        ? content
+        : content.slice(0, footerIndex + EXECUTOR_FOOTER_TEXT.length);
+}
+
+function findLatestExecutorTaskPromptIndex(messages: SessionMessage[]): number {
+    for (let index = messages.length - 1; index >= 0; index--) {
+        if (messages[index]?.role === "user" && isExecutorTaskPrompt(messages[index].content)) {
+            return index;
+        }
+    }
+    return -1;
+}
+
 export interface CodeActExecutorConfig {
     /** 单次执行最大超时 (ms)。默认 60000 */
     maxExecutionTimeMs: number;
@@ -374,6 +431,8 @@ export class CodeActExecutor {
 
     /** Callback handler（由 GroupSubagent 或 S8 集成时注入） */
     private callbackHandler: ((cb: SubagentCallback) => void) | null = null;
+    /** pending 消息实际注入 prompt 后的通知，用于和 post-task window 跨路径去重 */
+    private pendingMessageDrainHandler: ((messages: PostTaskReactionMessage[], source: PendingMessageDrainSource) => void) | null = null;
 
     /** 层 2: 消息前送缓冲区 — NC hook 在 session 执行期间推入新消息 */
     private pendingMessages: PostTaskReactionMessage[] = [];
@@ -396,6 +455,12 @@ export class CodeActExecutor {
      */
     setCallbackHandler(handler: (cb: SubagentCallback) => void): void {
         this.callbackHandler = handler;
+    }
+
+    setPendingMessageDrainHandler(
+        handler: (messages: PostTaskReactionMessage[], source: PendingMessageDrainSource) => void,
+    ): void {
+        this.pendingMessageDrainHandler = handler;
     }
 
     /**
@@ -477,6 +542,19 @@ export class CodeActExecutor {
     /** 检查是否已注入依赖 */
     hasDependencies(): boolean {
         return this.sandboxPool !== null && this.nc !== null && resolveComponentProfiles("session").length > 0;
+    }
+
+    private buildSessionHistoryMessages(isContinuation: boolean): ChatMessage[] {
+        const latestTaskPromptIndex = isContinuation ? findLatestExecutorTaskPromptIndex(this.session) : -1;
+        return this.session.map((msg, index) => ({
+            role: msg.role,
+            content: sanitizePromptTimestamps(
+                msg.role === "user" && isExecutorTaskPrompt(msg.content) && index !== latestTaskPromptIndex
+                    ? collapseExecutorTaskPrompt(msg.content)
+                    : msg.content,
+            ),
+            ...(index === this.session.length - 1 ? { cacheBreakpoint: true } : {}),
+        }));
     }
 
     /**
@@ -621,7 +699,15 @@ export class CodeActExecutor {
         let imageParts: ChatMessage["imageParts"] = [];
         let renderResult: ReturnType<ContextEngine["render"]> | null = null;
 
-        if (!isContinuation) {
+        if (isContinuation && task.continuationMessages?.length) {
+            const enriched = await this.enrichReactionMessages(task.continuationMessages);
+            taskPrompt = formatContinuationPromptFromEnrichedMessages(
+                enriched.formattedText,
+                task.continuationReason ?? "post-task",
+                task.continuationClassifierReason,
+            );
+            imageParts = enriched.imageParts;
+        } else if (!isContinuation) {
             const topicSummary = ctx.topicSummary ?? "";
             const toneGuidance = ctx.toneGuidance ?? "";
             const memoryContext = task.memoryContext;
@@ -689,6 +775,7 @@ export class CodeActExecutor {
                 availableStickers,
                 groundingContext: ctx.groundingContext,
                 sessionDigests: this.globalState?.getSessionDigests(),
+                useSkills: task.useSkills,
             };
             // 重新计算 toneGuidance（避免上面的 ternary 混乱）
             resolveCtx.toneGuidance = toneGuidance || undefined;
@@ -710,15 +797,7 @@ export class CodeActExecutor {
 
         // 注入历史 session（如果有）
         if (this.session.length > 0) {
-            for (let i = 0; i < this.session.length; i++) {
-                const msg = this.session[i];
-                const isLast = i === this.session.length - 1;
-                messages.push({
-                    role: msg.role,
-                    content: sanitizePromptTimestamps(msg.content),
-                    ...(isLast ? { cacheBreakpoint: true } : {}),
-                });
-            }
+            messages.push(...this.buildSessionHistoryMessages(isContinuation));
         }
 
         // 当前任务 prompt 放在最后（路径 A 时附加图片）
@@ -732,13 +811,15 @@ export class CodeActExecutor {
         // 清空 pending buffer（层 1 已经刷新了 recentMessages，此处 drain 掉残留）
         this.pendingMessages = [];
 
-        const sentCollector = new SentMessageCollector();
+        const sentCollector = new SentMessageCollector(this.memory ?? undefined);
         const sandbox = await this.sandboxPool!.acquire(this.chatId);
         const deduplicateSentMessages = currentConfig.subagent?.deduplicateSentMessages !== false;
+        const bannedWords = currentConfig.subagent?.bannedWords ?? DEFAULT_BANNED_WORDS;
 
         // 设置平台标识，供 capability-registry 和 scene.current 使用
         await sandbox.execute(`__setPlatform(${JSON.stringify(platform)})`, 5000);
         await sandbox.execute(`__setDuplicateMessageBlocking(${JSON.stringify(deduplicateSentMessages)})`, 5000);
+        await sandbox.execute(`__setBannedWords(${JSON.stringify(bannedWords)})`, 5000);
         // 注册 notify 监听器收集已发消息
         const rawChatId = getRawId(this.chatId);
         const notifyListener = (event: Record<string, unknown>) => {
@@ -784,13 +865,13 @@ export class CodeActExecutor {
                 resolveComponentProfiles("session"),
                 this.config.maxExecutionTimeMs,
                 sentCollector, // Fix 1: 传入 collector
-                () => this.drainPendingMessages(), // 层 2: turn 间消息注入
-                () => this.drainPendingMessagesForObservation(), // 层 2: direct attention 立即并入 observation
+                async () => this.drainPendingMessages(), // 层 2: turn 间消息注入
+                async () => this.drainPendingMessagesForObservation(), // 层 2: direct attention 立即并入 observation
                 `让${this.personaName}想想，`,  // prefill: 引导 LLM 以角色开始思考
                 ["[Execution Output]"],  // stop sequences
                 this.chatId,  // 关联 chatId，用于 codeActEvents 进度广播
                 this.config.maxTurns,  // 最大交互轮次
-                // Two-pass: 按需加载完整 API 文档（每个 turn 动态获取最新 registry）
+                // 运行时错误后按需加载完整 API 文档（每个 turn 动态获取最新 registry）
                 (() => {
                     const registry = getModuleRegistryCache();
                     if (registry.length === 0) return undefined;
@@ -817,17 +898,10 @@ export class CodeActExecutor {
         // 跳过已有的历史消息（只保存新产生的对话）
         const historyOffset = 1 + this.session.length; // 1 for system prompt + existing history
         const newMessages = sessionResult.messages.slice(historyOffset);
-        for (let mi = 0; mi < newMessages.length; mi++) {
-            const msg = newMessages[mi];
-            let content = msg.content;
-            // 首条 user message = task prompt：用 ContextEngine 的 historicalRendered 替代
-            // historicalRendered 自动按 history 策略处理（ephemeral sections 不保留，omit sections 用占位符）
-            if (mi === 0 && msg.role === "user" && renderResult?.historicalContent) {
-                content = renderResult.historicalContent;
-            }
+        for (const msg of newMessages) {
             this.session.push({
                 role: msg.role as "system" | "user" | "assistant",
-                content: typeof content === "string" ? sanitizePromptTimestamps(content) : content,
+                content: sanitizePromptTimestamps(msg.content),
                 timestamp: new Date().toISOString(),
             });
         }
@@ -912,17 +986,18 @@ export class CodeActExecutor {
         const suggestedEmojis = task.decisions.flatMap(decision => decision.suggestedEmojis ?? []);
         if (suggestedEmojis.length === 0) return undefined;
 
-        const matches = this.memory.searchStickersByEmoji(suggestedEmojis, 12);
+        const rawMatchLimit = Math.max(this.memory.getAllStickerDescriptions().length, 12);
+        const matches = this.memory.searchStickersByEmoji(suggestedEmojis, rawMatchLimit);
         const seen = new Set<string>();
-        const stickers: Array<{ emoji?: string; emojis?: string[]; description: string; uniqueFileId: string }> = [];
+        const sendableStickers: Array<{ emoji?: string; emojis?: string[]; description: string; uniqueFileId: string }> = [];
 
         for (const match of matches) {
             if (!match.enabled || seen.has(match.uniqueFileId)) continue;
             const filePath = this.mediaDownloader?.getExistingPath(match.uniqueFileId);
-            if (filePath && filePath.toLowerCase().endsWith(".webm")) continue;
+            if (!filePath || filePath.toLowerCase().endsWith(".webm")) continue;
 
             const cached = this.memory.getStickerDescription(match.uniqueFileId);
-            stickers.push({
+            sendableStickers.push({
                 uniqueFileId: match.uniqueFileId,
                 description: match.description,
                 emoji: match.emoji,
@@ -931,7 +1006,16 @@ export class CodeActExecutor {
             seen.add(match.uniqueFileId);
         }
 
-        return stickers.length > 0 ? stickers : undefined;
+        if (sendableStickers.length === 0) return undefined;
+        if (sendableStickers.length <= 12) return sendableStickers;
+
+        const shuffled = [...sendableStickers];
+        for (let index = shuffled.length - 1; index > 0; index--) {
+            const swapIndex = Math.floor(Math.random() * (index + 1));
+            [shuffled[index], shuffled[swapIndex]] = [shuffled[swapIndex], shuffled[index]];
+        }
+
+        return shuffled.slice(0, 12);
     }
 
     /**
@@ -1034,11 +1118,67 @@ export class CodeActExecutor {
         });
     }
 
+    private async enrichReactionMessages(messages: PostTaskReactionMessage[]): Promise<EnrichedResult> {
+        const messagesById = new Map(messages.map((message) => [message.messageId, message]));
+        const rawMessages: RawMessage[] = await Promise.all(messages.map(async (message) => {
+            const replyToMsgId = message.replyToMessageId;
+            const inBatchReply = replyToMsgId ? messagesById.get(replyToMsgId) : undefined;
+            let replyTo = inBatchReply?.sender;
+            let replyToText: string | undefined;
+
+            if (replyToMsgId && !inBatchReply && this.memory) {
+                try {
+                    const original = this.memory.getMessageById(this.chatId, replyToMsgId);
+                    if (original) {
+                        replyTo = original.displayName || original.userId || `msg#${replyToMsgId}`;
+                        replyToText = await resolveReplyText(original, {
+                            stickerCache: this.memory,
+                            visionConfig: this.visionConfig,
+                            llmConfig: resolveComponentProfiles("session")[0] ?? undefined,
+                            visionLlmConfig: this.visionLlmConfig,
+                            downloadFn: this.downloadFn,
+                            chatId: this.chatId,
+                        });
+                    }
+                } catch (error) {
+                    log.debug("enrichReactionMessages: reply target lookup failed", {
+                        chatId: this.chatId,
+                        replyToMsgId,
+                        error: String(error),
+                    });
+                }
+            }
+
+            return {
+                id: message.messageId,
+                sender: message.sender,
+                text: message.text,
+                timestamp: message.timestamp,
+                replyTo: replyTo ?? (replyToMsgId ? `msg#${replyToMsgId}` : undefined),
+                replyToMsgId,
+                replyToText,
+                mediaType: message.mediaType,
+                mediaInfo: message.mediaInfo,
+                chatId: this.chatId,
+            };
+        }));
+
+        return enrichMessages(rawMessages, {
+            visionConfig: this.visionConfig,
+            llmConfig: resolveComponentProfiles("session")[0],
+            visionLlmConfig: this.visionLlmConfig,
+            downloadFn: this.downloadFn,
+            stickerCache: this.memory ?? undefined,
+            chatId: this.chatId,
+            mediaDownloader: this.mediaDownloader,
+        });
+    }
+
     /**
      * 层 2: 在当前 turn 的 observation 前优先抽取 direct attention 消息
      * 仅当有人直接叫住 agent 时才清空 buffer 并立即反馈给模型。
      */
-    drainPendingMessagesForObservation(): string | null {
+    async drainPendingMessagesForObservation(): Promise<{ content: string; imageParts?: ImagePart[] } | null> {
         const trigger = findLatestDirectAttentionMessage(this.pendingMessages);
         if (!trigger) return null;
 
@@ -1049,15 +1189,23 @@ export class CodeActExecutor {
             count: drained.length,
             directReason,
         });
-        return formatMidTurnDirectAttentionPrompt(drained, directReason);
+        this.notifyPendingMessagesDrained(drained, "observation");
+        const enriched = await this.enrichReactionMessages(drained);
+        const content = [
+            "[📩 新消息到达]",
+            enriched.formattedText,
+            "",
+            `[mid-turn direct attention: ${directReason}] 这些消息发生在你处理当前任务期间，其中有人直接叫住你、回复你或提及你。请结合当前会话、刚才的执行结果和上面所有尚未处理的新消息判断是否需要调整下一步行动或直接回复；需要时在下一轮自然处理，不需要则继续当前任务。`,
+        ].join("\n");
+        return { content, imageParts: enriched.imageParts.length ? enriched.imageParts : undefined };
     }
 
     /**
      * 层 2: 取出并格式化 pending messages，清空 buffer
      * 由 session-runner 在每个 turn 的 LLM 调用前调用
-     * @returns 格式化的消息文本，无新消息时返回 null
+     * @returns 格式化的消息文本和图片，无新消息时返回 null
      */
-    drainPendingMessages(): string | null {
+    async drainPendingMessages(): Promise<{ content: string; imageParts?: ImagePart[] } | null> {
         if (this.pendingMessages.length === 0) return null;
         const drained = this.pendingMessages.splice(0);
         const trigger = findLatestDirectAttentionMessage(drained);
@@ -1066,10 +1214,36 @@ export class CodeActExecutor {
             count: drained.length,
             hasDirectAttention: !!trigger,
         });
+        this.notifyPendingMessagesDrained(drained, "turn");
+        const enriched = await this.enrichReactionMessages(drained);
         if (trigger) {
-            return formatMidTurnDirectAttentionPrompt(drained, trigger.directReason ?? "direct-address");
+            const directReason = trigger.directReason ?? "direct-address";
+            const content = [
+                "[📩 新消息到达]",
+                enriched.formattedText,
+                "",
+                `[mid-turn direct attention: ${directReason}] 这些消息发生在你处理当前任务期间，其中有人直接叫住你、回复你或提及你。请结合当前会话、刚才的执行结果和上面所有尚未处理的新消息判断是否需要调整下一步行动或直接回复；需要时在下一轮自然处理，不需要则继续当前任务。`,
+            ].join("\n");
+            return { content, imageParts: enriched.imageParts.length ? enriched.imageParts : undefined };
         }
-        return formatPendingMessages(drained);
+        const content = `[📩 新消息到达]\n${enriched.formattedText}`;
+        return { content, imageParts: enriched.imageParts.length ? enriched.imageParts : undefined };
+    }
+
+    private notifyPendingMessagesDrained(
+        messages: PostTaskReactionMessage[],
+        source: PendingMessageDrainSource,
+    ): void {
+        if (!this.pendingMessageDrainHandler || messages.length === 0) return;
+        try {
+            this.pendingMessageDrainHandler(messages, source);
+        } catch (err) {
+            log.debug("pending message drain handler failed", {
+                chatId: this.chatId,
+                source,
+                error: String(err),
+            });
+        }
     }
 
     /**
@@ -1469,18 +1643,22 @@ export class CodeActExecutor {
 
         // ═══ Layer 2: token-budget LLM compact (context-manager) ═══
         const sessionConfigs = resolveComponentProfiles("session");
-        if (sessionConfigs.length > 0) {
+        const compactConfigs = resolveComponentProfiles("compact");
+        const targetSessionConfig = sessionConfigs[0];
+        if (targetSessionConfig && compactConfigs.length > 0) {
             const chatMessages: ChatMessage[] = this.session.map(m => ({
                 role: m.role,
                 content: m.content,
             }));
-            if (shouldCompact(chatMessages, undefined, sessionConfigs[0])) {
+            if (shouldCompact(chatMessages, undefined, targetSessionConfig)) {
                 log.info("compactSession Layer 2: token 仍超预算，调用 context-manager compact", {
                     chatId: this.chatId,
                     messageCount: chatMessages.length,
                 });
                 try {
-                    const compacted = await contextManagerCompact(chatMessages, sessionConfigs);
+                    const compacted = await contextManagerCompact(chatMessages, compactConfigs, undefined, {
+                        targetLlmConfig: targetSessionConfig,
+                    });
                     this.session = compacted.map(m => ({
                         role: m.role as SessionMessage["role"],
                         content: m.content,

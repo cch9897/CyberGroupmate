@@ -80,6 +80,19 @@
       />
       <span class="text-xs opacity-50 mt-1">开启后，同一 session 内已真正发送成功的相同内容会被拦截。默认开启。</span></label
     >
+    <label class="cfg-field"
+      ><span class="cfg-label">Post-task 图片识别</span>
+      <input
+        type="checkbox"
+        class="toggle toggle-xs"
+        checked={config.subagent.postTaskFollowUpImageRecognition !== false}
+        on:change={(e) => {
+          config.subagent.postTaskFollowUpImageRecognition = e.target.checked;
+          config = config;
+        }}
+      />
+      <span class="text-xs opacity-50 mt-1">开启后，post-task follow-up 判定器会识别新消息中的图片（判定模型支持 vision 时内联图片）；关闭则仅用占位文本以节省开销。默认开启。</span></label
+    >
   </div>
   <div class="divider text-xs opacity-50 my-3">CodeAct</div>
   <div class="cfg-grid-3">

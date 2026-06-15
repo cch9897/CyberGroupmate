@@ -22,6 +22,7 @@ import { getOrCreatePool } from "./llm-pool.js";
 import { rateLimiter } from "./llm-rate-limiter.js";
 import { loadConfig } from "./config.js";
 import { createLogger } from "./logger.js";
+import { sanitizePromptText } from "./text-safety.js";
 import { EventEmitter } from "node:events";
 
 // Provider 实现
@@ -51,6 +52,8 @@ export interface LLMCallEvent {
     maxTokens: number;
     /** provider */
     provider: string;
+    /** llm_profiles 中的 key（如 gemini-flash） */
+    profileName?: string;
     /** 消息摘要：每条消息的 role + content 前 200 字 + imageParts 信息 */
     messageSummaries: Array<{
         role: string;
@@ -342,7 +345,7 @@ async function callLLMSingleKey(
     }
     const releaseSlot = await rateLimiter.acquire(profileName);
     try {
-        return await _callLLMSingleKeyInner(messages, config, options);
+        return await _callLLMSingleKeyInner(messages, config, { ...options, profileName });
     } finally {
         releaseSlot();
     }
@@ -353,8 +356,11 @@ async function _callLLMSingleKeyInner(
     config: LLMConfig,
     options?: LLMCallOptions,
 ): Promise<LLMResponse> {
-    // ── 擦屁股：清洗空 assistant 消息 ──
+    // ── 擦屁股：清洗畸形字符 + 空 assistant 消息 ──
+    // 截断 emoji 会留下孤立代理项，序列化进请求体后会让部分 provider 的 JSON/prefill 解析失败；
+    // 出站统一兜底，同时覆盖历史脏数据（如已落盘的 session digest）与所有未走 safe-truncate 的路径。
     for (const msg of messages) {
+        if (typeof msg.content === "string") msg.content = sanitizePromptText(msg.content);
         if (msg.role === "assistant" && (!msg.content || !msg.content.trim())) {
             log.warn("Empty assistant message detected, filling with placeholder", {
                 original: msg.content ?? "(undefined)",
@@ -380,6 +386,7 @@ async function _callLLMSingleKeyInner(
             temperature,
             maxTokens,
             provider: config.provider ?? "openai",
+            profileName: options?.profileName,
             messageSummaries: summarizeMessages(messages),
             timestamp: new Date().toISOString(),
             extraBody: config.extraBody,

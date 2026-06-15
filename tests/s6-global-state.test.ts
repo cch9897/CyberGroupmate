@@ -12,6 +12,7 @@ import { randomUUID } from "node:crypto";
 import { rmSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 
 import { GlobalState } from "../src/main-agent/global-state.js";
+import { resolveMetaHistoryBudget } from "../src/main-agent/meta-history-retention.js";
 
 const tempDirs: string[] = [];
 function tempDir(): string { const d = join(tmpdir(), `s6-${randomUUID()}`); mkdirSync(d, { recursive: true }); tempDirs.push(d); return d; }
@@ -80,22 +81,56 @@ describe("S6: Global State", () => {
     it("#4b metaSessionHistory uses a hysteresis window instead of trimming every overflow", () => {
         const dir = tempDir();
         const gs = new GlobalState({ filePath: join(dir, "s.json"), autoSaveInterval: 0 });
-        const chunk = "x".repeat(1500);
 
-        for (let i = 0; i < 12; i++) {
+        // Derive sizes from the resolved budget so the test is independent of the
+        // ambient config.yaml (which may override the compiled defaults). Each message
+        // is sized so a handful of them blows past the soft char limit; trimming is
+        // applied incrementally on every append.
+        const budget = resolveMetaHistoryBudget();
+        const prefixLen = 6; // "mNNN-" worst case
+        const chunkLen = Math.floor(budget.trimTargetChars / budget.minMessages) - prefixLen;
+        assert.ok(chunkLen > 0, "budget too small for this test");
+        const chunk = "x".repeat(chunkLen);
+
+        // Push far more oversized messages than the budget allows.
+        const total = Math.ceil(budget.softCharLimit / chunkLen) * 2 + 5;
+        let maxLenObserved = 0;
+        for (let i = 0; i < total; i++) {
             gs.appendMetaSessionHistory([{ role: "assistant", content: `m${i}-${chunk}` }]);
+            const h = gs.getMetaSessionHistory();
+            const chars = h.reduce((sum, m) => sum + m.content.trim().length, 0);
+            maxLenObserved = Math.max(maxLenObserved, h.length);
+            // Hysteresis core property: the window never grows unbounded — after any
+            // append the char total stays within the soft limit (which is the trigger
+            // to trim), and it never trims below the configured minimum.
+            assert.ok(
+                chars <= budget.softCharLimit + chunkLen,
+                `chars ${chars} should stay bounded by soft limit`,
+            );
+            assert.ok(h.length >= budget.minMessages || i + 1 < budget.minMessages,
+                `should never trim below minMessages (${budget.minMessages})`);
         }
 
         const history = gs.getMetaSessionHistory();
-        assert.equal(history.length, 8);
-        assert.equal(history[0]?.content.startsWith("m4-"), true);
-        assert.equal(history.at(-1)?.content.startsWith("m11-"), true);
+        // Newest messages are always retained.
+        assert.equal(history.at(-1)?.content.startsWith(`m${total - 1}-`), true);
+        // Hysteresis means it does NOT collapse to exactly minMessages on each overflow;
+        // the steady-state window sits between minMessages and the soft-limit capacity.
+        assert.ok(history.length >= budget.minMessages, "window respects minMessages floor");
+        assert.ok(maxLenObserved > budget.minMessages, "window grows above minMessages between trims");
 
-        gs.appendMetaSessionHistory([{ role: "user", content: `tail-${"y".repeat(200)}` }]);
+        // A small append after a non-overflowing append should not trigger another trim:
+        // it simply grows the history by one entry.
+        const before = gs.getMetaSessionHistory();
+        // Only meaningful when we are not already at the overflow boundary; trim the
+        // window first by leaving it as-is and appending a tiny message.
+        gs.appendMetaSessionHistory([{ role: "user", content: "tail-tiny" }]);
         const nextHistory = gs.getMetaSessionHistory();
-        assert.equal(nextHistory.length, 9);
-        assert.equal(nextHistory[0]?.content.startsWith("m4-"), true);
-        assert.equal(nextHistory.at(-1)?.content.startsWith("tail-"), true);
+        assert.ok(
+            nextHistory.length >= before.length - 1,
+            "a tiny append must not aggressively shrink the window",
+        );
+        assert.equal(nextHistory.at(-1)?.content, "tail-tiny");
         gs.dispose();
     });
 

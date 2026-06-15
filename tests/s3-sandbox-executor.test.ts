@@ -13,6 +13,7 @@ import { randomUUID } from "node:crypto";
 
 import { CodeActExecutor } from "../src/subagent/code-act-executor.js";
 import { CallbackQueue } from "../src/subagent/callback-queue.js";
+import { EXECUTOR_FOOTER_TEXT } from "../src/context-engine/providers/executor-providers.js";
 import type { CodeActReplyTask, SubagentCallback, GroupContextPackage, Decision } from "../src/subagent/types.js";
 import { cleanupTestMemory, createTestMemory } from "./helpers/test-db.js";
 
@@ -156,6 +157,15 @@ describe("S3: Sandbox 多实例 + CodeActExecutor", () => {
             }
         });
 
+        it("#5c Layer 2 context-manager 使用 compact 路由生成摘要", async () => {
+            const { readFileSync } = await import("node:fs");
+            const source = readFileSync("src/subagent/code-act-executor.ts", "utf-8");
+
+            assert.match(source, /const compactConfigs = resolveComponentProfiles\("compact"\)/);
+            assert.match(source, /contextManagerCompact\(chatMessages, compactConfigs/);
+            assert.doesNotMatch(source, /contextManagerCompact\(chatMessages, sessionConfigs/);
+        });
+
         it("#6 callbackHandler 在执行后被调用", async () => {
             const executor = new CodeActExecutor("chat1");
             const callbacks: SubagentCallback[] = [];
@@ -174,6 +184,10 @@ describe("S3: Sandbox 多实例 + CodeActExecutor", () => {
 
         it("#6a direct pending messages are injected into current observation", () => {
             const executor = new CodeActExecutor("chat1");
+            const drained: Array<{ ids: string[]; source: string }> = [];
+            executor.setPendingMessageDrainHandler((messages, source) => {
+                drained.push({ ids: messages.map((message) => message.messageId), source });
+            });
 
             executor.pushPendingMessage({
                 messageId: "msg-1",
@@ -196,13 +210,18 @@ describe("S3: Sandbox 多实例 + CodeActExecutor", () => {
             assert.match(observation ?? "", /\[📩 新消息到达\]/);
             assert.match(observation ?? "", /前面这句也要一起看/);
             assert.match(observation ?? "", /你在吗/);
-            assert.match(observation ?? "", /replyTo=sent-1/);
+            assert.match(observation ?? "", /reply to msg#sent-1 #sent-1/);
             assert.match(observation ?? "", /\[mid-turn direct attention: reply-to-agent\]/);
             assert.equal(executor.drainPendingMessages(), null);
+            assert.deepEqual(drained, [{ ids: ["msg-1", "msg-2"], source: "observation" }]);
         });
 
         it("#6b non-direct pending messages stay on the next-turn injection path", () => {
             const executor = new CodeActExecutor("chat1");
+            const drained: Array<{ ids: string[]; source: string }> = [];
+            executor.setPendingMessageDrainHandler((messages, source) => {
+                drained.push({ ids: messages.map((message) => message.messageId), source });
+            });
 
             executor.pushPendingMessage({
                 messageId: "msg-1",
@@ -218,6 +237,7 @@ describe("S3: Sandbox 多实例 + CodeActExecutor", () => {
             assert.match(nextTurn ?? "", /\[📩 新消息到达\]/);
             assert.match(nextTurn ?? "", /普通插话/);
             assert.doesNotMatch(nextTurn ?? "", /mid-turn direct attention/);
+            assert.deepEqual(drained, [{ ids: ["msg-1"], source: "turn" }]);
         });
 
         it("#6c direct pending messages stay highlighted if they miss current observation", () => {
@@ -236,6 +256,122 @@ describe("S3: Sandbox 多实例 + CodeActExecutor", () => {
 
             assert.match(nextTurn ?? "", /\[mid-turn direct attention: @mention\]/);
             assert.match(nextTurn ?? "", /看一下我这条/);
+        });
+
+        it("#6c.1 pending sticker messages use cached descriptions", () => {
+            const executor = new CodeActExecutor("chat1");
+            (executor as any).memory = {
+                getStickerDescription: (uniqueFileId: string) => uniqueFileId === "sticker-known"
+                    ? { description: "比心示好的温柔贴纸", emojis: ["🫶"] }
+                    : null,
+            };
+
+            executor.pushPendingMessage({
+                messageId: "msg-sticker",
+                sender: "Alice",
+                text: "[🎭 贴纸: 🫶]",
+                timestamp: "2026-05-13T10:00:01.000Z",
+                mediaType: "sticker",
+                mediaInfo: JSON.stringify({
+                    type: "sticker",
+                    fileId: "file-sticker",
+                    uniqueFileId: "sticker-known",
+                    emoji: "🫶",
+                }),
+            });
+
+            const nextTurn = executor.drainPendingMessages();
+
+            assert.match(nextTurn ?? "", /贴纸 🫶: 比心示好的温柔贴纸/);
+            assert.doesNotMatch(nextTurn ?? "", /file-sticker/);
+            assert.doesNotMatch(nextTurn ?? "", /uniqueFileId/);
+        });
+
+        it("#6d buildAvailableStickers filters sendable stickers before randomly selecting 12", () => {
+            const memory = createTestMemory("executor-sticker-availability");
+            const originalRandom = Math.random;
+            try {
+                Math.random = () => 0;
+
+                const executor = new CodeActExecutor("chat1");
+                (executor as any).memory = memory;
+                (executor as any).mediaDownloader = {
+                    getExistingPath(uniqueFileId: string) {
+                        if (uniqueFileId.startsWith("missing-")) return null;
+                        if (uniqueFileId.startsWith("video-")) return `/tmp/${uniqueFileId}.webm`;
+                        return `/tmp/${uniqueFileId}.webp`;
+                    },
+                };
+
+                for (let i = 0; i < 16; i++) {
+                    memory.setStickerDescription(`sendable-${i}`, `sendable ${i}`, ["🙏"], true);
+                }
+                for (let i = 0; i < 6; i++) {
+                    memory.setStickerDescription(`disabled-${i}`, `disabled ${i}`, ["🙏"], false);
+                }
+                for (let i = 0; i < 6; i++) {
+                    memory.setStickerDescription(`missing-${i}`, `missing ${i}`, ["🙏"], true);
+                }
+
+                const stickers = (executor as any).buildAvailableStickers(
+                    makeTask("chat1", [{ action: "REPLY", suggestedEmojis: ["🙏"] }]),
+                );
+
+                assert.equal(stickers?.length, 12);
+                assert.ok(
+                    stickers?.every((item: { uniqueFileId: string }) => item.uniqueFileId.startsWith("sendable-")),
+                );
+                assert.notDeepEqual(
+                    stickers?.map((item: { uniqueFileId: string }) => item.uniqueFileId),
+                    Array.from({ length: 12 }, (_, index) => `sendable-${15 - index}`),
+                );
+            } finally {
+                Math.random = originalRandom;
+                cleanupTestMemory(memory, "executor-sticker-availability");
+            }
+        });
+
+        it("#6e continuation keeps only the latest task prompt uncollapsed", () => {
+            const executor = new CodeActExecutor("chat1");
+            const firstPrompt = [
+                "═══ task-1 ═══",
+                "聊天对象: chat1(chat1) [群聊]",
+                "",
+                "## 目标消息",
+                "[2026-05-13 10:00] [msgId:m1] Alice: 第一轮",
+                "",
+                EXECUTOR_FOOTER_TEXT,
+                "",
+                "## 相关记忆",
+                "只该在 continuation 之前保留到当前 turn。",
+            ].join("\n");
+            const secondPrompt = [
+                "═══ task-2 ═══",
+                "聊天对象: chat1(chat1) [群聊]",
+                "",
+                "## 目标消息",
+                "[2026-05-13 10:01] [msgId:m2] Bob: 第二轮",
+                "",
+                EXECUTOR_FOOTER_TEXT,
+                "",
+                "## 话题摘要",
+                "这是当前 turn 的 volatile 内容。",
+            ].join("\n");
+
+            executor.session = [
+                { role: "user", content: firstPrompt, timestamp: "2026-05-13T10:00:00.000Z" },
+                { role: "assistant", content: "第一轮完成", timestamp: "2026-05-13T10:00:05.000Z" },
+                { role: "user", content: secondPrompt, timestamp: "2026-05-13T10:01:00.000Z" },
+                { role: "assistant", content: "第二轮完成", timestamp: "2026-05-13T10:01:05.000Z" },
+            ];
+
+            const continued = (executor as any).buildSessionHistoryMessages(true);
+            assert.doesNotMatch(continued[0].content, /## 相关记忆/);
+            assert.match(continued[2].content, /## 话题摘要/);
+
+            const freshTask = (executor as any).buildSessionHistoryMessages(false);
+            assert.doesNotMatch(freshTask[2].content, /## 话题摘要/);
+            assert.ok(freshTask[2].content.endsWith(EXECUTOR_FOOTER_TEXT));
         });
     });
 

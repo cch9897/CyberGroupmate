@@ -12,7 +12,7 @@
 |:-----|:-----|:----:|
 | MCP Bridge | MCP Server 桥接（stdio + Streamable HTTP） | ✅ |
 | SKILL.md | agentskills.io 标准生态原生支持 | ✅ |
-| P0-4 | LLM 上下文同步（Two-pass 动态化 + 模块文档重生成） | ✅ |
+| P0-4 | LLM 上下文同步（运行时错误后文档注入动态化 + 模块文档重生成） | ✅ |
 | P1-6 | Cron API — Sandbox 内自建持久化定时任务 | ✅ |
 | P1-7 | Events API — Sandbox 事件监听器注册 | ✅ |
 | P2-8 | 后台任务持久化（spawnPersistent）| ✅ |
@@ -135,7 +135,7 @@ Standard Agent Skills from workspace/skills/*/SKILL.md.
 
 ## 三、P0-4：LLM 上下文同步
 
-### Two-pass prefixMap 动态化
+### 文档注入 prefixMap 动态化
 
 **`src/sandbox/session-runner.ts`** + **`src/subagent/code-act-executor.ts`**
 
@@ -161,7 +161,7 @@ twoPassConfig: {
 
 ### TRIVIAL_CALLS 更新
 
-**`src/sandbox/api-intent-extractor.ts`** 新增无需 Pass 2 的轻量调用白名单：
+**`src/sandbox/api-intent-extractor.ts`** 新增无需完整文档的轻量调用白名单：
 
 ```
 cron.list, events.list, kv.get, kv.del, mcp.list, http.listWebhooks, ...

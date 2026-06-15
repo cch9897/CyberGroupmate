@@ -28,6 +28,41 @@ describe("executor context providers", () => {
         assert.doesNotMatch(result.historicalContent, /digest 2/);
     });
 
+    it("only persists new Meta session digests after commit", () => {
+        const engine = new ContextEngine("executor-digest-delta-test");
+        engine.registerAll(getExecutorTaskProviders());
+
+        const base = [
+            { createdAt: "2026-05-01T10:00:00.000Z", content: "digest A" },
+            { createdAt: "2026-05-01T10:01:00.000Z", content: "digest B" },
+        ];
+        const common = {
+            chatId: "telegram:g1",
+            taskId: "task-1",
+            decisions: [{ action: "REPLY", contentDirection: "回复当前问题", confidence: 1 }],
+        };
+
+        const first = engine.render({ ...common, sessionDigests: base });
+        assert.match(first.historicalContent, /digest A/);
+        assert.match(first.historicalContent, /digest B/);
+        engine.commit(first.tree);
+
+        const unchanged = engine.render({ ...common, taskId: "task-2", sessionDigests: base });
+        assert.doesNotMatch(unchanged.historicalContent, /# 历史 Session Digests/);
+
+        const changed = engine.render({
+            ...common,
+            taskId: "task-3",
+            sessionDigests: [
+                ...base,
+                { createdAt: "2026-05-01T10:02:00.000Z", content: "digest C" },
+            ],
+        });
+        assert.match(changed.historicalContent, /digest C/);
+        assert.doesNotMatch(changed.historicalContent, /digest A/);
+        assert.doesNotMatch(changed.historicalContent, /digest B/);
+    });
+
     it("exposes runtime.elevate in the subagent API overview", () => {
         const api = loadApiTypeDefs("telegram");
         assert.match(api, /## runtime/);

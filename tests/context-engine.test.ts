@@ -388,8 +388,7 @@ describe("Pipeline Providers", () => {
         assert.ok(data);
         const rendered = metaAttendHeaderProvider.render(data);
 
-        assert.match(rendered, /chatId: telegram:2070293084/);
-        assert.match(rendered, /raw: 2070293084/);
+        assert.match(rendered, /composite chatId: telegram:2070293084/);
         assert.doesNotMatch(rendered, /onebot:private/);
     });
 
@@ -597,8 +596,10 @@ describe("Regression: prompt-renderer.ts 已删除", () => {
     });
 
     it("保留的模板文件仍存在", () => {
+        // mainagent-main-system.md was removed in commit 1fe4aee ("fix: meta attend")
+        // once the meta path migrated to ContextEngine providers; only the executor
+        // template remains a real on-disk prompt.
         const keptTemplates = [
-            "system-prompts/main-agent/mainagent-main-system.md",
             "system-prompts/executor/subagent-execution.md",
         ];
         for (const tmpl of keptTemplates) {

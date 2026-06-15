@@ -11,6 +11,7 @@
 
 import type { CapabilityRegistryEnv } from "../../capability-registry.js";
 import { createTelegramClientProxy } from "../telegram/index.js";
+import { DEFAULT_BANNED_WORDS } from "../../../core/banned-words.js";
 
 export interface SkillListEntry {
     /** workspace/skills 下的真实目录名。读写文件请使用 path/id，不要猜 bindingName。 */
@@ -53,8 +54,9 @@ export function installSkills(
     env: CapabilityRegistryEnv,
     sentHistory: Map<string, Set<string>>,
     deduplicateSentMessages = true,
+    bannedWords: string[] = DEFAULT_BANNED_WORDS,
 ) {
-    const tg = createTelegramClientProxy(env, sentHistory, deduplicateSentMessages);
+    const tg = createTelegramClientProxy(env, sentHistory, deduplicateSentMessages, bannedWords);
     return {
         /** 获取安装/创建新 Skill 的步骤说明（无实际代码动作） */
         install: (name: string) => {

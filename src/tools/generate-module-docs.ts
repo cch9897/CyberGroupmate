@@ -2,7 +2,7 @@
  * generate-module-docs.ts — 自动化 Sandbox 模块文档生成工具
  *
  * 从 src/sandbox/modules/ 下的 .d.ts 文件中解析方法签名和 JSDoc 注释，
- * 生成结构化的 modules-docs.json 用于 Two-pass Code Generation。
+ * 生成结构化的 modules-docs.json，用于轻量 API 概览与运行时错误后的 d.ts 文档注入。
  *
  * 用法：npx tsx src/tools/generate-module-docs.ts
  *
@@ -110,4 +110,3 @@ function mergeEntries(allEntries: ModuleEntry[], newEntries: ModuleEntry[]): voi
 }
 
 main();
-

@@ -26,6 +26,19 @@ import path from "node:path";
 
 const log = createLogger("onebot-adapter");
 
+/**
+ * 归一化 QQ 图片的 uniqueFileId。
+ *
+ * QQ 没有 file_unique 时会回退到 `file` 字段，其形如 `{内容MD5}.{扩展名}`。
+ * 同一张图（同一 MD5）可能被上报为 `.jpg` / `.png` 等不同扩展名，导致同一贴纸
+ * 被当成多个不同的 uniqueFileId 重复记录进贴纸库。这里当值形如「内容散列+扩展名」
+ * 时去掉扩展名、统一大写，让同一内容收敛到唯一 key。其它形态（base64、face:/mface: 等）原样返回。
+ */
+function normalizeQqImageKey(value: string): string {
+    const match = value.match(/^([A-Fa-f0-9]{16,})\.[A-Za-z0-9]+$/);
+    return match ? match[1].toUpperCase() : value;
+}
+
 type OneBotMessageSegment = {
     type: string;
     data?: Record<string, unknown>;
@@ -1044,8 +1057,11 @@ export class OneBotAdapter implements PlatformAdapter {
             }
         }
         if (this.config.sendFileAsDataUrl === true && typeof file === "string") {
-            const dataUrl = this.toDataUrlIfLocalFile(file);
-            if (dataUrl) file = dataUrl;
+            // OneBot v11 / NapCat 使用 base64:// 前缀，不支持 HTML data: URL 格式
+            const localPath = this.resolveFileReferenceToPath(file);
+            if (localPath) {
+                file = `base64://${readFileSync(localPath).toString("base64")}`;
+            }
         }
         if (typeof file === "string") {
             if (!(file.startsWith("http://") || file.startsWith("https://") || file.startsWith("base64://") || file.startsWith("file://") || file.startsWith("data:"))) {
@@ -1458,7 +1474,7 @@ export class OneBotAdapter implements PlatformAdapter {
                     type: isSticker ? "sticker" : "photo",
                     url,
                     fileId: url || fileId,
-                    uniqueFileId: String(data.file_unique ?? data.file_id ?? (file || url || fileId)),
+                    uniqueFileId: normalizeQqImageKey(String(data.file_unique ?? data.file_id ?? (file || url || fileId))),
                     fileName: typeof data.name === "string" ? data.name : (file ? path.basename(file) : undefined),
                     width: typeof data.width === "number" ? data.width : (typeof data.width === "string" ? Number(data.width) || undefined : undefined),
                     height: typeof data.height === "number" ? data.height : (typeof data.height === "string" ? Number(data.height) || undefined : undefined),

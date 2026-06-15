@@ -5,6 +5,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import {
     disconnectAll,
     getConnectionConfigs,
+    getMcpModuleEntries,
     initMcpBridge,
     mcpBridge,
     replaceConnectionConfigs,
@@ -110,13 +111,29 @@ describe("mcp-bridge Streamable HTTP", () => {
                 url: serverUrl,
             });
 
+            // The MCP bridge should publish exactly the connected server's tools as a
+            // dynamic module entry. We assert against getMcpModuleEntries() (the bridge's
+            // own contribution) rather than the fully merged cache, because the merged
+            // cache also folds in builtin modules and workspace TS Skills, which may
+            // coincidentally share a name (e.g. a local "github" skill) and inflate the
+            // method count in a way that depends on the developer's workspace state.
+            const mcpEntries = getMcpModuleEntries();
+            const githubEntry = mcpEntries.find((entry) => entry.name === "github");
+            assert.ok(githubEntry, "connected MCP server should be published as a dynamic module entry");
+            assert.equal(githubEntry?.methods.length, 1);
+            assert.equal(githubEntry?.methods[0]?.name, "search_repositories");
+            assert.match(githubEntry?.description ?? "", /MCP Server \(1 tools\) via Streamable HTTP/);
+            assert.match(githubEntry?.description ?? "", /用于搜索 GitHub 仓库和代码/);
+
+            // The onRegistryChange → refreshModuleRegistryCache() wiring should make the
+            // connected server visible in the merged cache too, with its tool present.
             const registry = getModuleRegistryCache();
             const githubModule = registry.find((entry) => entry.name === "github");
             assert.ok(githubModule, "connected MCP server should appear in module registry cache");
-            assert.equal(githubModule?.methods.length, 1);
-            assert.equal(githubModule?.methods[0]?.name, "search_repositories");
-            assert.match(githubModule?.description ?? "", /MCP Server \(1 tools\) via Streamable HTTP/);
-            assert.match(githubModule?.description ?? "", /用于搜索 GitHub 仓库和代码/);
+            assert.ok(
+                githubModule?.methods.some((method) => method.name === "search_repositories"),
+                "merged cache should include the connected MCP tool",
+            );
             assert.deepEqual(getConnectionConfigs(), [{
                 name: "github",
                 description: "用于搜索 GitHub 仓库和代码",

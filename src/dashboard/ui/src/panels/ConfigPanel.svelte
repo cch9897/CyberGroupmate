@@ -20,6 +20,7 @@
   import SystemPromptsTab from "./config/SystemPromptsTab.svelte";
   import GroundingTab from "./config/GroundingTab.svelte";
   import RateLimitingTab from "./config/RateLimitingTab.svelte";
+  import BackgroundAgentTab from "./config/BackgroundAgentTab.svelte";
 
   let config = null;
   let originalConfig = null;
@@ -62,10 +63,11 @@
     { id: "systemPrompts", label: "System Prompts", icon: "fa-file-lines" },
     { id: "grounding", label: "Grounding", icon: "fa-globe" },
     { id: "rateLimiting", label: "请求限速", icon: "fa-gauge-high" },
+    { id: "backgroundAgent", label: "做梦系统", icon: "fa-moon" },
     { id: "envVars", label: "环境变量", icon: "fa-key" },
   ];
 
-  const RESTART_SECTIONS = new Set(["embedding", "dashboard"]);
+  const RESTART_SECTIONS = new Set(["embedding", "dashboard", "backgroundAgent"]);
   const RESTART_FIELDS = {
     telegram: ["mode", "botToken", "apiId", "apiHash", "phone"],
     discord: ["botToken"],
@@ -78,6 +80,7 @@
     { key: "session", label: "CodeAct 交互", desc: "生成回复内容" },
     { key: "recording_cluster", label: "话题聚类", desc: "消息→话题分组" },
     { key: "recording_triage", label: "话题 Triage", desc: "摘要 + 介入判断" },
+    { key: "post_task_followup", label: "Post-task Follow-up", desc: "窗口内 5 秒追问判定" },
     { key: "reflection", label: "反思引擎", desc: "人物画像/总结" },
     { key: "compact", label: "上下文压缩", desc: "对话历史摘要" },
     { key: "memory", label: "记忆检索", desc: "Deep recall" },
@@ -611,6 +614,8 @@
             <EnvVarsTab bind:config {pwFocus} {pwBlur} {addEnvVar} {removeEnvVar} />
           {:else if currentSection === "rateLimiting"}
             <RateLimitingTab bind:config profileNames={Object.keys(config.llmProfiles ?? {})} />
+          {:else if currentSection === "backgroundAgent"}
+            <BackgroundAgentTab bind:config {pwFocus} {pwBlur} />
           {:else if currentSection === "grounding"}
             <GroundingTab bind:config {pwFocus} {pwBlur} />
           {:else if currentSection === "systemPrompts"}

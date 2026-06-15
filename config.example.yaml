@@ -105,6 +105,8 @@ llm_routing:
   #   - gemini-flash
   # recording — 话题聚类 + Triage（后台分析）
   recording: gemini-flash
+  # post_task_followup — Post-task window 内 5 秒批量追问判定（建议用很便宜的小模型）
+  post_task_followup: gemini-flash
   # reflection — 反思引擎（人物画像/话题总结）
   reflection: gemini-flash
   # compact — 上下文压缩（对话历史摘要）
@@ -133,6 +135,10 @@ llm_routing:
 #   #   vision_cache — 首次识别后缓存描述，相同贴纸复用
 #   #   vision_each — 每次发送都用 vision 模型识别
 #   sticker_mode: emoji_only
+#   # 动态贴纸（WebM 视频贴纸 / TGS 动画贴纸）抽帧数量上限 (3)
+#   # 多帧会按时间均匀采样后一并送 Vision LLM，帮助理解动画含义
+#   # 设为 0 可完全禁用动态贴纸的 vision 识别（仅显示 emoji）
+#   animated_sticker_frames: 3
 #   # 聊天媒体/文件自动下载到 workspace/Downloads/ 的大小上限 (MB) (20)
 #   max_media_download_size: 20
 #   # 已下载媒体文件的保留天数，超期自动清理 (3)
@@ -361,6 +367,20 @@ metrics:
 #   restrict_adapter_writes_to_bound_chat: false
 #   # 是否启用 session 内重复消息拦截；仅真正发送成功后才记录 (true)
 #   deduplicate_sent_messages: true
+#   # Subagent 发言前禁用词检查列表。包含任一词语的文字消息将被拦截，
+#   # 并向 LLM 上下文发出警告，要求修改措辞后重新发送。
+#   # 传空列表（[]）可完全禁用此检查。
+#   # 不填时使用内置默认词表（"确实"、"笑死"、"接住" 等口癖词）。
+#   banned_words:
+#     - 确实
+#     - 笑死
+#     - 还真是
+#     - 接住
+#     - 抓住
+#     - 你说得对
+#     - 说得对
+#     - 不绕
+#     - 我认了
 #   # Subagent 发言后的发酵窗口。窗口内 L0 追问交给 subagent，结束后 callback 回 Meta (120000)
 #   post_task_window_ms: 120000
 #   # 常驻模块清单：始终全量注入子代理运行时的底层基础模块和指定扩展。
@@ -439,3 +459,18 @@ metrics:
 #   - key: DATABASE_URL
 #     value: "postgres://..."
 #     scope: host
+
+# ─── Background Agent (做梦系统) ───
+# background_agent:
+#   enabled: true               # 是否启用 MCP Server（默认 true）
+#   mcp_port: 3100              # MCP Server 监听端口（默认 3100，仅本机 127.0.0.1）
+#   mcp_token: "your-token"     # 认证 token（不设则每次启动随机生成）
+#   harness: "claude-code"      # harness 类型："claude-code" 或 "copilot"
+#   claude_code_path: "claude"  # Claude CLI 路径（harness=claude-code 时，默认 PATH 中的 claude）
+#   copilot_path: "copilot"     # Copilot CLI 路径（harness=copilot 时，默认 PATH 中的 copilot）
+#   harness_model: "sonnet"     # harness 使用的模型名称
+#   max_budget_usd: 5           # 单次做梦的最大花费（美元，仅 Claude Code 支持）
+#   schedule: "0 3 * * *"       # 定时做梦的 cron 表达式（默认凌晨 3 点）
+#   min_interval_hours: 6       # 定时做梦的强制最小间隔（小时，默认 6，设 0 关闭）；防重启/cron 边界/重试叠加导致频繁做梦
+#   extra_args:                 # 自定义启动参数（传给 harness CLI）
+#     - "--verbose"

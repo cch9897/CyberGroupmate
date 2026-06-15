@@ -18,6 +18,7 @@ export const TELEGRAM_MTCUTE_GUIDE_METHODS = {
         "getProfilePhoto",
         "getProfilePhotos",
         "iterProfilePhotos",
+        "downloadAsBuffer",
         "editCloseFriends",
     ],
 

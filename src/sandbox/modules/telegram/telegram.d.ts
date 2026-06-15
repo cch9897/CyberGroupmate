@@ -34,6 +34,13 @@ type TelegramMessage = {
     forwardFromUrl?: string;
 };
 
+type TelegramMtcuteRef = {
+    /** Host-side mtcute object reference. Pass this object back to telegram mtcute methods to preserve native object identity. */
+    __mtcuteRef: string;
+    __mtcuteType?: string;
+    [key: string]: unknown;
+};
+
 declare const telegram: {
     // ─── 按需能力指南 ───
     /** 加载 inline bot 使用指南。用于像 Telegram 客户端输入 `@bot query` 一样查询 inline bot 并发送某个结果；调用本方法只披露指南，不会执行实际发送。 */
@@ -56,6 +63,8 @@ declare const telegram: {
     useInvites(): Promise<string>;
     /** 加载论坛话题指南。用于确认群是否开启 Forum、列出话题或定位 topic id；调用本方法只披露相关 API。 */
     useForumTopics(): Promise<string>;
+    /** 加载媒体下载指南。包含：1) 用 fs.writeFileBinary() 正确保存 base64 buffer 的方法；2) GIF/短视频抽帧分析时避免 60s 超时的策略（默认 4-6 帧、复用已有文件、先发进度）。遇到 downloadMedia 或 GIF 分析相关问题时调用。 */
+    useMediaDownload(): Promise<string>;
     // ─── 发送与交互 ───
     /** 发送普通文本消息 */
     sendText(chatId: number | string, text: string, opts?: { replyTo?: number; silent?: boolean; }): Promise<{ id: number; text: string; date: Date; chat: { id: number; title?: string; username?: string; type: "private" | "group" | "supergroup" | "channel"; }; sender: { id: number; displayName?: string; title?: string; username?: string; }; isMention: boolean; replyToMessage?: { id: number } | null; media?: unknown; mediaInfo?: { type: "photo" | "sticker" | "video" | "document" | "animation" | "audio" | "other"; rawType?: string; fileId?: string; uniqueFileId?: string; emoji?: string; mimeType?: string; fileName?: string; width?: number; height?: number; fileSize?: number; filePath?: string; downloadStatus?: "downloaded" | "cached" | "too_large" | "failed"; downloadError?: string; }; }>;
@@ -64,7 +73,7 @@ declare const telegram: {
      * @example sendMedia(chatId, { type: 'photo', file: 'https://example.com/img.jpg', caption: '看看这个' })
      * @example sendMedia(chatId, { type: 'photo', file: 'ip_skk_moe.png' }) // 自动基于 process.cwd() 解析
      */
-    sendMedia(chatId: number | string, media: string | { type: 'photo' | 'video' | 'document' | 'audio' | 'auto'; file: string; caption?: string; fileName?: string }, opts?: { replyTo?: number; silent?: boolean; }): Promise<{ id: number; text: string; date: Date; chat: { id: number; title?: string; username?: string; type: "private" | "group" | "supergroup" | "channel"; }; sender: { id: number; displayName?: string; title?: string; username?: string; }; isMention: boolean; replyToMessage?: { id: number } | null; media?: unknown; mediaInfo?: { type: "photo" | "sticker" | "video" | "document" | "animation" | "audio" | "other"; rawType?: string; fileId?: string; uniqueFileId?: string; emoji?: string; mimeType?: string; fileName?: string; width?: number; height?: number; fileSize?: number; filePath?: string; downloadStatus?: "downloaded" | "cached" | "too_large" | "failed"; downloadError?: string; }; }>;
+    sendMedia(chatId: number | string, media: string | { type: 'photo' | 'video' | 'document' | 'audio' | 'voice' | 'auto'; file: string; caption?: string; fileName?: string }, opts?: { replyTo?: number; silent?: boolean; }): Promise<{ id: number; text: string; date: Date; chat: { id: number; title?: string; username?: string; type: "private" | "group" | "supergroup" | "channel"; }; sender: { id: number; displayName?: string; title?: string; username?: string; }; isMention: boolean; replyToMessage?: { id: number } | null; media?: unknown; mediaInfo?: { type: "photo" | "sticker" | "video" | "document" | "animation" | "audio" | "other"; rawType?: string; fileId?: string; uniqueFileId?: string; emoji?: string; mimeType?: string; fileName?: string; width?: number; height?: number; fileSize?: number; filePath?: string; downloadStatus?: "downloaded" | "cached" | "too_large" | "failed"; downloadError?: string; }; }>;
     /** 发送磁盘文件到聊天。支持绝对路径或基于 cwd 的相对路径。host 侧读取文件并上传。始终作为文件/文档发送。 */
     sendFile(chatId: number | string, filePath: string, opts?: { replyTo?: number; caption?: string; fileName?: string; mimeType?: string }): Promise<{ id: number; text: string; date: Date; chat: { id: number; title?: string; username?: string; type: "private" | "group" | "supergroup" | "channel"; }; sender: { id: number; displayName?: string; title?: string; username?: string; }; isMention: boolean; replyToMessage?: { id: number } | null; media?: unknown; mediaInfo?: { type: "photo" | "sticker" | "video" | "document" | "animation" | "audio" | "other"; rawType?: string; fileId?: string; uniqueFileId?: string; emoji?: string; mimeType?: string; fileName?: string; width?: number; height?: number; fileSize?: number; filePath?: string; downloadStatus?: "downloaded" | "cached" | "too_large" | "failed"; downloadError?: string; }; }>;
     /**
@@ -144,19 +153,52 @@ declare const telegram: {
     getMessageReactions(chatId: number | string, messageIds: number[]): Promise<Array<{ emoji: string; count: number; }>>;
     /**
      * 下载媒体文件的二进制数据。返回 base64 编码的 buffer 和文件大小。
-     * 需要传入通过 mediaInfo.fileId 获取的文件标识符。
-     * @param fileId TDLib/Bot API 兼容的文件 ID
+     * 优先传入 msg.mediaInfo.fileId，不要把整个 msg.mediaInfo 当作 location 传入；也可以直接传 mtcute 返回的 Photo/FileLocation 等带 __mtcuteRef 的对象。
+     * @param location TDLib/Bot API 兼容 file_id、mtcute FileDownloadLocation、或带 __mtcuteRef 的 mtcute 对象。通常使用 msg.mediaInfo.fileId。
      * @param chatId  可选，用于 file reference 过期时自动 refetch
      * @param messageId 可选，同上
      * @param uniqueFileId 可选，用于缓存命中
+     *
+     * ⚠️ **保存到磁盘必须用 `fs.writeFileBinary()`，不能用 `fs.writeFile()`。**
+     * `data.buffer` 是 base64 字符串；`fs.writeFile` 会把它当 UTF-8 文本写入导致文件损坏。
+     *
      * @example
+     * // ✅ 正确：下载并保存为可用的图片文件
      * const msg = messages[0];
      * if (msg.mediaInfo?.fileId) {
      *   const data = await telegram.downloadMedia(msg.mediaInfo.fileId, chatId, msg.id, msg.mediaInfo.uniqueFileId);
-     *   // data.buffer 是 base64 编码的文件内容, data.size 是字节数
+     *   fs.writeFileBinary("workspace/Downloads/photo.jpg", data.buffer);
+     *   // 之后可以 vision.see("workspace/Downloads/photo.jpg") 或 sendMedia(chatId, { type: 'photo', file: 'workspace/Downloads/photo.jpg' })
      * }
+     * @example
+     * // ❌ 错误：writeFile 写入 base64 字符串，文件损坏
+     * // fs.writeFile("photo.jpg", data.buffer);
+     * @example
+     * // 错误：await telegram.downloadMedia(msg.mediaInfo)
+     * // 正确：await telegram.downloadMedia(msg.mediaInfo.fileId, msg.chat.id, msg.id, msg.mediaInfo.uniqueFileId)
      */
-    downloadMedia(fileId: string, chatId?: number | string, messageId?: number, uniqueFileId?: string): Promise<{ buffer: string; size: number; }>;
+    downloadMedia(location: string | TelegramMtcuteRef | Record<string, unknown>, chatId?: number | string, messageId?: number, uniqueFileId?: string): Promise<{ buffer: string; size: number; }>;
+    /**
+     * mtcute 原生 downloadAsBuffer 透传。返回值在 sandbox 中表示为 base64 buffer。
+     *
+     * ⚠️ **重要**：此方法对 `location` 类型容错较低。
+     * - ✅ 接受：fileId 字符串、带 `__mtcuteRef` 的 mtcute 原生对象（如 `getProfilePhotos` 返回的 photo 对象）
+     * - ❌ 不接受：`msg.mediaInfo`（普通 plain object，没有 `__mtcuteRef`）——会报 "Unknown object undefined"
+     *
+     * 大多数场景建议优先用 `downloadMedia`（容错更好），仅在需要 mtcute 原生对象时用此方法。
+     *
+     * @example
+     * // ✅ 下载用户头像（getProfilePhotos 返回 mtcute 原生对象，可直接传入）
+     * const [photo] = await telegram.getProfilePhotos(userId, { limit: 1 });
+     * const data = await telegram.downloadAsBuffer(photo);
+     *
+     * @example
+     * // ❌ 不要传 mediaInfo（会报错）
+     * // const data = await telegram.downloadAsBuffer(msg.mediaInfo); // Error!
+     * // ✅ 改用 downloadMedia，或先取 fileId 字符串
+     * const data = await telegram.downloadMedia(msg.mediaInfo.fileId, chatId, msg.id, msg.mediaInfo.uniqueFileId);
+     */
+    downloadAsBuffer(location: string | TelegramMtcuteRef, params?: { fileSize?: number; partSize?: number; dcId?: number; offset?: number; limit?: number }): Promise<{ buffer: string; size: number; }>;
 
     // ─── 群组管理 ───
     /** 加入一个群聊或频道 */

@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -53,7 +54,64 @@ function makeIncomingMessage(overrides: Record<string, unknown> = {}): Record<st
     };
 }
 
+class FakeDiscordClient extends EventEmitter {
+    loginCalls = 0;
+    destroyCalls = 0;
+    readonly user: { id: string; username: string };
+    readonly guilds = { cache: { size: 0 } };
+
+    constructor(id: string) {
+        super();
+        this.user = { id, username: id };
+    }
+
+    async login(_token: string): Promise<string> {
+        this.loginCalls++;
+        queueMicrotask(() => this.emit("ready"));
+        return "logged-in";
+    }
+
+    async destroy(): Promise<void> {
+        this.destroyCalls++;
+    }
+}
+
+async function waitFor(assertion: () => boolean, timeoutMs = 500): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        if (assertion()) return;
+        await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.ok(assertion(), "timed out waiting for condition");
+}
+
 describe("DiscordAdapter", () => {
+    it("should recreate the Discord client after session invalidation", async () => {
+        const nc = makeNC();
+        const clients: FakeDiscordClient[] = [];
+        const adapter = new DiscordAdapter({ botToken: "token" }, nc, undefined, async () => {
+            const client = new FakeDiscordClient(`bot-${clients.length + 1}`);
+            clients.push(client);
+            return client;
+        });
+
+        (adapter as any).getReconnectDelayMs = () => 1;
+
+        try {
+            await adapter.start();
+            assert.equal(clients.length, 1);
+            assert.equal(clients[0].loginCalls, 1);
+
+            clients[0].emit("invalidated");
+
+            await waitFor(() => clients.length === 2 && clients[1].loginCalls === 1);
+            assert.equal(clients[0].destroyCalls, 1);
+        } finally {
+            await adapter.stop();
+            nc.dispose();
+        }
+    });
+
     it("should append known display names to inbound Discord user mentions", () => {
         const nc = makeNC();
         const adapter = new DiscordAdapter({ botToken: "token" }, nc, {
@@ -131,6 +189,49 @@ describe("DiscordAdapter", () => {
             ]);
 
             assert.equal(sentOptions?.content, "<@1485835320535810058> 收到");
+        } finally {
+            nc.dispose();
+        }
+    });
+
+    it("should react to fetched Discord messages", async () => {
+        const nc = makeNC();
+        const adapter = new DiscordAdapter({ botToken: "token" }, nc);
+        const fetchedMessageIds: string[] = [];
+        const reactions: string[] = [];
+
+        (adapter as any).client = {
+            channels: {
+                async fetch(id: string) {
+                    assert.equal(id, "channel-1");
+                    return {
+                        id: "channel-1",
+                        isTextBased: () => true,
+                        messages: {
+                            async fetch(messageId: string) {
+                                fetchedMessageIds.push(messageId);
+                                return {
+                                    id: messageId,
+                                    async react(emoji: string) {
+                                        reactions.push(emoji);
+                                    },
+                                };
+                            },
+                        },
+                    };
+                },
+            },
+        };
+
+        try {
+            await adapter.handleCall("discord.sendReaction", [
+                "discord:channel-1",
+                "msg-42",
+                "<:blobreach:123456789012345678>",
+            ]);
+
+            assert.deepEqual(fetchedMessageIds, ["msg-42"]);
+            assert.deepEqual(reactions, ["<:blobreach:123456789012345678>"]);
         } finally {
             nc.dispose();
         }

@@ -21,6 +21,9 @@ const log = createLogger("discord-adapter");
 const MEDIA_DOWNLOAD_TIMEOUT_MS = 15_000;
 const MEDIA_SEND_TIMEOUT_MS = 25_000;
 const DISCORD_API_BASE = "https://discord.com/api/v10";
+const DISCORD_RECONNECT_BASE_MS = 1000;
+const DISCORD_RECONNECT_MAX_MS = 30_000;
+const DISCORD_GATEWAY_RECOVERY_TIMEOUT_MS = 120_000;
 
 type ParsedDiscordTarget = {
     raw: string;
@@ -42,6 +45,8 @@ type PreparedDiscordAttachment = {
     sizeBytes: number;
 };
 
+type DiscordClientFactory = () => Promise<any>;
+
 /** 结构化媒体元数据 */
 export interface DiscordMediaInfo {
     type: "photo" | "video" | "document" | "other";
@@ -62,83 +67,199 @@ export class DiscordAdapter implements PlatformAdapter {
 
     private client: any | null = null;
     private selfUserId: string | null = null;
+    private stopRequested = false;
+    private connecting: Promise<void> | null = null;
+    private reconnectTimer: NodeJS.Timeout | null = null;
+    private gatewayRecoveryTimer: NodeJS.Timeout | null = null;
+    private reconnectAttempts = 0;
 
     constructor(
         private config: DiscordConfig,
         private nc: NotificationCenter,
         private memory?: Pick<IMemoryStoreV2, "getPersonIdentity">,
+        private createClient: DiscordClientFactory = defaultDiscordClientFactory,
     ) {}
 
     async start(): Promise<void> {
-        if (this.client) return;
-
         if (!this.config.botToken) {
             throw new Error("discord.bot_token is required");
         }
 
-        // Dynamic import to avoid top-level dependency on discord.js
-        const { Client, GatewayIntentBits, Partials } = await import("discord.js");
+        if (this.client) return;
+        if (this.connecting) return this.connecting;
 
-        const client = new Client({
-            intents: [
-                GatewayIntentBits.Guilds,
-                GatewayIntentBits.GuildMessages,
-                GatewayIntentBits.MessageContent,
-                GatewayIntentBits.DirectMessages,
-            ],
-            partials: [
-                Partials.Channel, // Required for DM support
-                Partials.Message,
-            ],
-        });
+        this.stopRequested = false;
+        this.reconnectAttempts = 0;
+        this.clearReconnectTimer();
+        this.clearGatewayRecoveryWatchdog();
+        return this.connect(false);
+    }
 
-        // Wait for ready event
-        await new Promise<void>((resolve, reject) => {
-            client.once("ready", () => {
-                this.selfUserId = client.user?.id ?? null;
-                log.info("Discord client ready", {
-                    username: client.user?.username,
-                    id: this.selfUserId,
-                    guilds: client.guilds.cache.size,
-                });
-                resolve();
+    async stop(): Promise<void> {
+        this.stopRequested = true;
+        this.clearReconnectTimer();
+        this.clearGatewayRecoveryWatchdog();
+        const client = this.client;
+        this.client = null;
+        this.selfUserId = null;
+        if (client) await this.destroyClient(client, "stop");
+    }
+
+    private connect(isReconnect: boolean): Promise<void> {
+        if (this.connecting) return this.connecting;
+        this.connecting = this.createAndLoginClient(isReconnect)
+            .finally(() => {
+                this.connecting = null;
             });
-            client.once("error", reject);
-            client.login(this.config.botToken).catch(reject);
+        return this.connecting;
+    }
+
+    private async createAndLoginClient(isReconnect: boolean): Promise<void> {
+        const client = await this.createClient();
+        this.attachClientLifecycle(client);
+        this.attachMessageListener(client);
+
+        try {
+            await this.loginAndWaitForReady(client);
+        } catch (err) {
+            await this.destroyClient(client, "failed login");
+            throw err;
+        }
+
+        if (this.stopRequested) {
+            await this.destroyClient(client, "stopped before ready");
+            return;
+        }
+
+        this.client = client;
+        this.selfUserId = client.user?.id ?? null;
+        this.reconnectAttempts = 0;
+        log.info(isReconnect ? "DiscordAdapter 重连成功" : "Discord client ready", {
+            username: client.user?.username,
+            id: this.selfUserId,
+            guilds: client.guilds?.cache?.size ?? 0,
+        });
+        log.info(`✅ DiscordAdapter 已启动: ${client.user?.username ?? "?"} (${this.selfUserId})`);
+    }
+
+    private loginAndWaitForReady(client: any): Promise<void> {
+        return new Promise<void>((resolve, reject) => {
+            let settled = false;
+
+            const cleanup = () => {
+                client.off?.("ready", onReady);
+                client.off?.("clientReady", onReady);
+                client.off?.("error", onError);
+            };
+            const settle = (fn: () => void) => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                fn();
+            };
+            const onReady = () => settle(resolve);
+            const onError = (err: unknown) => settle(() => {
+                reject(err instanceof Error ? err : new Error(String(err)));
+            });
+
+            client.once("ready", onReady);
+            client.once("clientReady", onReady);
+            client.once("error", onError);
+            Promise.resolve(client.login(this.config.botToken)).catch(onError);
+        });
+    }
+
+    private attachClientLifecycle(client: any): void {
+        client.on("shardReconnecting", (shardId: number) => {
+            log.warn("Discord shard 正在重连", { shardId });
+            this.armGatewayRecoveryWatchdog(client, shardId);
+        });
+        client.on("shardResume", (shardId: number, replayedEvents: number) => {
+            this.clearGatewayRecoveryWatchdog();
+            log.info("Discord shard 已恢复", { shardId, replayedEvents });
+        });
+        client.on("shardReady", (shardId: number) => {
+            this.clearGatewayRecoveryWatchdog();
+            log.info("Discord shard ready", { shardId });
+        });
+        client.on("shardError", (err: Error, shardId: number) => {
+            log.warn("Discord shard error", { shardId, error: String(err) });
+        });
+        client.on("error", (err: Error) => {
+            log.warn("Discord client error", { error: String(err) });
+        });
+        client.on("invalidated", () => {
+            log.warn("Discord session invalidated，将重建 client 并重连");
+            this.scheduleReconnect("invalidated", {}, client);
+        });
+        client.on("shardDisconnect", (event: { code?: number; reason?: string; wasClean?: boolean }, shardId: number) => {
+            log.warn("Discord shard 已断开且 discord.js 不会继续恢复，将重建 client 并重连", {
+                shardId,
+                code: event?.code,
+                reason: event?.reason,
+                wasClean: event?.wasClean,
+            });
+            this.scheduleReconnect("shardDisconnect", {
+                shardId,
+                code: event?.code,
+                reason: event?.reason,
+            }, client);
+        });
+    }
+
+    private attachMessageListener(client: any): void {
+        client.on("messageCreate", async (message: any) => {
+            if (this.client !== client) return;
+            this.handleIncomingMessage(message);
+        });
+    }
+
+    private handleIncomingMessage(message: any): void {
+        // Skip bot's own messages
+        if (message.author?.id === this.selfUserId) return;
+        // Skip system messages
+        if (message.system) return;
+
+        const normalized = this.normalizeIncomingMessage(message);
+        if (!normalized) return;
+
+        log.debug("接收 Discord 消息", {
+            messageId: normalized.messageId,
+            chatId: normalized.chatId,
+            userId: normalized.userId,
+            chatType: normalized.chatType,
+            isDirectMessage: normalized.isDirectMessage,
+            mentionsAgent: normalized.mentionsAgent,
+            textPreview: normalized.text.slice(0, 80),
         });
 
-        // Listen for messages
-        client.on("messageCreate", async (message: any) => {
-            // Skip bot's own messages
-            if (message.author?.id === this.selfUserId) return;
-            // Skip system messages
-            if (message.system) return;
-
-            const normalized = this.normalizeIncomingMessage(message);
-            if (!normalized) return;
-
-            log.debug("接收 Discord 消息", {
-                messageId: normalized.messageId,
+        this.nc.push({
+            type: "nc.message",
+            scene: "discord",
+            source: {
+                scene: "discord",
+                platform: "discord",
                 chatId: normalized.chatId,
                 userId: normalized.userId,
                 chatType: normalized.chatType,
-                isDirectMessage: normalized.isDirectMessage,
-                mentionsAgent: normalized.mentionsAgent,
-                textPreview: normalized.text.slice(0, 80),
-            });
-
-            this.nc.push({
-                type: "nc.message",
+                messageId: normalized.messageId,
+                replyToMessageId: normalized.replyToMessageId,
+            },
+            chatId: normalized.chatId,
+            userId: normalized.userId,
+            displayName: normalized.displayName,
+            username: normalized.username,
+            text: normalized.text,
+            timestamp: normalized.timestamp,
+            messageId: normalized.messageId,
+            replyToMessageId: normalized.replyToMessageId,
+            chatTitle: normalized.chatTitle,
+            chatType: normalized.chatType,
+            isDirectMessage: normalized.isDirectMessage,
+            mentionsAgent: normalized.mentionsAgent,
+            mediaInfo: normalized.mediaInfo,
+            payload: {
                 scene: "discord",
-                source: {
-                    scene: "discord",
-                    platform: "discord",
-                    chatId: normalized.chatId,
-                    userId: normalized.userId,
-                    chatType: normalized.chatType,
-                    messageId: normalized.messageId,
-                    replyToMessageId: normalized.replyToMessageId,
-                },
                 chatId: normalized.chatId,
                 userId: normalized.userId,
                 displayName: normalized.displayName,
@@ -152,51 +273,94 @@ export class DiscordAdapter implements PlatformAdapter {
                 isDirectMessage: normalized.isDirectMessage,
                 mentionsAgent: normalized.mentionsAgent,
                 mediaInfo: normalized.mediaInfo,
-                payload: {
+                source: {
                     scene: "discord",
+                    platform: "discord",
                     chatId: normalized.chatId,
                     userId: normalized.userId,
-                    displayName: normalized.displayName,
-                    username: normalized.username,
-                    text: normalized.text,
-                    timestamp: normalized.timestamp,
+                    chatType: normalized.chatType,
                     messageId: normalized.messageId,
                     replyToMessageId: normalized.replyToMessageId,
-                    chatTitle: normalized.chatTitle,
-                    chatType: normalized.chatType,
-                    isDirectMessage: normalized.isDirectMessage,
-                    mentionsAgent: normalized.mentionsAgent,
-                    mediaInfo: normalized.mediaInfo,
-                    source: {
-                        scene: "discord",
-                        platform: "discord",
-                        chatId: normalized.chatId,
-                        userId: normalized.userId,
-                        chatType: normalized.chatType,
-                        messageId: normalized.messageId,
-                        replyToMessageId: normalized.replyToMessageId,
-                    },
-                    platformData: {
-                        originalType: "discord.message",
-                    },
                 },
-                _urgent: normalized.isDirectMessage || normalized.mentionsAgent || normalized.replyToMessageId ? true : false,
-            });
+                platformData: {
+                    originalType: "discord.message",
+                },
+            },
+            _urgent: normalized.isDirectMessage || normalized.mentionsAgent || normalized.replyToMessageId ? true : false,
         });
-
-        this.client = client;
-        log.info(`✅ DiscordAdapter 已启动: ${client.user?.username ?? "?"} (${this.selfUserId})`);
     }
 
-    async stop(): Promise<void> {
-        if (!this.client) return;
-        try {
-            await this.client.destroy();
-        } catch (err) {
-            log.warn("Discord client destroy error", { error: String(err) });
-        }
+    private scheduleReconnect(reason: string, details: Record<string, unknown> = {}, sourceClient?: any): void {
+        if (this.stopRequested || this.reconnectTimer) return;
+        if (sourceClient && this.client && sourceClient !== this.client) return;
+
+        this.clearGatewayRecoveryWatchdog();
+        const oldClient = sourceClient ?? this.client;
         this.client = null;
         this.selfUserId = null;
+        void this.destroyClient(oldClient, reason);
+
+        this.reconnectAttempts++;
+        const delay = this.getReconnectDelayMs(this.reconnectAttempts);
+        log.info(`DiscordAdapter 将在 ${delay}ms 后重连 (第 ${this.reconnectAttempts} 次)`, {
+            reason,
+            ...details,
+        });
+        this.reconnectTimer = setTimeout(async () => {
+            this.reconnectTimer = null;
+            if (this.stopRequested) return;
+            try {
+                await this.connect(true);
+            } catch (err) {
+                log.warn("DiscordAdapter 重连失败", { error: String(err) });
+                this.scheduleReconnect("connectFailed", { error: String(err) });
+            }
+        }, delay);
+    }
+
+    private getReconnectDelayMs(attempt: number): number {
+        return Math.min(
+            DISCORD_RECONNECT_BASE_MS * Math.pow(2, attempt - 1),
+            DISCORD_RECONNECT_MAX_MS,
+        );
+    }
+
+    private armGatewayRecoveryWatchdog(client: any, shardId: number): void {
+        if (this.gatewayRecoveryTimer) return;
+        this.gatewayRecoveryTimer = setTimeout(() => {
+            this.gatewayRecoveryTimer = null;
+            if (this.stopRequested || this.client !== client) return;
+            log.warn("Discord gateway 重连超时，将强制重建 client", {
+                shardId,
+                timeoutMs: DISCORD_GATEWAY_RECOVERY_TIMEOUT_MS,
+            });
+            this.scheduleReconnect("gatewayRecoveryTimeout", {
+                shardId,
+                timeoutMs: DISCORD_GATEWAY_RECOVERY_TIMEOUT_MS,
+            }, client);
+        }, DISCORD_GATEWAY_RECOVERY_TIMEOUT_MS);
+    }
+
+    private clearGatewayRecoveryWatchdog(): void {
+        if (!this.gatewayRecoveryTimer) return;
+        clearTimeout(this.gatewayRecoveryTimer);
+        this.gatewayRecoveryTimer = null;
+    }
+
+    private clearReconnectTimer(): void {
+        if (!this.reconnectTimer) return;
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+    }
+
+    private async destroyClient(client: any | null, reason: string): Promise<void> {
+        if (!client) return;
+        try {
+            client.removeAllListeners?.();
+            await client.destroy?.();
+        } catch (err) {
+            log.warn("Discord client destroy error", { reason, error: String(err) });
+        }
     }
 
     canHandle(method: string): boolean {
@@ -207,6 +371,7 @@ export class DiscordAdapter implements PlatformAdapter {
         return [
             "discord.sendText",
             "discord.sendMedia",
+            "discord.sendReaction",
             "discord.sendTyping",
         ];
     }
@@ -312,6 +477,50 @@ export class DiscordAdapter implements PlatformAdapter {
                     await channel.sendTyping();
                 }
                 log.info("discord.sendTyping:success", { requestId, channelId, durationMs: Date.now() - callStart });
+                return null;
+            }
+            case "discord.sendReaction": {
+                const target = this.parseTarget(this.stripDiscordMentionDisplayLabels(String(args[0] ?? "")));
+                const messageId = String(args[1] ?? "").trim();
+                const emoji = String(args[2] ?? "").trim();
+                if (!messageId) {
+                    throw new Error("sendReaction: messageId is required");
+                }
+                if (!emoji) {
+                    throw new Error("sendReaction: emoji is required");
+                }
+
+                log.info("discord.sendReaction:start", {
+                    requestId,
+                    target: target.raw,
+                    channelId: target.channelId,
+                    messageId,
+                    emoji,
+                });
+
+                const channel = await this.resolveTextChannel(target, "sendReaction", requestId);
+                const channelId = channel.id ?? target.channelId;
+                if (typeof channel?.messages?.fetch !== "function") {
+                    throw new Error(`sendReaction: channel ${channelId} does not support message fetching`);
+                }
+
+                const fetchStart = Date.now();
+                const message = await channel.messages.fetch(messageId);
+                if (!message || typeof message.react !== "function") {
+                    throw new Error(`sendReaction: message ${messageId} is not reactable`);
+                }
+
+                const reactStart = Date.now();
+                await message.react(emoji);
+                log.info("discord.sendReaction:success", {
+                    requestId,
+                    channelId,
+                    messageId,
+                    emoji,
+                    durationMs: Date.now() - callStart,
+                    fetchDurationMs: reactStart - fetchStart,
+                    reactDurationMs: Date.now() - reactStart,
+                });
                 return null;
             }
             case "discord.downloadMedia": {
@@ -959,4 +1168,21 @@ export class DiscordAdapter implements PlatformAdapter {
             timestamp: message.createdAt?.toISOString?.() ?? message.timestamp ?? new Date().toISOString(),
         };
     }
+}
+
+async function defaultDiscordClientFactory(): Promise<any> {
+    // Dynamic import to avoid top-level dependency on discord.js.
+    const { Client, GatewayIntentBits, Partials } = await import("discord.js");
+    return new Client({
+        intents: [
+            GatewayIntentBits.Guilds,
+            GatewayIntentBits.GuildMessages,
+            GatewayIntentBits.MessageContent,
+            GatewayIntentBits.DirectMessages,
+        ],
+        partials: [
+            Partials.Channel,
+            Partials.Message,
+        ],
+    });
 }

@@ -429,6 +429,8 @@ export interface MessageSearchResult {
     displayName: string;
     content: string;
     timestamp: string;
+    mediaType?: string;
+    mediaInfo?: string;
 }
 
 export interface MessageQueryOptions {
@@ -684,7 +686,7 @@ export interface IMemoryStoreV2 {
     getRecentMessages(chatId: string, limit?: number): RecentMessageEntry[];
 
     /** 获取已缓存的 sticker 描述（只读，用于上下文富化） */
-    getStickerDescription(uniqueFileId: string): { description: string; emoji?: string; emojis?: string[] } | null;
+    getStickerDescription(uniqueFileId: string, contentHash?: string): { description: string; emoji?: string; emojis?: string[] } | null;
 
     /** 搜索核心事实 */
     searchFacts(query: string, options?: {

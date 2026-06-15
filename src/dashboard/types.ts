@@ -38,6 +38,8 @@ export interface DashboardDeps {
     metaSandbox?: MetaSandbox;
     /** Dashboard 保存配置后的回调（用于热应用） */
     onConfigSaved?: (config: AppConfig) => Promise<void> | void;
+    /** Background Agent HarnessManager */
+    harnessManager?: import("../harness/manager.js").HarnessManager;
 }
 
 /** Dashboard 配置 */

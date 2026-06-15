@@ -12,6 +12,7 @@ import { resolve as pathResolve } from "node:path";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { loadBuiltinGuideContent } from "../../builtin-guides.js";
+import { DEFAULT_BANNED_WORDS, findBannedWords, buildBannedWordWarning } from "../../../core/banned-words.js";
 
 // ─── 工具函数 ───
 
@@ -73,6 +74,7 @@ export function createOneBotClientProxy(
     env: CapabilityRegistryEnv,
     sentHistory: Map<string, Set<string>>,
     deduplicateSentMessages = true,
+    bannedWords: string[] = DEFAULT_BANNED_WORDS,
 ) {
     /**
      * 将可能的工作区相对路径解析为绝对路径。
@@ -136,6 +138,23 @@ export function createOneBotClientProxy(
         },
 
         sendText: async (chatId: string, text: string, opts?: { replyTo?: string | number }) => {
+            // ── 禁用词拦截 ──
+            if (bannedWords.length > 0) {
+                const found = findBannedWords(text, bannedWords);
+                if (found.length > 0) {
+                    const warning = buildBannedWordWarning(found, text);
+                    env.emitOutput(warning);
+                    env.notifyHost({
+                        type: "system.banned_word_blocked",
+                        scene: "onebot",
+                        chatId: String(chatId),
+                        text,
+                        foundWords: found,
+                        timestamp: Date.now(),
+                    });
+                    return null;
+                }
+            }
             if (shouldBlockDuplicate(String(chatId), text)) {
                 const warning = `[⚠ 运行时警告: 重复消息已拦截] 目标 chat=${String(chatId)} 的消息 "${text.length > 80 ? text.slice(0, 80) + '...' : text}" 与本次 session 中已发送的消息内容完全一致，已自动拦截。`;
                 env.emitOutput(warning);

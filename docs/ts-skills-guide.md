@@ -79,7 +79,7 @@ export default {
 
 ### 3.2 编写 Agent 可见类定义 (`*.d.ts`)
 
-为了防止大模型产生 API 幻觉，并且配合 **Two-pass Code Generation** 流程，必须提供一个精确定义的 `.d.ts` 文件。该文件将告诉 LLM 这个能力到底怎么调用。
+为了防止大模型产生 API 幻觉，并且配合运行时错误后的按需文档注入流程，必须提供一个精确定义的 `.d.ts` 文件。该文件将告诉 LLM 这个能力到底怎么调用。
 
 ```typescript
 // workspace/skills/github/github.d.ts
@@ -126,11 +126,11 @@ declare const github: {
 ### 4.1 预热与依赖
 任何用到第三方库（如 `npm install @octokit/rest`）的 Skill，只需在 `workspace/skills/package.json` 添加依赖并自行 `npm install`。Sandbox Worker 启动时可以毫无阻碍地 `require / import` 这些包。
 
-### 4.2 纯动态文档解析与 Two-Pass 类型推断
+### 4.2 纯动态文档解析与错误后类型提示
 你**无需**为了 TS Skills 执行任何文档生成命令（`npm run gen:module-docs` 仅针对框架自带的核心接口）。框架在每次运行时会自动读取并解析文档：
 
 - 扫描机制：`skill-loader.ts` 会在运行时自动扫描 `workspace/skills/` 目录下带有 `.d.ts` 后缀的文件，并用正则表达式提取其中方法的 JSDoc 注释。
-- 注入原理：在 LLM 生成代码阶段（Two-pass第一阶段），如果意图提取器通过正则表达式检测到了类似 `github.listIssues(...)`，框架会自动将该方法完整的 TypeDoc 动态提取出并注入上下文告知大模型重试。
+- 注入原理：LLM 先基于轻量 API 概览直接生成并执行代码；只有当运行时错误出现时，意图提取器才会从失败代码中检测类似 `github.listIssues(...)` 的调用，并将该方法完整的 TypeDoc 动态提取出来追加进 observation，供下一轮修正使用。
 
 ### 4.3 动态挂载机制 (Hot Mounting)
 当你启动系统时，`sandbox-worker.ts` 将执行以下动作：

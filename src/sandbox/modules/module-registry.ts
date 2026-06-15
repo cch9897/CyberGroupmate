@@ -2,8 +2,8 @@
  * module-registry.ts — Sandbox 模块注册表
  *
  * 统一声明所有暴露给 sandbox 的模块。每个模块条目包含：
- * - 简短摘要（用于 Pass 1 轻量 prompt）
- * - 完整 TypeDoc 文档（用于 Pass 2 按需注入）
+ * - 简短摘要（用于常驻轻量 prompt）
+ * - 完整 TypeDoc 文档（用于运行时错误后按需注入）
  *
  * 由 `generate-module-docs` 工具自动填充 `fullDoc` 字段，
  * 人工只需维护 `methods` 中的方法列表和 `brief` 描述。
@@ -17,9 +17,9 @@
 export interface MethodDoc {
     /** 方法名 */
     name: string;
-    /** 一句话签名摘要（Pass 1 用） */
+    /** 一句话签名摘要（轻量 prompt 用） */
     brief: string;
-    /** 完整 TypeDoc 文档（MD 格式，含参数、返回值、示例代码等）（Pass 2 用） */
+    /** 完整 TypeDoc 文档（MD 格式，含参数、返回值、示例代码等）（运行时错误后注入用） */
     fullDoc: string;
     /** 是否在注入该方法文档时附带模块 typeDefs。默认为 true。 */
     includeTypeDefs?: boolean;
@@ -33,7 +33,7 @@ export interface ModuleEntry {
     description: string;
     /** 方法列表 */
     methods: MethodDoc[];
-    /** 该模块涉及的 interface / type / enum 定义原文（Pass 2 按需注入） */
+    /** 该模块涉及的 interface / type / enum 定义原文（运行时错误后按需注入） */
     typeDefs?: string;
 }
 

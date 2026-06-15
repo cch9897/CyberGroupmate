@@ -13,6 +13,7 @@
 import { NotificationCenter, type NotificationEvent } from "./event/notification-center.js";
 import { ensureCompositeId, getRawId, getPlatform, getGroupModelKey } from "./core/chat-id.js";
 import { SandboxPool } from "./sandbox/sandbox-pool.js";
+import type { ShellWakeEvent } from "./sandbox/sandbox.js";
 import { installSkillsDependencies } from "./sandbox/skill-loader.js";
 import { createSandboxHostCallHandler } from "./sandbox/host-call-handler.js";
 import { MemoryStoreV2 } from "./memory-v2/index.js";
@@ -23,6 +24,7 @@ import {
     type EnvironmentVariable,
 } from "./core/config.js";
 import { describeImage, ensureSupportedFormat } from "./core/vision-processor.js";
+import { normalizeMessageMediaFields } from "./core/message-enricher.js";
 import { TopicRegistry } from "./pipeline/index.js";
 import {
     existsSync,
@@ -54,6 +56,10 @@ import { matchesCron } from "./core/cron-matcher.js";
 import { autoReconnect as autoReconnectMcp, initMcpBridge, mcpBridge } from "./sandbox/modules/mcp-bridge/index.js";
 import { CodeActExecutor, refreshModuleRegistryCache } from "./subagent/code-act-executor.js";
 import { PostTaskWindowManager, buildDispatchedRecordForPostTaskDirect } from "./subagent/post-task-window.js";
+import {
+    buildDispatchedRecordForShellWakeDirect,
+    buildShellWakeDirectTask,
+} from "./subagent/shell-wake-task.js";
 import type { ActiveUserProfile } from "./subagent/types.js";
 import { MetaSandbox } from "./meta-sandbox/meta-sandbox.js";
 import { buildMetaApiContext } from "./meta-sandbox/meta-api/index.js";
@@ -154,6 +160,7 @@ function ensureDataDirs(): void {
     const dirs = [
         DATA_DIR,
         join(DATA_DIR, "tg-session"),
+        join(DATA_DIR, "dream-journal"),
     ];
     for (const dir of dirs) {
         if (!existsSync(dir)) {
@@ -342,7 +349,7 @@ async function main(): Promise<void> {
     const nc = new NotificationCenter(EVENTS_PATH);
     let shuttingDown = false;
     let sandboxDispatchApi: {
-        taskToGroup: (chatId: string, taskSpec: any) => Promise<unknown>;
+        taskToGroup: (chatId: string, taskSpec: any, options?: any) => Promise<unknown>;
         getTask: (taskId: string) => Promise<unknown>;
         listTasks: (options?: any) => Promise<unknown>;
     } | null = null;
@@ -360,6 +367,10 @@ async function main(): Promise<void> {
             sandbox.on("notify", (event: Record<string, unknown>) => {
                 nc.push(event as { type: string;[key: string]: unknown });
             });
+            // shell.runBackground() 完成 / 空闲 / 硬超时 → 直达原 Subagent 续接任务
+            sandbox.on("shell_wake", (event: ShellWakeEvent) => {
+                enqueueShellWakeDirectTask(chatId, event);
+            });
             sandbox.setHostCallHandler(createSandboxHostCallHandler(chatId, {
                 appConfig,
                 globalState,
@@ -370,11 +381,11 @@ async function main(): Promise<void> {
                 mcpBridge,
                 accumulator,
                 dispatchApi: {
-                    taskToGroup: async (targetChatId, taskSpec) => {
+                    taskToGroup: async (targetChatId, taskSpec, options) => {
                         if (!sandboxDispatchApi) {
                             throw new Error("dispatch API not initialized");
                         }
-                        return sandboxDispatchApi.taskToGroup(targetChatId, taskSpec);
+                        return sandboxDispatchApi.taskToGroup(targetChatId, taskSpec, options);
                     },
                     getTask: async (taskId) => {
                         if (!sandboxDispatchApi) {
@@ -571,6 +582,18 @@ async function main(): Promise<void> {
                 markDirectSubagentDeliveryAsRead(task.chatId, "post-task-direct");
             }
         },
+        recentMessagesProvider: (chatId, limit) => memory.getRecentMessages(chatId, limit).reverse().map((message) => ({
+            messageId: String(message.messageId),
+            sender: String(message.displayName || message.userId || "?"),
+            text: String(message.text ?? ""),
+            timestamp: String(message.timestamp ?? ""),
+            replyToMessageId: message.replyToMessageId ? String(message.replyToMessageId) : undefined,
+            mediaType: message.mediaType ?? undefined,
+            mediaInfo: message.mediaInfo ?? undefined,
+        })),
+        stickerDescriptionLookup: memory,
+        downloadFnProvider: (chatId) => buildDownloadFn(chatId),
+        mediaDownloader: sharedMediaDownloader,
     });
 
     log.info("Subagent 组件初始化完成", {
@@ -604,6 +627,7 @@ async function main(): Promise<void> {
                 : new Date(typeof event.timestamp === "number" ? event.timestamp : Date.now()).toISOString();
             const agentName = appConfig.persona?.name ?? "agent";
             const text = String(event.text ?? "");
+            const mediaFields = normalizeMessageMediaFields((event as any).mediaInfo, text);
             try {
                 memory.storeMessageBatch([{
                     messageId,
@@ -613,6 +637,8 @@ async function main(): Promise<void> {
                     text,
                     replyToMessageId: event.replyToMessageId ? String(event.replyToMessageId) : undefined,
                     timestamp,
+                    mediaType: mediaFields.mediaType,
+                    mediaInfo: mediaFields.mediaInfo,
                 }]);
                 memory.storeInteraction({
                     chatId: compositeChatId,
@@ -640,6 +666,8 @@ async function main(): Promise<void> {
                     text,
                     timestamp: Date.now(),
                     replyToMessageId: event.replyToMessageId ? String(event.replyToMessageId) : undefined,
+                    mediaType: mediaFields.mediaType,
+                    mediaInfo: mediaFields.mediaInfo,
                 };
                 agentSub.recordingPipeline.onMessage(agentMsg);
             }
@@ -731,10 +759,12 @@ async function main(): Promise<void> {
         const executor = sub.codeActExecutor as import("./subagent/code-act-executor.js").CodeActExecutor | null;
         const executorProcessing = !!executor?.isProcessing();
 
-        if (!executorProcessing) postTaskWindows.recordMessage(chatId, event, { isDirectAttention, directReason: directReason || undefined });
+        postTaskWindows.recordMessage(chatId, event, { isDirectAttention, directReason: directReason || undefined });
 
         if (isDirectAttention) {
-            const handledByPostTaskWindow = executorProcessing || postTaskWindows.tryForwardDirectMessage(chatId, event, directReason);
+            const handledByPostTaskWindow = executorProcessing
+                ? postTaskWindows.hasActiveWindow(chatId)
+                : postTaskWindows.tryForwardDirectMessage(chatId, event, directReason);
             if (!handledByPostTaskWindow) {
                 const entry = sub.buildQueueEntry("DIRECT_ADDRESS");
                 accumulator.ingest(0, createDirectAddressItem(chatId, {
@@ -946,8 +976,103 @@ async function main(): Promise<void> {
         };
     };
 
+    function initializeCodeActExecutor(executor: CodeActExecutor, chatId: string): void {
+        const currentConfig = loadConfig();
+        const persona = currentConfig.persona;
+        const visionConfig = currentConfig.vision;
+        const visionLlmConfig = currentConfig.llmRouting.vision
+            ? resolveComponentProfiles("vision", currentConfig)[0]
+            : undefined;
+        const chatAdapter = adapters.find((item) => chatId.startsWith(item.platform + ":"));
+        const formatMention = chatAdapter
+            ? (rawId: string, username?: string) => chatAdapter.formatMention(rawId, username)
+            : undefined;
+
+        executor.setCallbackHandler((cb) => {
+            postTaskWindows?.handleCallback(cb);
+
+            setTimeout(() => {
+                try {
+                    const sub = subagentManager.get(cb.chatId);
+                    if (sub?.recordingPipeline) {
+                        sub.recordingPipeline.flush();
+                    }
+                } catch (error) {
+                    log.debug("post-session flush failed", { chatId: cb.chatId, error: String(error) });
+                }
+            }, 60_000);
+        });
+        executor.setPendingMessageDrainHandler((messages, source) => {
+            postTaskWindows?.markMessagesInjected(
+                chatId,
+                messages.map((message) => message.messageId),
+                `mid-turn-${source}`,
+            );
+        });
+        executor.setDependencies(
+            sandboxPool,
+            nc,
+            persona,
+            memory,
+            visionConfig,
+            buildDownloadFn(chatId),
+            sendTyping,
+            visionLlmConfig,
+            sharedMediaDownloader,
+            formatMention,
+            globalState,
+        );
+    }
+
+    function ensureCodeActExecutor(chatId: string): CodeActExecutor {
+        const subagent = subagentManager.getOrCreate(chatId);
+        let executor = subagent.codeActExecutor as CodeActExecutor | null | undefined;
+        if (!executor) {
+            executor = new CodeActExecutor(chatId);
+            subagent.codeActExecutor = executor;
+        }
+
+        if (!executor.getSessionFilePath()) {
+            executor.setSessionFilePath(subagentManager.getSessionFilePath(chatId));
+            executor.loadSession();
+        }
+
+        initializeCodeActExecutor(executor, chatId);
+        return executor;
+    }
+
+    function enqueueShellWakeDirectTask(chatId: string, event: ShellWakeEvent): void {
+        try {
+            const subagent = subagentManager.getOrCreate(chatId);
+            const executor = ensureCodeActExecutor(chatId);
+            const task = buildShellWakeDirectTask({
+                chatId,
+                event,
+                queueEntry: subagent.buildQueueEntry("SCHEDULER_TRIGGER"),
+            });
+
+            globalState.recordDispatchedSubagentTask(buildDispatchedRecordForShellWakeDirect(task, event));
+            executor.enqueue(task);
+            markDirectSubagentDeliveryAsRead(chatId, "shell-wake");
+            log.info("shell_wake → subagent", {
+                chatId,
+                taskId: task.taskId,
+                tabId: event.tabId,
+                reason: event.reason,
+            });
+        } catch (error) {
+            log.error("shell_wake direct enqueue failed", {
+                chatId,
+                tabId: event.tabId,
+                reason: event.reason,
+                error: error instanceof Error ? error.stack ?? error.message : String(error),
+            });
+        }
+    }
+
     let activeUserProfilesForDispatch = new Map<string, ActiveUserProfile[]>();
     let metaSandbox: MetaSandbox | null = null;
+    let harnessManager: import("./harness/manager.js").HarnessManager | null = null;
     const metaApiContext = buildMetaApiContext({
         memory,
         subagentManager,
@@ -956,50 +1081,13 @@ async function main(): Promise<void> {
         groundingConfig: appConfig.grounding,
         getActiveUserProfilesForChat: (chatId) => activeUserProfilesForDispatch.get(chatId),
         getQuoteOutput: (index) => metaSandbox?.getOutput(index),
+        getHarnessManager: () => harnessManager,
         workspaceRoot: process.cwd(),
         onTaskDispatched: (task) => {
             metricsInstance?.groupCollector.onAttend(task.chatId, "REPLY");
         },
         initializeExecutor: (executor, chatId) => {
-            const realExecutor = executor as CodeActExecutor;
-            const currentConfig = loadConfig();
-            const persona = currentConfig.persona;
-            const visionConfig = currentConfig.vision;
-            const visionLlmConfig = currentConfig.llmRouting.vision
-                ? resolveComponentProfiles("vision", currentConfig)[0]
-                : undefined;
-            const chatAdapter = adapters.find((item) => chatId.startsWith(item.platform + ":"));
-            const formatMention = chatAdapter
-                ? (rawId: string, username?: string) => chatAdapter.formatMention(rawId, username)
-                : undefined;
-
-            realExecutor.setCallbackHandler((cb) => {
-                postTaskWindows.handleCallback(cb);
-
-                setTimeout(() => {
-                    try {
-                        const sub = subagentManager.get(cb.chatId);
-                        if (sub?.recordingPipeline) {
-                            sub.recordingPipeline.flush();
-                        }
-                    } catch (error) {
-                        log.debug("post-session flush failed", { chatId: cb.chatId, error: String(error) });
-                    }
-                }, 60_000);
-            });
-            realExecutor.setDependencies(
-                sandboxPool,
-                nc,
-                persona,
-                memory,
-                visionConfig,
-                buildDownloadFn(chatId),
-                sendTyping,
-                visionLlmConfig,
-                sharedMediaDownloader,
-                formatMention,
-                globalState,
-            );
+            initializeCodeActExecutor(executor as CodeActExecutor, chatId);
         },
     });
     sandboxDispatchApi = metaApiContext.dispatch;
@@ -1059,6 +1147,7 @@ async function main(): Promise<void> {
     // ─── Dashboard 监控仪表盘 ───
     const dashboardEnabled = appConfig.dashboard?.enabled !== false;
     let dashboardServer: { stop: () => void } | null = null;
+    let dashboardDeps: import("./dashboard/types.js").DashboardDeps | null = null;
     if (dashboardEnabled) {
         const { DashboardServer } = await import("./dashboard/dashboard-server.js");
         const { TokenStatsCollector } = await import("./dashboard/token-stats.js");
@@ -1077,8 +1166,7 @@ async function main(): Promise<void> {
         // 进程退出时保存统计
         process.on("exit", () => tokenStats.shutdown());
 
-        const dashboard = new DashboardServer(
-            {
+        dashboardDeps = {
                 nc,
                 subagentManager,
                 accumulator,
@@ -1108,13 +1196,76 @@ async function main(): Promise<void> {
                         managed: currentEnvPlan.managedKeys.length,
                     });
                 },
-            },
+            };
+        const dashboard = new DashboardServer(
+            dashboardDeps,
             { host: dashboardHost, port: dashboardPort, token: dashboardToken, enabled: true },
         );
         dashboardServer = dashboard;
         await dashboard.start();
         const displayHost = dashboardHost === "0.0.0.0" || dashboardHost === "::" ? "localhost" : dashboardHost;
         log.info("Dashboard 已启动", { listen: `${dashboardHost}:${dashboardPort}`, url: `http://${displayHost}:${dashboardPort}?token=${dashboardToken}` });
+    }
+
+    // ─── Background Agent MCP Server ───
+    const mcpServerEnabled = appConfig.backgroundAgent?.enabled !== false;
+    let mcpServerInstance: { httpServer: import("node:http").Server; config: { port: number; authToken: string } } | null = null;
+    {
+        const { writeFileSync, unlinkSync } = await import("node:fs");
+        const { join } = await import("node:path");
+        const mcpInfoPath = join(process.cwd(), "workspace", "mcp-server-info.json");
+        try { unlinkSync(mcpInfoPath); } catch {}
+        if (mcpServerEnabled) {
+            const { startMcpServer, generateAuthToken } = await import("./mcp-server/index.js");
+            const mcpPort = appConfig.backgroundAgent?.mcpPort ?? 3100;
+            const mcpToken = appConfig.backgroundAgent?.mcpToken ?? generateAuthToken();
+            try {
+                mcpServerInstance = await startMcpServer(
+                    { metaApi: metaApiContext, globalState, accumulator, sandboxPool, workspaceRoot: process.cwd() },
+                    { port: mcpPort, authToken: mcpToken },
+                );
+                if (mcpServerInstance) {
+                    const connInfo = { url: `http://127.0.0.1:${mcpPort}/mcp`, token: mcpToken };
+                    writeFileSync(mcpInfoPath, JSON.stringify(connInfo, null, 2));
+                }
+            } catch (err) {
+                log.error("MCP Server 启动失败", { error: String(err) });
+            }
+        }
+    }
+
+    // ─── Background Agent HarnessManager ───
+    const bgHarness = appConfig.backgroundAgent?.harness;
+    if (mcpServerInstance && (bgHarness === "claude-code" || bgHarness === "copilot")) {
+        const { HarnessManager, ClaudeCodeLauncher, CopilotCliLauncher } = await import("./harness/index.js");
+        const { buildDreamingDigest } = await import("./harness/dreaming-context.js");
+        const launcher = bgHarness === "copilot"
+            ? new CopilotCliLauncher(appConfig.backgroundAgent!.copilotPath)
+            : new ClaudeCodeLauncher(appConfig.backgroundAgent!.claudeCodePath);
+        const model = appConfig.backgroundAgent!.harnessModel ?? appConfig.backgroundAgent!.claudeModel;
+        harnessManager = new HarnessManager({
+            launcher,
+            workDir: process.cwd(),
+            mcpUrl: `http://127.0.0.1:${mcpServerInstance.config.port}/mcp`,
+            mcpToken: mcpServerInstance.config.authToken,
+            persona: appConfig.persona,
+            model,
+            maxBudgetUsd: appConfig.backgroundAgent!.maxBudgetUsd,
+            extraArgs: appConfig.backgroundAgent!.extraArgs,
+            minDreamIntervalMs: appConfig.backgroundAgent!.minIntervalHours != null
+                ? appConfig.backgroundAgent!.minIntervalHours * 60 * 60_000
+                : undefined,
+            buildDreamingDigest: (sinceTs) => buildDreamingDigest({
+                listTasks: () => globalState.listDispatchedSubagentTasks({ limit: 200 }).tasks,
+                memory,
+                sinceTs,
+            }),
+        });
+        harnessManager.onSpawnFailure = (error, pendingCount) => {
+            globalState.addSessionDigest(`[Background Agent spawn failed] ${error} (${pendingCount} pending tasks)`);
+        };
+        if (dashboardDeps) dashboardDeps.harnessManager = harnessManager;
+        log.info("HarnessManager 已创建", { harness: bgHarness });
     }
 
     // ─── Prometheus Metrics Exporter ───
@@ -1289,6 +1440,24 @@ async function main(): Promise<void> {
     }, 30_000);
     if (schedulerWatchdogInterval.unref) schedulerWatchdogInterval.unref();
 
+    // ─── Background Agent 定时做梦 ───
+    let backgroundDreamingInterval: ReturnType<typeof setInterval> | null = null;
+    if (harnessManager) {
+        const dreamSchedule = appConfig.backgroundAgent?.schedule ?? "0 3 * * *";
+        let lastDreamingMinute = -1;
+        backgroundDreamingInterval = setInterval(() => {
+            const now = new Date();
+            const minuteKey = now.getFullYear() * 1000000 + now.getMonth() * 10000 + now.getDate() * 100 + now.getHours() * 60 + now.getMinutes();
+            if (minuteKey === lastDreamingMinute) return;
+            if (!matchesCron(dreamSchedule, now)) return;
+            lastDreamingMinute = minuteKey;
+            log.info("Background Agent 定时做梦触发", { schedule: dreamSchedule });
+            harnessManager!.triggerScheduled();
+        }, 30_000);
+        if (backgroundDreamingInterval.unref) backgroundDreamingInterval.unref();
+        log.info("Background Agent 定时做梦已注册", { schedule: dreamSchedule });
+    }
+
     // ─── 启动（并行 + 超时容错） ───
     const ADAPTER_START_TIMEOUT_MS = 30_000;
     const adapterStatuses: Array<{ platform: string; status: "ok" | "failed" | "timeout"; error?: string }> = [];
@@ -1346,6 +1515,17 @@ async function main(): Promise<void> {
         clearInterval(topicCleanupInterval);
         clearInterval(reflectionInterval);
         clearInterval(schedulerWatchdogInterval);
+        if (backgroundDreamingInterval) clearInterval(backgroundDreamingInterval);
+
+        // 停止 Background Agent harness
+        if (harnessManager) {
+            await harnessManager.shutdown();
+        }
+
+        // 停止 MCP server
+        if (mcpServerInstance) {
+            mcpServerInstance.httpServer.close();
+        }
 
         // 先停止平台输入，避免新消息继续进入系统
         await Promise.allSettled(adapters.map((adapter) =>

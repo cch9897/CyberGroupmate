@@ -8,7 +8,8 @@ export type AttentionSource =
     | "SCHEDULER"
     | "WAKE_CONDITION"
     | "TOPIC_SIGNAL"
-    | "PROACTIVE_IDLE";
+    | "PROACTIVE_IDLE"
+    | "BACKGROUND_AGENT";
 
 export interface AttentionItem {
     layer: AttentionLayer;

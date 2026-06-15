@@ -64,6 +64,43 @@ export interface SandboxExecuteOptions {
     scopeId?: string;
 }
 
+/** 后台命令唤醒原因 */
+export type ShellWakeReason =
+    /** 命令运行结束（拿到退出码） */
+    | "exit"
+    /** 距上次输出超过 idleTimeout 仍未结束（可能卡住/等输入，不 kill，交给 agent 决策） */
+    | "idle"
+    /** 运行时长达到 maxDuration 硬上限仍未结束（不 kill，交给 agent 决策） */
+    | "hard";
+
+/** shell.runBackground() 后台命令唤醒事件载荷（Sandbox emit "shell_wake"） */
+export interface ShellWakeEvent {
+    tabId: string;
+    reason: ShellWakeReason;
+    command: string;
+    /** 仅 reason==="exit" 时有意义 */
+    exitCode?: number;
+    /** 本次运行开始以来的输出尾部片段（截断，供唤醒任务描述参考） */
+    recentOutput: string;
+}
+
+/** 后台命令监视器：检测完成 / 空闲超时 / 硬超时，并触发 shell_wake */
+interface ShellMonitor {
+    command: string;
+    /** 完成检测用的 sentinel 请求 ID */
+    sentinelId: string;
+    /** 多久无输出判定空闲（ms，0=禁用） */
+    idleTimeout: number;
+    /** 运行硬上限（ms，0=禁用） */
+    maxDuration: number;
+    idleTimer: ReturnType<typeof setTimeout> | null;
+    hardTimer: ReturnType<typeof setTimeout> | null;
+    /** hard 唤醒只触发一次 */
+    hardFired: boolean;
+    /** run 开始时的 scrollback 绝对行游标，用于截取本次运行输出 */
+    cursorAtStart: number;
+}
+
 /** Worker → Host 消息 */
 interface WorkerMessage {
     type: "result" | "notify" | "input_request" | "print" | "host_call";
@@ -89,6 +126,8 @@ interface PtyTab {
     process: pty.IPty;
     state: "idle" | "busy";
     scrollback: string[];
+    /** scrollback[0] 对应的绝对行号（被裁剪的行数累计），用于稳定游标 */
+    scrollbackBase: number;
     pendingRequest: {
         id: string;
         command: string;
@@ -99,6 +138,8 @@ interface PtyTab {
     outputBuffer: string;
     /** 超时后保存的 sentinel ID，用于检测迟到的命令完成 */
     lastSentinelId?: string;
+    /** 后台 shell.runBackground() 命令的监视器（非阻塞，完成/超时时 emit shell_wake） */
+    monitor: ShellMonitor | null;
 }
 
 /**
@@ -157,6 +198,12 @@ export class Sandbox extends EventEmitter {
     private static MAX_TABS = 5;
     /** 每个 Tab 的滚动缓冲区最大行数 */
     private static MAX_SCROLLBACK_LINES = 500;
+    /** shell.runBackground 默认空闲超时（无输出多久判定空闲）：2 分钟 */
+    private static DEFAULT_IDLE_TIMEOUT = 120_000;
+    /** shell.runBackground 默认硬运行上限：30 分钟 */
+    private static DEFAULT_MAX_DURATION = 1_800_000;
+    /** 自动命名后台 tab 的计数器 */
+    private bgTabCounter = 0;
     /** 当前 shell 所在的 cwd（来自 default tab 的最近一次结果） */
     private shellCwd: string = "";
     /** shell home 目录（所有 tab 共享） */
@@ -437,9 +484,11 @@ export class Sandbox extends EventEmitter {
             process: proc,
             state: "idle",
             scrollback: [],
+            scrollbackBase: 0,
             pendingRequest: null,
             outputBuffer: "",
             lastSentinelId: undefined,
+            monitor: null,
         };
 
         // Per-tab 数据处理（含 scrollback + sentinel 检测）
@@ -456,6 +505,11 @@ export class Sandbox extends EventEmitter {
                 if (tab.pendingRequest.timer) clearTimeout(tab.pendingRequest.timer);
                 tab.pendingRequest = null;
             }
+            // 后台监视的命令随 PTY 退出 → 当作完成唤醒一次
+            if (tab.monitor) {
+                this.fireShellWake(tab, "exit", exitCode);
+            }
+            tab.state = "idle";
             this.ptyTabs.delete(tabId);
         });
 
@@ -554,7 +608,9 @@ export class Sandbox extends EventEmitter {
                 type: "host_call_result",
                 id,
                 ok: false,
+                method,
                 error: err instanceof Error ? err.message : String(err),
+                ...(err instanceof Error && err.stack ? { stack: err.stack } : {}),
             });
             this.child.stdin.write(msg + "\n");
         }
@@ -685,9 +741,28 @@ export class Sandbox extends EventEmitter {
         const cleanData = data.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
         const newLines = cleanData.split("\n");
         tab.scrollback.push(...newLines);
-        // 限制 scrollback 大小
+        // 限制 scrollback 大小（裁剪时累加 base，保持游标稳定）
         if (tab.scrollback.length > Sandbox.MAX_SCROLLBACK_LINES) {
-            tab.scrollback.splice(0, tab.scrollback.length - Sandbox.MAX_SCROLLBACK_LINES);
+            const removed = tab.scrollback.length - Sandbox.MAX_SCROLLBACK_LINES;
+            tab.scrollback.splice(0, removed);
+            tab.scrollbackBase += removed;
+        }
+
+        // ─── 后台 shell.runBackground() 监视：重置空闲计时器 + 完成检测 ───
+        if (tab.monitor) {
+            this.armIdleTimer(tab);
+            tab.outputBuffer += data;
+            const sentinel = `__SANDBOX_DONE_${tab.monitor.sentinelId}`;
+            const sentinelRegex = new RegExp(
+                `${sentinel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}_(\\d+)_(.+?)__`
+            );
+            const match = tab.outputBuffer.match(sentinelRegex);
+            if (match) {
+                const exitCode = parseInt(match[1], 10);
+                tab.outputBuffer = "";
+                this.fireShellWake(tab, "exit", exitCode);
+            }
+            return;
         }
 
         // ─── 有 pendingRequest：正常 sentinel 检测 ───
@@ -709,8 +784,11 @@ export class Sandbox extends EventEmitter {
                 let output = tab.outputBuffer.slice(0, sentinelIdx).trim();
 
                 const echoLine = `echo '${sentinel}'_$?_$(pwd)__`;
+                // 过滤掉本次 sentinel 行、其 echo 行，以及任何残留的 sentinel
+                // （如 PTY 启动握手 __pty_ready__ 或上一条命令的迟到 sentinel），
+                // 避免它们泄漏进命令输出并破坏后续的命令回显跳过逻辑。
                 output = output.split("\n")
-                    .filter(line => !line.includes(echoLine) && !line.includes(sentinel))
+                    .filter(line => !line.includes(echoLine) && !line.includes("__SANDBOX_DONE_"))
                     .join("\n")
                     .trim();
 
@@ -763,6 +841,136 @@ export class Sandbox extends EventEmitter {
         }
     }
 
+    /** scrollback 中自绝对游标 cursor 起的新增输出（去除 sentinel 标记行） */
+    private scrollbackSince(tab: PtyTab, cursor: number): string {
+        const start = Math.max(0, cursor - tab.scrollbackBase);
+        return tab.scrollback
+            .slice(start)
+            .filter((line) => !line.includes("__SANDBOX_DONE_"))
+            .join("\n")
+            .trim();
+    }
+
+    /** （重新）武装后台监视器的空闲计时器：在每次有输出时调用以重置 */
+    private armIdleTimer(tab: PtyTab): void {
+        const mon = tab.monitor;
+        if (!mon || mon.idleTimeout <= 0) return;
+        if (mon.idleTimer) clearTimeout(mon.idleTimer);
+        mon.idleTimer = setTimeout(() => this.fireShellWake(tab, "idle"), mon.idleTimeout);
+    }
+
+    /**
+     * 触发后台命令的 shell_wake 事件。
+     * - exit：终态，清掉监视器与计时器，终端转 idle
+     * - idle：临时静默，仅解除空闲计时器（下次有输出会重新武装）
+     * - hard：硬上限，仅触发一次
+     * 三种都**不 kill 进程**，交给 agent 决策。
+     */
+    private fireShellWake(tab: PtyTab, reason: ShellWakeReason, exitCode?: number): void {
+        const mon = tab.monitor;
+        if (!mon) return;
+
+        if (reason === "exit") {
+            if (mon.idleTimer) clearTimeout(mon.idleTimer);
+            if (mon.hardTimer) clearTimeout(mon.hardTimer);
+            tab.state = "idle";
+            tab.monitor = null;
+        } else if (reason === "idle") {
+            if (mon.idleTimer) {
+                clearTimeout(mon.idleTimer);
+                mon.idleTimer = null;
+            }
+        } else if (reason === "hard") {
+            if (mon.hardFired) return;
+            mon.hardFired = true;
+            if (mon.hardTimer) {
+                clearTimeout(mon.hardTimer);
+                mon.hardTimer = null;
+            }
+        }
+
+        const recentOutput = this.scrollbackSince(tab, mon.cursorAtStart).slice(-2000);
+        const event: ShellWakeEvent = {
+            tabId: tab.id,
+            reason,
+            command: mon.command,
+            ...(exitCode !== undefined ? { exitCode } : {}),
+            recentOutput,
+        };
+        log.info("shell_wake", { chatId: this.chatId, tabId: tab.id, reason, exitCode });
+        this.emit("shell_wake", event);
+    }
+
+    /**
+     * 非阻塞地在独立后台终端启动一条命令，立即返回 tabId。
+     *
+     * 命令在后台运行，agent 可继续处理其它事务。Host 侧监视器会在
+     * 命令完成 / 空闲超时 / 达到硬上限时 emit "shell_wake"（由 main 侧
+     * 转成一个新的唤醒任务）。三种情况都不会 kill 进程。
+     */
+    async runShellBackground(
+        command: string,
+        opts?: { tabId?: string; idleTimeout?: number; maxDuration?: number },
+    ): Promise<{ tabId: string }> {
+        if (!command || !command.trim()) {
+            throw new Error("shell.runBackground: command 不能为空");
+        }
+        let tabId = opts?.tabId?.trim();
+        if (tabId === "default") {
+            throw new Error("shell.runBackground 不能使用 'default'，请用独立的后台 tab 名（或省略自动命名）");
+        }
+        if (tabId && this.ptyTabs.has(tabId)) {
+            throw new Error(`终端 Tab '${tabId}' 已存在，请换名或先 shell.kill('${tabId}')`);
+        }
+        if (!tabId) {
+            do {
+                tabId = `bg-${++this.bgTabCounter}`;
+            } while (this.ptyTabs.has(tabId));
+        }
+
+        const tab = await this.createPtyTab(tabId);
+
+        const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+        const idleRaw = opts?.idleTimeout ?? Sandbox.DEFAULT_IDLE_TIMEOUT;
+        const hardRaw = opts?.maxDuration ?? Sandbox.DEFAULT_MAX_DURATION;
+        const idleTimeout = idleRaw <= 0 ? 0 : clamp(idleRaw, 5_000, 24 * 3_600_000);
+        const maxDuration = hardRaw <= 0 ? 0 : clamp(hardRaw, 10_000, 24 * 3_600_000);
+
+        const id = `req_${++this.requestCounter}`;
+        const sentinel = `__SANDBOX_DONE_${id}`;
+
+        tab.state = "busy";
+        tab.outputBuffer = "";
+        const mon: ShellMonitor = {
+            command,
+            sentinelId: id,
+            idleTimeout,
+            maxDuration,
+            idleTimer: null,
+            hardTimer: null,
+            hardFired: false,
+            cursorAtStart: tab.scrollbackBase + tab.scrollback.length,
+        };
+        tab.monitor = mon;
+
+        if (maxDuration > 0) {
+            mon.hardTimer = setTimeout(() => this.fireShellWake(tab, "hard"), maxDuration);
+        }
+        this.armIdleTimer(tab);
+
+        tab.process.write(`${command}\necho '${sentinel}'_$?_$(pwd)__\n`);
+        log.info("shell.runBackground started", { chatId: this.chatId, tabId, idleTimeout, maxDuration });
+        return { tabId };
+    }
+
+    /** 清理某个 tab 的后台监视器计时器（不发 wake） */
+    private clearMonitor(tab: PtyTab): void {
+        if (!tab.monitor) return;
+        if (tab.monitor.idleTimer) clearTimeout(tab.monitor.idleTimer);
+        if (tab.monitor.hardTimer) clearTimeout(tab.monitor.hardTimer);
+        tab.monitor = null;
+    }
+
     /**
      * 发送用户输入响应到 worker（回应 runtime.input()）
      *
@@ -800,6 +1008,7 @@ export class Sandbox extends EventEmitter {
                 tab.pendingRequest.reject(new Error("Sandbox stopped"));
                 tab.pendingRequest = null;
             }
+            this.clearMonitor(tab);
             try { tab.process.kill(); } catch { /* ignore */ }
         }
         this.ptyTabs.clear();
@@ -872,7 +1081,20 @@ export class Sandbox extends EventEmitter {
             throw new Error(`终端 Tab '${id}' 不存在。可用 Tabs: ${available}`);
         }
         const n = Math.min(lines ?? 50, Sandbox.MAX_SCROLLBACK_LINES);
-        return tab.scrollback.slice(-n).join("\n");
+        // 过滤内部 sentinel 行（PTY 握手 / 命令完成标记），避免污染 agent 判断
+        const clean = tab.scrollback.filter((line) => !line.includes("__SANDBOX_DONE_"));
+        return clean.slice(-n).join("\n");
+    }
+
+    /**
+     * 是否有正在运行的后台 shell.runBackground 命令。
+     * 供 SandboxPool 判断：有后台命令在跑时不应空闲回收（否则会静默 kill）。
+     */
+    hasActiveBackgroundTasks(): boolean {
+        for (const [, tab] of this.ptyTabs) {
+            if (tab.monitor) return true;
+        }
+        return false;
     }
 
     sendShellInput(input: string, tabId?: string): void {
@@ -894,6 +1116,8 @@ export class Sandbox extends EventEmitter {
                 resolve({ output: "[⚠ Shell 进程由于卡死已被强行重置]", error: true });
                 tab.pendingRequest = null;
             }
+            this.clearMonitor(tab);
+            tab.state = "idle";
             try { tab.process.kill(); } catch { /* ignore */ }
             this.ptyTabs.delete(id);
         }

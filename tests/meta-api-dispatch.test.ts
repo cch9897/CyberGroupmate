@@ -63,6 +63,43 @@ describe("createDispatchApi", () => {
         );
     });
 
+    it("records subagent dispatch source metadata and a global digest", async () => {
+        const enqueued: any[] = [];
+        const records: any[] = [];
+        const digests: string[] = [];
+        const api = createDispatchApi({
+            memory: {} as any,
+            subagentManager: {
+                getOrCreate: () => ({
+                    chatId: "telegram:target",
+                    codeActExecutor: {
+                        enqueue: (task: unknown) => enqueued.push(task),
+                        getSessionFilePath: () => "workspace/sessions/telegram/target.json",
+                    },
+                }),
+                getSessionFilePath: () => "workspace/sessions/telegram/target.json",
+            } as any,
+            accumulator: { markActioned: () => undefined } as any,
+            globalState: {
+                recordDispatchedSubagentTask: (record: unknown) => records.push(record),
+                addSessionDigest: (content: string) => digests.push(content),
+                getSessionDigests: () => [],
+            } as any,
+            taskIdFactory: () => "task-from-source",
+        });
+
+        await api.taskToGroup(
+            "telegram:target",
+            { contentDirection: "ask target to verify" },
+            { source: { type: "subagent", chatId: "telegram:source" } },
+        );
+
+        assert.equal(enqueued.length, 1);
+        assert.equal(records[0].sourceType, "subagent");
+        assert.equal(records[0].sourceChatId, "telegram:source");
+        assert.match(digests[0], /Subagent telegram:source -> telegram:target/);
+    });
+
     it("builds and enqueues a CodeActReplyTask with quoted context and grounding", async () => {
         const enqueued: any[] = [];
         const marked: string[] = [];

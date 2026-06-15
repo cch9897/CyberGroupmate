@@ -32,6 +32,13 @@ export function installShell() {
             if (!_callbacks) throw new Error("Shell not initialized");
             return (await _callbacks.callHost("shell.read", [tabId, lines])) as string;
         },
+        runBackground: async (
+            command: string,
+            opts?: { tabId?: string; idleTimeout?: number; maxDuration?: number },
+        ): Promise<{ tabId: string }> => {
+            if (!_callbacks) throw new Error("Shell not initialized");
+            return (await _callbacks.callHost("shell.runBackground", [command, opts])) as { tabId: string };
+        },
         sendInput: async (input: string, tabId?: string): Promise<void> => {
             if (!_callbacks) throw new Error("Shell not initialized");
             await _callbacks.callHost("shell.sendInput", [input, tabId]);

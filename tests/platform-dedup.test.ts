@@ -9,6 +9,10 @@ type SendTextClient = {
     sendText(chatId: string, text: string): Promise<unknown>;
 };
 
+type DiscordReactionClient = {
+    sendReaction(channelId: string, messageId: string, emoji: string): Promise<void>;
+};
+
 type PlatformCase = {
     name: string;
     chatId: string;
@@ -134,4 +138,37 @@ describe("platform proxy duplicate tracking", () => {
             assert.equal(notifications.some((event) => event.type === "system.duplicate_message_blocked"), false);
         });
     }
+
+    it("forwards discord reactions without touching dedup history", async () => {
+        const outputs: string[] = [];
+        const notifications: Array<Record<string, unknown>> = [];
+        const sentHistory = new Map<string, Set<string>>();
+        const hostCalls: Array<{ method: string; args: unknown[] }> = [];
+
+        const env: CapabilityRegistryEnv = {
+            ctx: {},
+            emitOutput: (line) => outputs.push(line),
+            notifyHost: (event) => notifications.push(event),
+            requestInput: async () => "",
+            printToHost: (message) => outputs.push(message),
+            spawnTask: () => {},
+            killTask: () => {},
+            listTasks: () => [],
+            callHost: async (method, args = []) => {
+                hostCalls.push({ method, args });
+                return null;
+            },
+        };
+
+        const client = createDiscordClientProxy(env, sentHistory) as DiscordReactionClient;
+        await client.sendReaction("channel-100", "msg-42", "😄");
+
+        assert.deepEqual(hostCalls, [{
+            method: "discord.sendReaction",
+            args: ["channel-100", "msg-42", "😄"],
+        }]);
+        assert.ok(outputs.some((line) => line.includes("[Discord] sendReaction ok channel=channel-100 msg=msg-42 emoji=😄")));
+        assert.deepEqual([...sentHistory.entries()], []);
+        assert.deepEqual(notifications, []);
+    });
 });

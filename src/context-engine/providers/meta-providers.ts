@@ -10,7 +10,7 @@ import { deriveChatType, formatTopicList, type FormattableTopic } from "../promp
 import { formatMessageLine, type RawMessage, type StickerDescriptionLookup } from "../../core/message-enricher.js";
 import { getRawId } from "../../core/chat-id.js";
 import type { VisionConfig } from "../../core/config.js";
-import { formatTsForPrompt } from "../../core/timezone.js";
+import { formatTsForPrompt, getWeekdayLabel } from "../../core/timezone.js";
 
 const META_ASSOCIATED_MEMORIES_ENABLED = false;
 
@@ -47,6 +47,7 @@ interface MetaAttendHeaderData {
 
 interface MetaAttendMetaData {
     source: string;
+    weekday: string;
     priority: number;
     newMessageCount: number;
     engagementScore: number;
@@ -548,6 +549,7 @@ export const metaAttendMetaProvider: SectionProvider<MetaAttendMetaData> = {
         }
         return {
             source,
+            weekday: getWeekdayLabel(),
             priority: Number(ctx.priority ?? 0),
             newMessageCount: Number(ctx.newMessageCount ?? 0),
             engagementScore: Number(ctx.engagementScore ?? 0),
@@ -563,6 +565,7 @@ export const metaAttendMetaProvider: SectionProvider<MetaAttendMetaData> = {
     render(data) {
         const lines = [
             "## 当前注意力元数据",
+            ...(data.weekday ? [`- 今天: ${data.weekday}`] : []),
             `- source: ${data.source}`,
             `- priority: ${data.priority}`,
             `- newMessageCount: ${data.newMessageCount}`,

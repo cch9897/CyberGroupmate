@@ -265,7 +265,7 @@ function createSkillMdModuleEntry(skill: DiscoveredSkill): ModuleEntry | null {
             methods: [{
                 name: "use",
                 brief: `打印并阅读该 Skill 的详细指南。调用: await ${skill.bindingName}.use(); 文件: ${skill.path}/SKILL.md`,
-                fullDoc: "",  // use() 本身即自文档（调用后输出 SKILL.md 全文），无需 two-pass 注入
+                fullDoc: "",  // use() 本身即自文档（调用后输出 SKILL.md 全文），无需额外文档注入
             }],
         };
     } catch (err) {

@@ -7,7 +7,7 @@ import { loadModuleRegistry, lookupFullDocs } from "../src/sandbox/modules/modul
 import { buildPrefixMap, extractApiCalls, getDocLookupMethods, needsDocLookup } from "../src/sandbox/api-intent-extractor.js";
 import type { ChatMessage } from "../src/core/llm/types.js";
 
-describe("TS Skills Two-Pass Architecture (Context & Deduplication)", () => {
+describe("TS Skills Runtime Doc Injection (Context & Deduplication)", () => {
     const registry = loadModuleRegistry();
     const prefixMap = buildPrefixMap(registry);
 
@@ -26,7 +26,7 @@ describe("TS Skills Two-Pass Architecture (Context & Deduplication)", () => {
         assert.equal(briefDocsTelegram.includes("## discord"), false, "Should filter out discord from telegram system prompt");
     });
 
-    it("Phase 2: Intent extraction and Full Doc Injection", () => {
+    it("Phase 2: Intent extraction and runtime Full Doc Injection candidates", () => {
         const pass1Code = `
             await telegram.sendText(123, "hello");
             await telegram.sendSticker(123, "AgAD5xcAAk7BUVQ");
@@ -59,7 +59,7 @@ describe("TS Skills Two-Pass Architecture (Context & Deduplication)", () => {
             { role: "assistant", content: "Let me do that." }
         ];
 
-        // 模拟第一轮 (Turn 0) 生成的代码
+        // 模拟第一轮 (Turn 0) 生成并运行时报错的代码
         const pass1Code = `
             await telegram.sendText(123, "hello");
             await telegram.sendSticker(123, "AgAD5xcAAk7BUVQ");
@@ -78,11 +78,11 @@ describe("TS Skills Two-Pass Architecture (Context & Deduplication)", () => {
         assert.equal(missingMethodsRound1.length, 1, "First round only injects non-trivial docs");
         assert.equal(missingMethodsRound1[0], "telegram.sendSticker");
 
-        // 模拟 Pass 2 补充了这些文档进入 messages
+        // 模拟运行时错误后补充了这些文档进入 messages
         const fullDocsRound1 = lookupFullDocs(registry, missingMethodsRound1);
         messages.push({
             role: "user",
-            content: `[📚 API 文档加载完成]\n\n${fullDocsRound1}`
+            content: `[📚 运行时错误后加载 API d.ts 文档]\n\n${fullDocsRound1}`
         });
 
         // ==========================================
@@ -112,12 +112,12 @@ describe("TS Skills Two-Pass Architecture (Context & Deduplication)", () => {
         assert.equal(needsDocLookup(missingMethodsRound2), false);
     });
 
-    it("Phase 3b: Trivial calls should not be injected when a documented non-trivial call triggers Two-pass", () => {
+    it("Phase 3b: Trivial calls should not be injected when a documented non-trivial call needs docs", () => {
         const messages: ChatMessage[] = [
             { role: "system", content: "You are an agent..." },
             {
                 role: "user",
-                content: `[📚 API 文档加载完成]\n\n${lookupFullDocs(registry, ["telegram.sendSticker"])}`
+                content: `[📚 运行时错误后加载 API d.ts 文档]\n\n${lookupFullDocs(registry, ["telegram.sendSticker"])}`
             },
         ];
 

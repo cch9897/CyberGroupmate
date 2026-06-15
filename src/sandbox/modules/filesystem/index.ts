@@ -202,6 +202,24 @@ export const filesystem = {
     },
 
     /**
+     * 以二进制模式写入文件（base64 → bytes）。
+     * 用于保存 telegram.downloadMedia / downloadAsBuffer 返回的 data.buffer（base64 字符串）。
+     * 不要用 writeFile() 写二进制数据，那样会把 base64 字符串当 UTF-8 文本存入，导致文件损坏。
+     */
+    writeFileBinary(path: string, base64: string): void {
+        const resolved = safePath(path);
+        const buf = Buffer.from(base64, "base64");
+        if (buf.length > MAX_FILE_SIZE) {
+            throw new Error(`内容过大 (${(buf.length / 1024 / 1024).toFixed(1)}MB)，限制 ${MAX_FILE_SIZE / 1024 / 1024}MB`);
+        }
+        const dir = resolve(resolved, "..");
+        if (!existsSync(dir)) {
+            mkdirSync(dir, { recursive: true });
+        }
+        writeFileSync(resolved, buf);
+    },
+
+    /**
      * 追加写入文件
      */
     appendFile(path: string, content: string): void {

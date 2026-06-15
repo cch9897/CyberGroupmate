@@ -47,6 +47,7 @@ const GUIDE_META: Record<GuideGroupName, GuideMeta> = {
         notes: [
             "这些方法通常会直接修改当前登录账号。调用前确认目标字段和值，尤其是用户名、头像和生日。",
             "需要 peer 的地方优先使用 `InputPeerLike`：`'me'`、`'self'`、username、marked ID 或 mtcute raw/input peer 都可以。",
+            "mtcute 返回的对象在 sandbox 中会带 `__mtcuteRef`，可直接传回其他 mtcute 方法；`downloadAsBuffer` 的二进制返回会序列化为 `{ buffer, size }`。",
         ],
     },
     advancedMessages: {

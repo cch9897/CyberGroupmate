@@ -4,19 +4,21 @@ FROM node:22-bookworm AS deps
 RUN apt-get update && \
     apt-get install -y --no-install-recommends python3 make g++ && \
     rm -rf /var/lib/apt/lists/*
+RUN npm install -g pnpm@11.3.0
 
 WORKDIR /app
-COPY package.json package-lock.json ./
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY patches/ ./patches/
-RUN npm ci
+RUN pnpm install --frozen-lockfile
 
 # ── Stage 2: Build dashboard UI ──
 FROM node:22-bookworm AS ui-build
-WORKDIR /app
-COPY src/dashboard/ui/package.json src/dashboard/ui/package-lock.json ./src/dashboard/ui/
-RUN cd src/dashboard/ui && npm ci
-COPY src/dashboard/ui/ ./src/dashboard/ui/
-RUN cd src/dashboard/ui && npm run build
+RUN npm install -g pnpm@11.3.0
+WORKDIR /app/src/dashboard/ui
+COPY src/dashboard/ui/package.json src/dashboard/ui/pnpm-lock.yaml src/dashboard/ui/pnpm-workspace.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY src/dashboard/ui/ ./
+RUN pnpm run build
 
 # ── Stage 3: Runtime ──
 FROM node:22-bookworm

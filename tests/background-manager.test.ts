@@ -14,7 +14,7 @@ function sleep(ms: number): Promise<void> {
 describe("BackgroundManager", () => {
     it("should spawn and list a running task", () => {
         const events: Record<string, unknown>[] = [];
-        const bg = new BackgroundManager((e) => events.push(e));
+        const bg = new BackgroundManager({ notifyCallback: (e) => events.push(e), printCallback: () => { } });
 
         bg.spawn("test-task", async (signal) => {
             // 长期运行的任务
@@ -33,28 +33,45 @@ describe("BackgroundManager", () => {
         bg.killAll();
     });
 
-    it("should not allow duplicate running tasks", () => {
-        const bg = new BackgroundManager(() => { });
+    it("should replace a running task when spawning the same name", async () => {
+        const bg = new BackgroundManager({ notifyCallback: () => { }, printCallback: () => { } });
 
+        let firstAborted = false;
+        let firstSignal: AbortSignal | undefined;
+        bg.spawn("task-a", async (signal) => {
+            firstSignal = signal;
+            await new Promise((_, reject) => {
+                signal.addEventListener("abort", () => {
+                    firstAborted = true;
+                    reject(new Error("aborted"));
+                });
+            });
+        });
+        assert.equal(bg.runningCount, 1);
+
+        // Re-spawning a running task aborts the existing one and starts the new one
         bg.spawn("task-a", async (signal) => {
             await new Promise((_, reject) => {
                 signal.addEventListener("abort", () => reject(new Error("aborted")));
             });
         });
 
-        assert.throws(
-            () =>
-                bg.spawn("task-a", async () => {
-                    // noop
-                }),
-            { message: /already running/ }
-        );
+        await sleep(20);
+        // The first task's signal was aborted as part of the replacement
+        assert.equal(firstAborted, true);
+        assert.equal(firstSignal?.aborted, true);
+        // Only a single task record remains under that name and it is running
+        const tasks = bg.ps();
+        assert.equal(tasks.length, 1);
+        assert.equal(tasks[0].name, "task-a");
+        assert.equal(tasks[0].status, "running");
+        assert.equal(bg.runningCount, 1);
 
         bg.killAll();
     });
 
     it("should kill a running task", async () => {
-        const bg = new BackgroundManager(() => { });
+        const bg = new BackgroundManager({ notifyCallback: () => { }, printCallback: () => { } });
 
         bg.spawn("task-b", async (signal) => {
             await new Promise((_, reject) => {
@@ -74,13 +91,13 @@ describe("BackgroundManager", () => {
     });
 
     it("should return false when killing non-existent task", () => {
-        const bg = new BackgroundManager(() => { });
+        const bg = new BackgroundManager({ notifyCallback: () => { }, printCallback: () => { } });
         const killed = bg.kill("nonexistent");
         assert.equal(killed, false);
     });
 
     it("should track task that completes normally", async () => {
-        const bg = new BackgroundManager(() => { });
+        const bg = new BackgroundManager({ notifyCallback: () => { }, printCallback: () => { } });
 
         bg.spawn("quick-task", async () => {
             // 快速完成的任务
@@ -96,7 +113,7 @@ describe("BackgroundManager", () => {
 
     it("should report errors via notifyCallback for crashed tasks", async () => {
         const events: Record<string, unknown>[] = [];
-        const bg = new BackgroundManager((e) => events.push(e));
+        const bg = new BackgroundManager({ notifyCallback: (e) => events.push(e), printCallback: () => { } });
 
         bg.spawn("crashing-task", async () => {
             await sleep(10);
@@ -117,7 +134,7 @@ describe("BackgroundManager", () => {
     });
 
     it("should allow re-spawning after task completes", async () => {
-        const bg = new BackgroundManager(() => { });
+        const bg = new BackgroundManager({ notifyCallback: () => { }, printCallback: () => { } });
 
         bg.spawn("reusable", async () => {
             await sleep(10);
@@ -139,7 +156,7 @@ describe("BackgroundManager", () => {
     });
 
     it("should track runningCount correctly", async () => {
-        const bg = new BackgroundManager(() => { });
+        const bg = new BackgroundManager({ notifyCallback: () => { }, printCallback: () => { } });
 
         assert.equal(bg.runningCount, 0);
 
@@ -164,7 +181,7 @@ describe("BackgroundManager", () => {
     });
 
     it("should killAll running tasks", async () => {
-        const bg = new BackgroundManager(() => { });
+        const bg = new BackgroundManager({ notifyCallback: () => { }, printCallback: () => { } });
 
         for (let i = 0; i < 3; i++) {
             bg.spawn(`task-${i}`, async (signal) => {

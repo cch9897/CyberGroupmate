@@ -207,7 +207,7 @@ describe("runMetaSession", () => {
         assert.doesNotMatch(llmCalls[1][llmCalls[1].length - 2].content, /<end_turn>/);
     });
 
-    it("injects Meta API docs through two-pass before executing platform APIs", async () => {
+    it("injects Meta API docs only after runtime errors and keeps the previous assistant message", async () => {
         const registry: ModuleEntry[] = [{
             name: "dispatch",
             description: "Meta dispatch API",
@@ -225,10 +225,15 @@ describe("runMetaSession", () => {
         }];
         const sandbox = new MetaSandbox({
             dispatch: {
-                taskToGroup: async (_chatId: string, taskSpec: { contentDirection: string }) => ({
-                    taskId: "task-1",
-                    contentDirection: taskSpec.contentDirection,
-                }),
+                taskToGroup: async (_chatId: string, taskSpec: { contentDirection?: string }) => {
+                    if (typeof taskSpec.contentDirection !== "string") {
+                        throw new Error("contentDirection is required");
+                    }
+                    return {
+                        taskId: "task-1",
+                        contentDirection: taskSpec.contentDirection,
+                    };
+                },
             },
         });
         const llmCalls: ChatMessage[][] = [];
@@ -247,7 +252,7 @@ describe("runMetaSession", () => {
                     "Need to dispatch.",
                     "",
                     "```ts",
-                    "await dispatch.taskToGroup(\"telegram:g1\", { contentDirection: \"pass1\" });",
+                    "await dispatch.taskToGroup(\"telegram:g1\", { direction: \"pass1\" });",
                     "```",
                 ].join("\n"),
             },
@@ -256,7 +261,7 @@ describe("runMetaSession", () => {
                     "Docs loaded; rewrite with the right shape.",
                     "",
                     "```ts",
-                    "const task = await dispatch.taskToGroup(\"telegram:g1\", { contentDirection: \"pass2\" });",
+                    "const task = await dispatch.taskToGroup(\"telegram:g1\", { contentDirection: \"fixed\" });",
                     "console.log(task.taskId, task.contentDirection);",
                     "```",
                 ].join("\n"),
@@ -290,15 +295,18 @@ describe("runMetaSession", () => {
 
             assert.equal(result.endReason, "end_turn");
             assert.equal(result.turns[0]?.code, [
-                "const task = await dispatch.taskToGroup(\"telegram:g1\", { contentDirection: \"pass2\" });",
-                "console.log(task.taskId, task.contentDirection);",
+                "await dispatch.taskToGroup(\"telegram:g1\", { direction: \"pass1\" });",
             ].join("\n"));
-            assert.match(result.turns[0]?.observation ?? "", /task-1 pass2/);
-            assert.match(llmCalls[1]?.at(-1)?.content ?? "", /Meta API 文档加载完成/);
+            assert.match(result.turns[0]?.observation ?? "", /contentDirection is required/);
+            assert.match(result.turns[0]?.observation ?? "", /运行时错误后加载 Meta API d\.ts 文档/);
+            assert.match(result.turns[0]?.observation ?? "", /### dispatch\.taskToGroup/);
+            assert.match(result.turns[1]?.observation ?? "", /task-1 fixed/);
+            assert.doesNotMatch(llmCalls[0]?.map((message) => message.content).join("\n") ?? "", /### dispatch\.taskToGroup/);
             assert.match(llmCalls[1]?.at(-1)?.content ?? "", /### dispatch\.taskToGroup/);
+            assert.match(llmCalls[1]?.at(-2)?.content ?? "", /direction: "pass1"/);
             assert.deepEqual(
                 progressEvents.map((event) => event.phase),
-                ["thinking", "type_resolving", "thinking", "executing", "observation", "thinking", "end"],
+                ["thinking", "executing", "type_resolving", "observation", "thinking", "executing", "observation", "thinking", "end"],
             );
         } finally {
             codeActEvents.off("codeact:progress", onProgress);

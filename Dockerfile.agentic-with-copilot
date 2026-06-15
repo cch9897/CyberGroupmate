@@ -1,0 +1,16 @@
+ARG BASE_IMAGE=ghcr.io/archeb/cybergroupmate:agentic
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+USER root
+
+# Install the GitHub Copilot CLI (official standalone npm package), which bakes
+# the binary into the image — no runtime download or auth needed at build time.
+#
+# The previous `gh extension install github/gh-copilot` approach no longer works:
+# current gh (>= 2.94) ships `copilot` as a built-in command and rejects the
+# extension ("copilot matches the name of a built-in command or alias").
+RUN npm install -g @github/copilot \
+    && copilot --version \
+    && copilot --help >/dev/null

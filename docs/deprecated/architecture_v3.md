@@ -147,7 +147,7 @@ CyberGroupmate 是一个接入即时通讯平台（Telegram / Discord / OneBot�
 | 组件 | 文件 | 说明 |
 |:-----|:-----|:-----|
 | CodeActExecutor | `src/subagent/code-act-executor.ts` | per-group 串行执行器；Q4 任务队列；持有 LLM Session（对话历史）+ ContextManager 两层 compact |
-| SessionRunner | `src/sandbox/session-runner.ts` | 单次 CodeAct Session 运行器；Two-pass 代码生成（Pass1 轻量概览 → 按需 Pass2 完整文档注入）；循环：LLM 思考 → 执行代码 → Observation → 重复直到完成 |
+| SessionRunner | `src/sandbox/session-runner.ts` | 单次 CodeAct Session 运行器；轻量 API 概览常驻，运行时错误后按需注入 d.ts 完整文档且保留原代码消息；循环：LLM 思考 → 执行代码 → Observation → 重复直到完成 |
 | SandboxPool | `src/sandbox/sandbox-pool.ts` | 全局 Sandbox 实例池，管理并发数（默认 5）和空闲回收 |
 | Sandbox | `src/sandbox/sandbox.ts` | Host 侧沙盒管理器；子进程生命周期、Multi-Tab PTY（`shell.*`）、Host Call 路由、事件监听器和 Webhook 持久化 |
 | SandboxWorker | `src/sandbox/sandbox-worker.ts` | Worker 子进程；执行 LLM 生成的 JS/TS 代码；暴露所有沙盒 API 全局变量 |

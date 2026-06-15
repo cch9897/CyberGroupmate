@@ -15,7 +15,7 @@ import { buildMetaApiContext } from "../src/meta-sandbox/meta-api/index.js";
 import { MetaSandbox } from "../src/meta-sandbox/meta-sandbox.js";
 import { CallbackQueue } from "../src/subagent/callback-queue.js";
 import { SubagentManager } from "../src/subagent/subagent-manager.js";
-import type { AttentionQueueEntry } from "../src/subagent/types.js";
+import type { AttentionQueueEntry, SubagentCallback } from "../src/subagent/types.js";
 import type { LLMResponse } from "../src/core/llm.js";
 
 function createMetaMemoryStub() {
@@ -56,6 +56,59 @@ const TEST_LLM_CONFIG: LLMConfig = {
 };
 
 describe("MainAgentLoop meta session path", () => {
+    it("routes subagent-dispatch completion back to the source subagent and records a digest", async () => {
+        const dir = tempDir();
+        const globalState = new GlobalState({
+            filePath: join(dir, "global-state.json"),
+            autoSaveInterval: 0,
+        });
+        const accumulator = new AttentionAccumulator(globalState, { windowMs: 0, topN: 2 });
+        const callbackQueue = new CallbackQueue();
+        const subagentManager = new SubagentManager({ sessionsDir: join(dir, "sessions") });
+        const loop = new MainAgentLoop(accumulator, callbackQueue, subagentManager, {}, globalState);
+        const notifications: any[] = [];
+
+        const source = subagentManager.getOrCreate("telegram:source");
+        source.codeActExecutor = {
+            enqueue: (task: unknown) => notifications.push(task),
+        };
+        subagentManager.getOrCreate("telegram:target");
+
+        globalState.recordDispatchedSubagentTask({
+            taskId: "target-task",
+            chatId: "telegram:target",
+            sourceType: "subagent",
+            sourceChatId: "telegram:source",
+            contentDirection: "ask target to verify API gateway decision",
+            createdAt: new Date().toISOString(),
+        });
+
+        const callback: SubagentCallback = {
+            taskId: "target-task",
+            chatId: "telegram:target",
+            executionType: "CODEACT",
+            status: "COMPLETED",
+            summary: "target verified Kong is still preferred",
+            durationMs: 123,
+            createdAt: new Date().toISOString(),
+            sentMessages: [{ text: "Kong 还是更合适", timestamp: new Date().toISOString() }],
+        };
+        callbackQueue.enqueue(callback);
+
+        const result = await loop.tick();
+
+        assert.equal(notifications.length, 1);
+        assert.match(notifications[0].taskId, /^dispatch-notify:/);
+        assert.match(notifications[0].continuationPrompt, /target verified Kong/);
+        assert.equal(result.phase2Eval.activeCount, 0);
+        assert.ok(globalState.getSessionDigests().some((digest) =>
+            /DISPATCH_DONE/.test(digest.content)
+            && /Subagent telegram:source -> telegram:target/.test(digest.content)
+        ));
+
+        globalState.dispose();
+    });
+
     it("batches released attention entries into one meta session and stores digest", async () => {
         const dir = tempDir();
         const globalState = new GlobalState({
@@ -199,15 +252,14 @@ describe("MainAgentLoop meta session path", () => {
                 ].join("\n"),
             },
             {
+                // 第二轮只做只读确认，不再重复下发同一任务。
+                // 历史上这里曾用 legacy `context: {...}` 字段，会被 assertNoLegacyContext 抛出而不入队；
+                // commit 5a53808 改为 quote-based dispatch 后，若仍调用 taskToGroup 就会真正入队第二个任务，
+                // 与本用例“单次 dispatch”的断言不符，因此改为 listTasks 的只读延续轮。
                 content: [
-                    "根据注入的 dispatch 文档重新下发。",
+                    "确认任务已下发。",
                     "```ts",
-                    "await dispatch.taskToGroup(\"telegram:g1\", {",
-                    "  contentDirection: \"reply from meta session\",",
-                    "  toneGuidance: \"calm\",",
-                    "  quotes: [\"source: meta-session\"],",
-                    "  useSkills: [\"memory\"],",
-                    "});",
+                    "await dispatch.listTasks({ chatId: \"telegram:g1\" });",
                     "```",
                 ].join("\n"),
             },
@@ -263,7 +315,7 @@ describe("MainAgentLoop meta session path", () => {
         assert.match(enqueuedTasks[0]?.contextSnapshot.quotedContext ?? "", /source: meta-session/);
         assert.equal(enqueuedTasks[0]?.contextSnapshot.dispatchContext, undefined);
         assert.deepEqual(Array.from(enqueuedTasks[0]?.useSkills ?? []), ["memory"]);
-        assert.equal(globalState.getSessionDigests()[0]?.content, "dispatched task to telegram:g1");
+        assert.ok(globalState.getSessionDigests().some((digest) => digest.content === "dispatched task to telegram:g1"));
 
         globalState.dispose();
     });

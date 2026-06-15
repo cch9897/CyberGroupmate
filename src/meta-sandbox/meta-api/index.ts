@@ -4,7 +4,9 @@ import type { MemoryStoreV2 } from "../../memory-v2/index.js";
 import type { GlobalState } from "../../main-agent/global-state.js";
 import type { SubagentManager } from "../../subagent/subagent-manager.js";
 import type { ActiveUserProfile } from "../../subagent/types.js";
+import type { HarnessManager } from "../../harness/manager.js";
 import { createAgentsApi } from "./agents.js";
+import { createBackgroundApi } from "./background.js";
 import { createConversationsApi } from "./conversations.js";
 import { createDispatchApi, type DispatchApiDeps } from "./dispatch.js";
 import { createMemoryApi } from "./memory.js";
@@ -12,6 +14,7 @@ import { createCronApi, createReminderApi } from "./scheduler.js";
 import { createTodoApi } from "./todo.js";
 
 export { createAgentsApi } from "./agents.js";
+export { createBackgroundApi } from "./background.js";
 export { createConversationsApi } from "./conversations.js";
 export { createDispatchApi } from "./dispatch.js";
 export { createMemoryApi } from "./memory.js";
@@ -25,6 +28,7 @@ export interface BuildMetaApiContextDeps extends Omit<DispatchApiDeps, "subagent
     accumulator: AttentionAccumulator;
     groundingConfig?: GroundingConfig;
     getActiveUserProfilesForChat?: (chatId: string) => ActiveUserProfile[] | undefined;
+    getHarnessManager?: () => HarnessManager | null;
 }
 
 export function buildMetaApiContext(deps: BuildMetaApiContextDeps) {
@@ -32,6 +36,7 @@ export function buildMetaApiContext(deps: BuildMetaApiContextDeps) {
         conversations: createConversationsApi(deps.memory, deps.subagentManager),
         memory: createMemoryApi(deps.memory, deps.globalState),
         agents: createAgentsApi(deps.subagentManager, deps.memory),
+        background: createBackgroundApi(deps.getHarnessManager ?? (() => null)),
         dispatch: createDispatchApi({
             memory: deps.memory,
             globalState: deps.globalState,

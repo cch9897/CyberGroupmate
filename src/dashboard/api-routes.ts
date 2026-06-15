@@ -13,6 +13,7 @@ import type { CodeActExecutor } from "../subagent/code-act-executor.js";
 import { refreshModuleRegistryCache } from "../subagent/code-act-executor.js";
 import { createLogger } from "../core/logger.js";
 import { loadConfig, validateConfig, saveConfig } from "../core/config.js";
+import { DEFAULT_BANNED_WORDS } from "../core/banned-words.js";
 import { rateLimiter } from "../core/llm-rate-limiter.js";
 import { discoverSkills } from "../sandbox/skill-loader.js";
 import {
@@ -32,10 +33,13 @@ import {
 } from "../meta-sandbox/meta-session-runner.js";
 import { getMetaHistoryWindowStatus } from "../main-agent/meta-history-retention.js";
 import { getPlatform } from "../core/chat-id.js";
+import { extractAnimatedStickerFrames } from "../core/vision-processor.js";
+import type { MainAgentGlobalState } from "../subagent/types.js";
 
 const log = createLogger("dashboard-api");
 const SKILLS_ROOT = join(process.cwd(), "workspace", "skills");
 const DEBUG_EXECUTION_LOCKS = new Set<string>();
+const dynamicStickerPreviewCache = new Map<string, { mtimeMs: number; buffer: Buffer }>();
 
 const DEFAULT_CODEACT_DEBUG_TIMEOUT_MS = 30_000;
 const MAX_CODEACT_DEBUG_TIMEOUT_MS = 120_000;
@@ -64,6 +68,71 @@ const BUILTIN_DEBUG_DTS: Record<string, string> = {
 function qs(val: unknown): string {
     if (Array.isArray(val)) return String(val[0] ?? "");
     return String(val ?? "");
+}
+
+const EMOJI_SEARCH_CHAR_RE = /[\p{Extended_Pictographic}\p{Regional_Indicator}]/u;
+
+function parseStickerSearchTerms(raw: string): string[] {
+    const trimmed = raw.trim();
+    if (!trimmed) return [];
+
+    const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+    const candidates: string[] = [];
+
+    for (const { segment } of segmenter.segment(trimmed)) {
+        const token = segment.trim();
+        if (!token || !EMOJI_SEARCH_CHAR_RE.test(token) || candidates.includes(token)) continue;
+        candidates.push(token);
+    }
+
+    return candidates;
+}
+
+function stickerFileKind(filePath?: string): "static" | "animated" | null {
+    if (!filePath) return null;
+    const lower = filePath.toLowerCase();
+    if (lower.endsWith(".webm") || isTgsStickerFile(filePath)) return "animated";
+    return "static";
+}
+
+function stickerContentType(filePath: string): string {
+    const lower = filePath.toLowerCase();
+    if (lower.endsWith(".png")) return "image/png";
+    if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+    if (lower.endsWith(".gif")) return "image/gif";
+    if (lower.endsWith(".webm")) return "video/webm";
+    if (isTgsStickerFile(filePath)) return "application/x-tgsticker";
+    return "image/webp";
+}
+
+function isTgsStickerFile(filePath: string): boolean {
+    const lower = filePath.toLowerCase();
+    if (lower.endsWith(".tgs")) return true;
+    if (!lower.endsWith(".bin")) return false;
+    try {
+        const fd = fs.openSync(filePath, "r");
+        try {
+            const header = Buffer.allocUnsafe(2);
+            return fs.readSync(fd, header, 0, 2, 0) === 2 && header[0] === 0x1f && header[1] === 0x8b;
+        } finally {
+            fs.closeSync(fd);
+        }
+    } catch {
+        return false;
+    }
+}
+
+async function renderDynamicStickerPreview(filePath: string): Promise<Buffer> {
+    const stat = fs.statSync(filePath);
+    const cached = dynamicStickerPreviewCache.get(filePath);
+    if (cached?.mtimeMs === stat.mtimeMs) return cached.buffer;
+
+    const raw = fs.readFileSync(filePath);
+    const frames = await extractAnimatedStickerFrames(raw, isTgsStickerFile(filePath), 1);
+    const buffer = frames[0];
+    if (!buffer) throw new Error("dynamic sticker preview produced no frames");
+    dynamicStickerPreviewCache.set(filePath, { mtimeMs: stat.mtimeMs, buffer });
+    return buffer;
 }
 
 function fromJSONSafe(val: string | null | undefined): unknown[] {
@@ -192,6 +261,108 @@ function serializeTopic(topic: any): Record<string, unknown> | null {
             chatId: String(msg.chatId),
             senderId: String(msg.senderId),
         })),
+    };
+}
+
+function previewText(value: unknown, limit = 180): string {
+    let text: string;
+    if (typeof value === "string") {
+        text = value;
+    } else {
+        try {
+            text = JSON.stringify(value);
+        } catch {
+            text = String(value ?? "");
+        }
+    }
+    text = text.replace(/\s+/g, " ").trim();
+    return text.length > limit ? `${text.slice(0, limit)}...` : text;
+}
+
+function buildGlobalStateSummary(state: Readonly<MainAgentGlobalState>): Record<string, unknown> {
+    const schedulerEvents = state.schedulerEvents ?? [];
+    const reminders = schedulerEvents.filter((event) => event.type === "reminder");
+    const crons = schedulerEvents.filter((event) => event.type === "cron");
+    const activeReminders = reminders.filter((event) => !event.triggered);
+    const triggeredReminders = reminders.length - activeReminders.length;
+    const memos = state.memos ?? [];
+    const sessionDigests = state.sessionDigests ?? [];
+    const metaSessionHistory = state.metaSessionHistory ?? [];
+    const signalPool = state.signalPool ?? [];
+    const wakeConditions = state.wakeConditions ?? [];
+    const dispatchedSubagentTasks = state.dispatchedSubagentTasks ?? [];
+    const taskStatusCounts = dispatchedSubagentTasks.reduce<Record<string, number>>((counts, task) => {
+        counts[task.status] = (counts[task.status] ?? 0) + 1;
+        return counts;
+    }, {});
+
+    return {
+        generatedAt: new Date().toISOString(),
+        sections: [
+            {
+                key: "schedulerEvents",
+                label: "调度事件",
+                count: schedulerEvents.length,
+                detail: `${activeReminders.length} active reminders, ${triggeredReminders} triggered, ${crons.length} crons`,
+            },
+            {
+                key: "memos",
+                label: "全局备忘录",
+                count: memos.length,
+                detail: `${memos.filter((memo) => !!memo.expiresAt).length} with expiry`,
+            },
+            {
+                key: "sessionDigests",
+                label: "Session Digests",
+                count: sessionDigests.length,
+            },
+            {
+                key: "metaSessionHistory",
+                label: "Meta History",
+                count: metaSessionHistory.length,
+                detail: getMetaHistoryWindowStatus(metaSessionHistory).currentChars + " chars",
+            },
+            {
+                key: "signalPool",
+                label: "Signal Pool",
+                count: signalPool.length,
+            },
+            {
+                key: "wakeConditions",
+                label: "Wake Conditions",
+                count: wakeConditions.length,
+            },
+            {
+                key: "dispatchedSubagentTasks",
+                label: "Dispatch Tasks",
+                count: dispatchedSubagentTasks.length,
+                detail: Object.entries(taskStatusCounts).map(([status, count]) => `${status}:${count}`).join(", "),
+            },
+        ],
+        recent: {
+            memos: memos.slice(-5).reverse().map((memo) => ({
+                key: memo.key,
+                createdAt: memo.createdAt,
+                expiresAt: memo.expiresAt,
+                value: previewText(memo.value),
+            })),
+            sessionDigests: sessionDigests.slice(-5).reverse().map((digest) => ({
+                createdAt: digest.createdAt,
+                content: previewText(digest.content),
+            })),
+            metaSessionHistory: metaSessionHistory.slice(-5).reverse().map((entry) => ({
+                role: entry.role,
+                timestamp: entry.timestamp,
+                content: previewText(entry.content),
+            })),
+            dispatchedSubagentTasks: dispatchedSubagentTasks.slice(-5).reverse().map((task) => ({
+                taskId: task.taskId,
+                chatId: task.chatId,
+                status: task.status,
+                updatedAt: task.updatedAt,
+                summary: previewText(task.summary ?? task.error ?? task.contentDirection),
+            })),
+        },
     };
 }
 
@@ -634,6 +805,10 @@ export function createApiRouter(deps: DashboardDeps, bridge: EventBridge): Route
         );
     });
 
+    router.get("/global-state/summary", (_req, res) => {
+        res.json(buildGlobalStateSummary(deps.globalState.getState()));
+    });
+
     router.get("/global-state", (_req, res) => {
         res.json(deps.globalState.getState());
     });
@@ -852,9 +1027,12 @@ export function createApiRouter(deps: DashboardDeps, bridge: EventBridge): Route
             const sandbox = await deps.sandboxPool.acquire(chatId);
             try {
                 const platform = getPlatform(chatId);
-                const deduplicateSentMessages = loadConfig("config.yaml", true).subagent?.deduplicateSentMessages !== false;
+                const cfg = loadConfig("config.yaml", true);
+                const deduplicateSentMessages = cfg.subagent?.deduplicateSentMessages !== false;
+                const bannedWords = cfg.subagent?.bannedWords ?? DEFAULT_BANNED_WORDS;
                 await sandbox.execute(`__setPlatform(${JSON.stringify(platform)})`, 5_000);
                 await sandbox.execute(`__setDuplicateMessageBlocking(${JSON.stringify(deduplicateSentMessages)})`, 5_000);
+                await sandbox.execute(`__setBannedWords(${JSON.stringify(bannedWords)})`, 5_000);
 
                 const result = await sandbox.execute(code, timeoutMs);
                 res.json({
@@ -1011,33 +1189,46 @@ export function createApiRouter(deps: DashboardDeps, bridge: EventBridge): Route
     });
 
     // ─── Sticker Management ───
-    router.get("/stickers", (_req, res) => {
-        const stickers = deps.memory.getAllStickerDescriptions();
-        // 附加 hasImage 标记 + 过滤 webm
+    router.get("/stickers", (req, res) => {
+        const searchQuery = qs(req.query.q).trim();
+        const allStickers = deps.memory.getAllStickerDescriptions();
+        const searchTerms = parseStickerSearchTerms(searchQuery);
+        const matchedIds = searchQuery
+            ? new Set(
+                searchTerms.length > 0
+                    ? deps.memory.searchStickersByEmoji(searchTerms, Math.max(allStickers.length, 1)).map(item => item.uniqueFileId)
+                    : []
+            )
+            : null;
+        const stickers = matchedIds
+            ? allStickers.filter(sticker => matchedIds.has(sticker.uniqueFileId))
+            : allStickers;
+        // Dynamic sticker previews are rendered by /stickers/:id/image.
         const result = stickers.map(s => {
             const filePath = deps.mediaDownloader?.getExistingPath(s.uniqueFileId);
-            const isWebm = filePath?.toLowerCase().endsWith(".webm") ?? false;
+            const kind = stickerFileKind(filePath ?? undefined);
             return {
                 ...s,
-                hasImage: !!filePath && !isWebm,
-                isWebm,
+                hasImage: !!filePath,
+                stickerKind: kind,
             };
-        }).filter(s => !s.isWebm); // 不展示 webm 贴纸
+        });
         res.json(result);
     });
 
-    router.get("/stickers/:uniqueFileId/image", (req, res) => {
+    router.get("/stickers/:uniqueFileId/image", async (req, res) => {
         if (!deps.mediaDownloader) { res.status(404).json({ error: "mediaDownloader not available" }); return; }
         const filePath = deps.mediaDownloader.getExistingPath(req.params.uniqueFileId);
         if (!filePath || !fs.existsSync(filePath)) { res.status(404).json({ error: "sticker image not found" }); return; }
         try {
-            const ext = filePath.toLowerCase();
-            const contentType = ext.endsWith(".png") ? "image/png"
-                : ext.endsWith(".jpg") || ext.endsWith(".jpeg") ? "image/jpeg"
-                : ext.endsWith(".gif") ? "image/gif"
-                : "image/webp";
-            res.setHeader("Content-Type", contentType);
             res.setHeader("Cache-Control", "public, max-age=86400");
+            if (stickerFileKind(filePath) === "animated") {
+                const preview = await renderDynamicStickerPreview(filePath);
+                res.setHeader("Content-Type", "image/png");
+                res.end(preview);
+                return;
+            }
+            res.setHeader("Content-Type", stickerContentType(filePath));
             fs.createReadStream(filePath).pipe(res);
         } catch (err) {
             res.status(500).json({ error: String(err) });
@@ -1158,6 +1349,7 @@ export function createApiRouter(deps: DashboardDeps, bridge: EventBridge): Route
                             description ?? "",
                             emoji,
                             newStickerEnabledByDefault,
+                            saved.contentHash ?? entry.contentHash,
                         );
                         deps.imageCatalog.markPromoted(
                             entry.contentHash,
@@ -1458,7 +1650,7 @@ export function createApiRouter(deps: DashboardDeps, bridge: EventBridge): Route
                 await callLLM(
                     [{ role: "user", content: "ping" }],
                     profile,
-                    { maxTokens: 10, timeoutMs: 15000, caller: "dashboard-test" }
+                    { timeoutMs: 15000, caller: "dashboard-test" }
                 );
                 const latency = Date.now() - start;
                 res.json({ ok: true, latency, model: profile.model, status: 200 });
@@ -1722,6 +1914,76 @@ export function createApiRouter(deps: DashboardDeps, bridge: EventBridge): Route
             const serverName = req.params.name;
             await mcpBridge.disconnect(serverName);
             res.json({ ok: true });
+        } catch (err) {
+            res.status(500).json({ error: String(err) });
+        }
+    });
+
+    // ─── Background Agent ───
+
+    router.get("/background-agent", (_req, res) => {
+        if (!deps.harnessManager) {
+            return res.json({ enabled: false });
+        }
+        res.json({
+            enabled: true,
+            ...deps.harnessManager.getStatus(),
+            currentRun: deps.harnessManager.getCurrentRun(),
+            runs: deps.harnessManager.getRecentRuns(20),
+        });
+    });
+
+    router.post("/background-agent/trigger", (req, res) => {
+        if (!deps.harnessManager) {
+            return res.status(404).json({ error: "HarnessManager not configured" });
+        }
+        // 可选的收集起点：
+        //   省略         → 默认（上次做梦起始时间起）
+        //   "all"        → 收集全部留存任务（不限起点）
+        //   ISO / epoch  → 从该时刻起
+        const sinceRaw = req.body?.since ?? qs(req.query.since);
+        let sinceTs: number | null | undefined = undefined;
+        if (sinceRaw !== undefined && sinceRaw !== null && String(sinceRaw).trim() !== "") {
+            const value = String(sinceRaw).trim();
+            if (value === "all") {
+                sinceTs = null;
+            } else {
+                const ms = /^\d+$/.test(value) ? Number(value) : Date.parse(value);
+                if (!Number.isFinite(ms)) {
+                    return res.status(400).json({ error: `invalid 'since': ${value}` });
+                }
+                sinceTs = ms;
+            }
+        }
+        deps.harnessManager.triggerManual(
+            { content: "manual-trigger-from-dashboard", source: "dashboard" },
+            sinceTs,
+        );
+        res.json({ ok: true, queueLength: deps.harnessManager.queueLength, sinceTs: sinceTs ?? null });
+    });
+
+    router.get("/background-agent/runs/:runId/events", (req, res) => {
+        if (!deps.harnessManager) {
+            return res.status(404).json({ error: "HarnessManager not configured" });
+        }
+        const run = deps.harnessManager.getRun(req.params.runId);
+        if (!run) {
+            return res.status(404).json({ error: "run not found" });
+        }
+        const after = Number(qs(req.query.after));
+        if (!run.logPath || !fs.existsSync(run.logPath)) {
+            const events = Number.isFinite(after)
+                ? run.events.filter((event) => event.id > after)
+                : run.events;
+            return res.json({ runId: run.id, events, source: "memory" });
+        }
+        try {
+            const events = fs.readFileSync(run.logPath, "utf-8")
+                .split(/\r?\n/)
+                .filter(Boolean)
+                .map((line) => JSON.parse(line))
+                .filter((event) => !Number.isFinite(after) || Number(event.id) > after);
+            res.json({ runId: run.id, events, source: "log", logPath: run.logPath });
         } catch (err) {
             res.status(500).json({ error: String(err) });
         }

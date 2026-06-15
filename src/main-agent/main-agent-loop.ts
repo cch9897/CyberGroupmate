@@ -11,7 +11,14 @@
 import { CallbackQueue } from "../subagent/callback-queue.js";
 import { SubagentManager } from "../subagent/subagent-manager.js";
 import { GlobalState } from "./global-state.js";
-import type { AttentionQueueEntry, SubagentCallback, AttendResult, Decision } from "../subagent/types.js";
+import type {
+    AttentionQueueEntry,
+    CodeActReplyTask,
+    DispatchedSubagentTaskRecord,
+    SubagentCallback,
+    AttendResult,
+    Decision,
+} from "../subagent/types.js";
 import { DEFAULT_SUBAGENT_CONFIG } from "../subagent/types.js";
 import type { AttentionItem } from "../accumulator/types.js";
 import { AttentionAccumulator } from "../accumulator/attention-accumulator.js";
@@ -21,8 +28,11 @@ import { buildWakeConditionPayload, matchCallbackWakeConditions } from "./wake-c
 import type { PlatformAdapter } from "../adapter/platform-adapter.js";
 import { markChatAsRead } from "../adapter/read-receipts.js";
 import type { MetaSessionHandler } from "./meta-session-handler.js";
+import { shortUuid } from "../core/ids.js";
+import { truncateForPrompt } from "../core/text-safety.js";
 
 const log = createLogger("main-agent-loop");
+const DISPATCH_SOURCE_NOTIFICATION_TASK_PREFIX = "dispatch-notify:";
 
 /** 主循环配置 */
 export interface MainAgentLoopConfig {
@@ -187,14 +197,30 @@ export class MainAgentLoop {
                 cbSubagent.addCallback(cb);
             }
             this.accumulator.unblock(cb.chatId);
-            this.accumulator.ingest(1, {
-                chatId: cb.chatId,
-                source: "CALLBACK",
-                enqueuedAt: Date.now(),
-                payload: cb,
-            });
+            const isDispatchSourceNotification = cb.taskId.startsWith(DISPATCH_SOURCE_NOTIFICATION_TASK_PREFIX);
+            let dispatchedTask: DispatchedSubagentTaskRecord | null | undefined;
 
-            if (this.globalState) {
+            if (this.globalState && !isDispatchSourceNotification) {
+                dispatchedTask = this.globalState.getDispatchedSubagentTask(cb.taskId);
+                if (dispatchedTask) {
+                    this.globalState.addSessionDigest(formatDispatchCompletionDigest(dispatchedTask, cb));
+                    this.enqueueDispatchSourceNotification(dispatchedTask, cb);
+                }
+            }
+
+            const isSubagentOriginDispatchCallback =
+                dispatchedTask?.sourceType === "subagent" && !!dispatchedTask.sourceChatId;
+
+            if (!isDispatchSourceNotification && !isSubagentOriginDispatchCallback) {
+                this.accumulator.ingest(1, {
+                    chatId: cb.chatId,
+                    source: "CALLBACK",
+                    enqueuedAt: Date.now(),
+                    payload: cb,
+                });
+            }
+
+            if (this.globalState && !isDispatchSourceNotification && !isSubagentOriginDispatchCallback) {
                 const matches = matchCallbackWakeConditions(cb, this.globalState.getWakeConditions());
                 for (const match of matches) {
                     this.globalState.removeWakeCondition(match.conditionId);
@@ -377,6 +403,62 @@ export class MainAgentLoop {
         markChatAsRead(this.adapters, chatId, "meta-attend");
     }
 
+    private enqueueDispatchSourceNotification(
+        dispatchedTask: DispatchedSubagentTaskRecord,
+        callback: SubagentCallback,
+    ): void {
+        if (dispatchedTask.sourceType !== "subagent" || !dispatchedTask.sourceChatId) {
+            return;
+        }
+        if (dispatchedTask.sourceChatId === dispatchedTask.chatId) {
+            return;
+        }
+
+        const sourceSubagent = this.subagentManager.get(dispatchedTask.sourceChatId);
+        const executor = sourceSubagent?.codeActExecutor as { enqueue?: (task: CodeActReplyTask) => void } | null | undefined;
+        if (!executor?.enqueue) {
+            log.warn("dispatch source notification skipped: source executor unavailable", {
+                sourceChatId: dispatchedTask.sourceChatId,
+                targetChatId: dispatchedTask.chatId,
+                taskId: dispatchedTask.taskId,
+            });
+            return;
+        }
+
+        const notificationTaskId = `${DISPATCH_SOURCE_NOTIFICATION_TASK_PREFIX}${shortUuid()}`;
+        const continuationPrompt = formatDispatchSourceNotificationPrompt(dispatchedTask, callback);
+        const task: CodeActReplyTask = {
+            type: "CODEACT_REPLY",
+            chatId: dispatchedTask.sourceChatId,
+            taskId: notificationTaskId,
+            decisions: [{
+                action: "OBSERVE",
+                contentDirection: `你之前派发给 ${dispatchedTask.chatId} 的任务 ${dispatchedTask.taskId} 已返回结果。根据通知判断是否需要继续跟进；不需要公开回应时直接写 SESSION_DIGEST 后结束。`,
+                confidence: 1,
+                reason: "Dispatch source notification",
+            }],
+            contextSnapshot: {
+                depth: 1,
+                chatId: dispatchedTask.sourceChatId,
+                snapshotTimestamp: new Date().toISOString(),
+                topicDigests: [],
+                engagementScore: 0,
+                contentDirection: "dispatch source notification",
+            },
+            replyMode: "SINGLE",
+            createdAt: new Date().toISOString(),
+            continuationPrompt,
+            skipRefreshTaskMessages: true,
+        };
+        executor.enqueue(task);
+        log.info("dispatch source notification enqueued", {
+            sourceChatId: dispatchedTask.sourceChatId,
+            targetChatId: dispatchedTask.chatId,
+            taskId: dispatchedTask.taskId,
+            notificationTaskId,
+        });
+    }
+
     /**
      * 获取 tick 计数
      */
@@ -441,6 +523,10 @@ export class MainAgentLoop {
                     : createSyntheticMetaEntry(item);
                 entry.schedulerTriggers = item.source === "PROACTIVE_IDLE" ? [] : extractSchedulerTriggers(item.payload);
                 break;
+            case "BACKGROUND_AGENT":
+                entry = createSyntheticMetaEntry(item);
+                entry.schedulerTriggers = extractBackgroundAgentTriggers(item.payload);
+                break;
             case "CALLBACK":
                 if (!subagent) return null;
                 entry = subagent.buildQueueEntry("DEFERRED_RE_ENTRY");
@@ -490,7 +576,7 @@ export interface MetaTurnResult {
 }
 
 function isSyntheticMetaSource(source: AttentionItem["source"]): boolean {
-    return source === "WAKE_CONDITION" || source === "SCHEDULER" || source === "PROACTIVE_IDLE";
+    return source === "WAKE_CONDITION" || source === "SCHEDULER" || source === "PROACTIVE_IDLE" || source === "BACKGROUND_AGENT";
 }
 
 function isSubagentCallback(value: unknown): value is SubagentCallback {
@@ -607,6 +693,14 @@ function extractSchedulerTriggers(payload: unknown): NonNullable<AttentionQueueE
     return [];
 }
 
+function extractBackgroundAgentTriggers(payload: unknown): NonNullable<AttentionQueueEntry["schedulerTriggers"]> {
+    if (!payload || typeof payload !== "object") return [];
+    const p = payload as Record<string, unknown>;
+    const desc = typeof p.description === "string" ? p.description : "Background Agent notification";
+    const id = typeof p.id === "string" ? p.id : `bg:${Date.now()}`;
+    return [{ id, type: "reminder" as const, description: `[Background Agent] ${desc}` }];
+}
+
 function extractDirectAddressPayload(payload: unknown, chatId: string): { reason?: string; messageIds: string[]; userIds: string[] } {
     if (!payload || typeof payload !== "object") {
         return { messageIds: [], userIds: [] };
@@ -643,6 +737,57 @@ function createSyntheticMetaEntry(item: AttentionItem): AttentionQueueEntry {
         engagementScore: 0,
         snapshotTimestamp: new Date(item.enqueuedAt).toISOString(),
     };
+}
+
+function formatDispatchCompletionDigest(
+    task: DispatchedSubagentTaskRecord,
+    callback: SubagentCallback,
+): string {
+    const source = task.sourceType === "subagent" && task.sourceChatId
+        ? `Subagent ${task.sourceChatId}${task.sourceTaskId ? ` task=${task.sourceTaskId}` : ""}`
+        : "Meta";
+    const sent = callback.sentMessages?.length
+        ? `sent=${callback.sentMessages.map((msg) => `"${truncateForPrompt(msg.text, 80)}"`).join(" / ")}`
+        : "sent=none";
+    return [
+        `[DISPATCH_DONE] ${source} -> ${task.chatId}: task=${task.taskId}, status=${callback.status}`,
+        `direction=${truncateForPrompt(task.contentDirection, 160)}`,
+        `summary=${truncateForPrompt(callback.summary, 240)}`,
+        callback.error ? `error=${truncateForPrompt(callback.error, 160)}` : "",
+        sent,
+    ].filter(Boolean).join("；");
+}
+
+function formatDispatchSourceNotificationPrompt(
+    task: DispatchedSubagentTaskRecord,
+    callback: SubagentCallback,
+): string {
+    const sentMessages = callback.sentMessages?.length
+        ? callback.sentMessages.map((msg) => `- ${msg.messageId ? `[${msg.messageId}] ` : ""}${msg.text}`).join("\n")
+        : "- (目标 Subagent 没有发送公开消息)";
+    const error = callback.error ? `\nerror: ${callback.error}` : "";
+    return [
+        "[Dispatch Result Notification]",
+        "这是内部通知：你之前派发给其他 Subagent 的任务已经返回结果。",
+        "",
+        `sourceChatId: ${task.sourceChatId}`,
+        `targetChatId: ${task.chatId}`,
+        `targetTaskId: ${task.taskId}`,
+        `status: ${callback.status}`,
+        `originalDirection: ${task.contentDirection}`,
+        "",
+        "targetSummary:",
+        callback.summary,
+        error,
+        "",
+        "targetSentMessages:",
+        sentMessages,
+        "",
+        "处理要求：",
+        "- 根据这个结果决定是否需要继续跟进、再次派发、更新 ctx/todo，或向当前群同步。",
+        "- 如果不需要公开回应，不要调用平台发送 API；只写清 SESSION_DIGEST 后结束。",
+        "- 这条通知本身不会再主动推给 Meta；系统已经把 source/target/result 写入全局 session digest。",
+    ].filter((line) => line !== "").join("\n");
 }
 
 function looksLikeQuotaError(message: string): boolean {

@@ -299,97 +299,6 @@ export async function runMetaSession(
                 isProcessing: true,
             });
 
-            if (parsed.code && config.twoPassConfig) {
-                const calledMethods = extractApiCalls(parsed.code, config.twoPassConfig.getPrefixMap());
-                const docLookupMethods = getDocLookupMethods(calledMethods);
-                const missingMethods = docLookupMethods.filter((method) => !hasInjectedMethodDoc(messages, method));
-
-                if (missingMethods.length > 0) {
-                    const fullDocs = config.twoPassConfig.lookupDocs(missingMethods);
-                    if (fullDocs) {
-                        log.info("Meta session Two-pass triggered", {
-                            sessionId,
-                            turn,
-                            calledMethods,
-                            missingMethods,
-                            docsLength: fullDocs.length,
-                        });
-
-                        emitMetaProgress(sessionId, {
-                            turn,
-                            phase: "type_resolving",
-                            thinking: `正在查阅 Meta API 文档: ${missingMethods.join(", ")}`,
-                            isProcessing: true,
-                        });
-
-                        const pass1AssistantHistoryContent = assistantHistoryContent;
-                        if (pass1AssistantHistoryContent) {
-                            messages.pop();
-                        }
-                        messages.push({
-                            role: "user",
-                            content: buildMetaApiDocsMessage(missingMethods, fullDocs),
-                        });
-                        syncMetaCodeActState(sessionId, messages, turns, true);
-
-                        try {
-                            const pass2Response = await llmCaller(messages, llmConfigs, {
-                                caller: "meta-session-pass2",
-                                stop: [META_SANDBOX_OBSERVATION_MARKER],
-                                timeoutMs: config.llmTimeoutMs,
-                                ...(config.contextManifest ? { contextManifest: config.contextManifest } : {}),
-                            });
-
-                            assistantMessage = pass2Response.content.trim();
-                            parsed = parseMetaResponse(assistantMessage);
-                            hasEndTurn = assistantMessage.includes(END_TURN_MARKER);
-
-                            if (parsed.code && hasEndTurn) {
-                                log.info("Meta session pass2 response included code and end_turn; end_turn is ignored until a later pure-text turn", {
-                                    sessionId,
-                                    turn,
-                                });
-                            }
-
-                            turnRecord.assistantMessage = assistantMessage;
-                            turnRecord.thinking = parsed.thinking || undefined;
-                            turnRecord.code = parsed.code;
-                            turnRecord.usage = pass2Response.usage;
-
-                            const pass2AssistantHistoryContent = buildAssistantHistoryContent(assistantMessage);
-                            if (pass2AssistantHistoryContent) {
-                                messages.push({ role: "assistant", content: pass2AssistantHistoryContent });
-                            }
-                            syncMetaCodeActState(sessionId, messages, turns, true);
-                            emitMetaProgress(sessionId, {
-                                turn,
-                                phase: "thinking",
-                                thinking: parsed.thinking || undefined,
-                                codeBlocks: parsed.code ? [{ lang: "js", code: parsed.code }] : undefined,
-                                isProcessing: true,
-                            });
-                        } catch (error) {
-                            log.warn("Meta session pass2 LLM failed; falling back to pass1 code", {
-                                sessionId,
-                                turn,
-                                error: String(error),
-                            });
-                            messages.pop();
-                            if (pass1AssistantHistoryContent) {
-                                messages.push({ role: "assistant", content: pass1AssistantHistoryContent });
-                            }
-                            syncMetaCodeActState(sessionId, messages, turns, true);
-                        }
-                    }
-                } else if (docLookupMethods.length > 0) {
-                    log.debug("Meta session API docs already in context; skipping Two-pass", {
-                        sessionId,
-                        turn,
-                        calledMethods,
-                    });
-                }
-            }
-
             if (!parsed.code) {
                 if (turn === 1) {
                     const observation = buildFirstNoCodeConfirmationObservation();
@@ -453,13 +362,52 @@ export async function runMetaSession(
             });
 
             const execution = await sandbox.execute(parsed.code, { timeoutMs: codeTimeout });
-            turnRecord.observation = execution.output;
-            messages.push({ role: "user", content: formatObservation(execution.output) });
+            let observationOutput = execution.output;
+
+            if (execution.error && config.twoPassConfig) {
+                const calledMethods = extractApiCalls(parsed.code, config.twoPassConfig.getPrefixMap());
+                const docLookupMethods = getDocLookupMethods(calledMethods);
+                const missingMethods = docLookupMethods.filter((method) => !hasInjectedMethodDoc(messages, method));
+
+                if (missingMethods.length > 0) {
+                    const fullDocs = config.twoPassConfig.lookupDocs(missingMethods);
+                    if (fullDocs) {
+                        log.info("Meta session runtime error docs injected", {
+                            sessionId,
+                            turn,
+                            calledMethods,
+                            missingMethods,
+                            docsLength: fullDocs.length,
+                        });
+
+                        emitMetaProgress(sessionId, {
+                            turn,
+                            phase: "type_resolving",
+                            thinking: `运行时错误后查阅 Meta API d.ts 文档: ${missingMethods.join(", ")}`,
+                            isProcessing: true,
+                        });
+
+                        const docsMessage = buildMetaApiDocsMessage(missingMethods, fullDocs);
+                        observationOutput = observationOutput
+                            ? `${observationOutput}\n\n${docsMessage}`
+                            : docsMessage;
+                    }
+                } else if (docLookupMethods.length > 0) {
+                    log.debug("Meta session runtime error docs already in context; skipping injection", {
+                        sessionId,
+                        turn,
+                        calledMethods,
+                    });
+                }
+            }
+
+            turnRecord.observation = observationOutput;
+            messages.push({ role: "user", content: formatObservation(observationOutput) });
             syncMetaCodeActState(sessionId, messages, turns, true);
             emitMetaProgress(sessionId, {
                 turn,
                 phase: "observation",
-                executionOutput: execution.output,
+                executionOutput: observationOutput,
                 isProcessing: true,
             });
 
@@ -502,10 +450,10 @@ function hasInjectedMethodDoc(messages: ChatMessage[], method: string): boolean 
 }
 
 function buildMetaApiDocsMessage(missingMethods: string[], fullDocs: string): string {
-    return `[📚 Meta API 文档加载完成]
+    return `[📚 运行时错误后加载 Meta API d.ts 文档]
 
-你打算使用以下 Meta API: ${missingMethods.join(", ")}。
-以下是这些方法的完整类型定义和用法文档，请仔细阅读后重新输出一个 JS/TS 代码块。
+刚才的代码出现了运行时错误，并且用到了以下 Meta API: ${missingMethods.join(", ")}。
+以下是这些方法的完整类型定义和用法文档。请结合上面的错误信息修正代码；不要删除或改写前一条代码消息。
 
 ${fullDocs}
 

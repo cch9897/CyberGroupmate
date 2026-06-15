@@ -60,8 +60,9 @@ export interface ProcessedMedia {
 
 /** Sticker 描述缓存接口 */
 export interface StickerCache {
-    getStickerDescription(uniqueFileId: string): { description: string; emoji?: string; emojis?: string[] } | null;
-    setStickerDescription(uniqueFileId: string, description: string, emoji?: string | string[], enabled?: boolean): void;
+    getStickerDescription(uniqueFileId: string, contentHash?: string): { description: string; emoji?: string; emojis?: string[] } | null;
+    linkStickerContent?(uniqueFileId: string, contentHash: string): void;
+    setStickerDescription(uniqueFileId: string, description: string, emoji?: string | string[], enabled?: boolean, contentHash?: string): void;
 }
 
 /** 下载函数类型 */
@@ -105,6 +106,169 @@ export async function ensureSupportedFormat(
         // 降级：直接使用原始 buffer（多数 Vision API 支持 WebP）
         return { buffer, mimeType };
     }
+}
+
+// ─── 动态贴纸抽帧 ───
+
+/** 动态贴纸抽帧识别的默认帧数上限 */
+const DEFAULT_ANIMATED_STICKER_FRAMES = 3;
+const TGS_RENDER_SIZE = 512;
+
+/** 判断附件是否为动态贴纸（WebM 视频贴纸 / TGS 动画贴纸） */
+export function isAnimatedSticker(att: Pick<MediaAttachment, "mimeType" | "fileName">): boolean {
+    return att.mimeType === "video/webm"
+        || att.mimeType === "application/x-tgsticker"
+        || /\.tgs$/i.test(att.fileName ?? "");
+}
+
+/** 判断动态贴纸是否为 TGS（Lottie）格式 */
+function isTgsSticker(att: Pick<MediaAttachment, "mimeType" | "fileName">): boolean {
+    return att.mimeType === "application/x-tgsticker" || /\.tgs$/i.test(att.fileName ?? "");
+}
+
+/**
+ * 从动态贴纸中抽取关键帧（PNG）
+ *
+ * - WebM 视频贴纸：用 @napi-rs/webcodecs 解码后均匀采样
+ * - TGS 动画贴纸：用 @napi-rs/canvas LottieAnimation 渲染采样帧
+ *
+ * 抽出的帧按时间均匀采样至 maxFrames 张。
+ */
+export async function extractAnimatedStickerFrames(
+    rawBuffer: Buffer,
+    isTgs: boolean,
+    maxFrames: number,
+): Promise<Buffer[]> {
+    if (isTgs) {
+        return renderTgsStickerFrames(rawBuffer, maxFrames);
+    }
+    return renderWebmStickerFrames(rawBuffer, maxFrames);
+}
+
+/**
+ * TGS 动画贴纸抽帧：LottieAnimation (Skia Skottie) → 多帧 PNG
+ * 使用 @napi-rs/canvas 内置的 LottieAnimation，无需额外 WASM 依赖
+ */
+async function renderTgsStickerFrames(rawBuffer: Buffer, maxFrames: number): Promise<Buffer[]> {
+    const { createCanvas, LottieAnimation } = await import("@napi-rs/canvas");
+    const { gunzipSync } = await import("node:zlib");
+
+    const lottieJson = gunzipSync(rawBuffer).toString("utf-8");
+    const anim = LottieAnimation.loadFromData(lottieJson);
+    const totalFrames = Math.max(1, anim.frames);
+    const frameIndexes = sampleFrameIndexes(totalFrames, maxFrames);
+
+    const canvas = createCanvas(
+        anim.width || TGS_RENDER_SIZE,
+        anim.height || TGS_RENDER_SIZE,
+    );
+    const ctx = canvas.getContext("2d");
+
+    return frameIndexes.map((frame) => {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        anim.seekFrame(frame);
+        anim.render(ctx as any);
+        return Buffer.from(canvas.toBuffer("image/png"));
+    });
+}
+
+/**
+ * WebM 视频贴纸抽帧：WebCodecs 全量解码 → 采样 → PNG
+ * 先全量解码收集所有帧，再均匀采样，最后统一释放资源（无竞态）
+ */
+async function renderWebmStickerFrames(rawBuffer: Buffer, maxFrames: number): Promise<Buffer[]> {
+    const { createCanvas } = await import("@napi-rs/canvas");
+    const webcodecs = await import("@napi-rs/webcodecs");
+
+    type VF = InstanceType<typeof webcodecs.VideoFrame>;
+    const frames: VF[] = [];
+    let demuxError: Error | undefined;
+    let decodeError: Error | undefined;
+
+    const decoder = new webcodecs.VideoDecoder({
+        output: (frame) => frames.push(frame),
+        error: (error) => { decodeError = error; },
+    });
+    const demuxer = new webcodecs.WebMDemuxer({
+        videoOutput: (chunk) => decoder.decode(chunk),
+        error: (error) => { demuxError = error; },
+    });
+
+    try {
+        // 零拷贝视图，正确处理 Buffer 作为 ArrayBuffer 切片的情况
+        await demuxer.loadBuffer(new Uint8Array(rawBuffer.buffer, rawBuffer.byteOffset, rawBuffer.byteLength));
+        if (demuxError) throw demuxError;
+
+        const decoderConfig = demuxer.videoDecoderConfig;
+        if (!decoderConfig) {
+            throw new Error("WebM 动态贴纸没有可解码的视频轨道");
+        }
+
+        decoder.configure(decoderConfig);
+        await demuxer.demuxAsync();
+        if (demuxError) throw demuxError;
+
+        await decoder.flush();
+        if (decodeError) throw decodeError;
+        if (frames.length === 0) {
+            throw new Error("WebM 动态贴纸未解码出任何帧");
+        }
+
+        const picked = sampleFrameIndexes(frames.length, maxFrames);
+        const pngFrames: Buffer[] = [];
+        for (const idx of picked) {
+            const frame = frames[idx];
+            if (frame) pngFrames.push(await videoFrameToPng(frame, createCanvas));
+        }
+        return pngFrames;
+    } finally {
+        decoder.close();
+        demuxer.close();
+        for (const frame of frames) frame.close();
+    }
+}
+
+/** VideoFrame → PNG：使用 allocationSize 确保 buffer 大小正确 */
+async function videoFrameToPng(
+    frame: any,
+    createCanvas: (w: number, h: number) => any,
+): Promise<Buffer> {
+    const width: number = frame.displayWidth || frame.codedWidth;
+    const height: number = frame.displayHeight || frame.codedHeight;
+    const size: number = frame.allocationSize({ format: "RGBA" });
+    const rgba = new Uint8Array(size);
+    await frame.copyTo(rgba, { format: "RGBA" });
+    return rgbaToPng(rgba, width, height, createCanvas);
+}
+
+/** RGBA 像素数据 → PNG Buffer */
+function rgbaToPng(
+    rgba: Uint8Array,
+    width: number,
+    height: number,
+    createCanvas: (w: number, h: number) => any,
+): Buffer {
+    const canvas = createCanvas(width, height);
+    const ctx = canvas.getContext("2d");
+    const imgData = ctx.createImageData(width, height);
+    imgData.data.set(new Uint8ClampedArray(rgba.buffer, rgba.byteOffset, width * height * 4));
+    ctx.putImageData(imgData, 0, 0);
+    return Buffer.from(canvas.toBuffer("image/png"));
+}
+
+/** 从 totalFrames 帧中均匀采样 maxFrames 个帧索引 */
+export function sampleFrameIndexes(totalFrames: number, maxFrames: number): number[] {
+    const count = Math.min(maxFrames, totalFrames);
+    if (count <= 0) return [];
+    if (count === 1) return [0];
+    if (count === 2) return [0, Math.floor(totalFrames / 2)];
+
+    const picked: number[] = [];
+    for (let i = 0; i < count; i++) {
+        const idx = Math.round((i * (totalFrames - 1)) / (count - 1));
+        if (!picked.includes(idx)) picked.push(idx);
+    }
+    return picked;
 }
 
 /** 图片描述内存缓存（Path B）: uniqueFileId → description */
@@ -152,11 +316,7 @@ export async function processMediaBatch(
         if (att.type === "photo" || (att.type === "document" && att.mimeType?.startsWith("image/"))) {
             photos.push(att);
         } else if (att.type === "sticker") {
-            // 跳过动态贴纸（WebM 视频贴纸和 TGS 动画贴纸大模型无法直接识别）
-            if (att.mimeType === "video/webm" || att.mimeType === "application/x-tgsticker") {
-                log.debug("跳过动态贴纸", { uniqueFileId: att.uniqueFileId, mimeType: att.mimeType });
-                continue;
-            }
+            // Keep disabled animated stickers visible by letting processSingleSticker emit emoji fallback.
             stickers.push(att);
         } else if (att.type === "video" || att.type === "document" || att.type === "animation" || att.type === "audio" || att.type === "other") {
             downloadOnly.push(att);
@@ -505,28 +665,36 @@ async function processSingleSticker(
     imageCatalog?: ImageCatalog,
 ): Promise<ProcessedMedia> {
     const mode = config?.stickerMode ?? "emoji_only";
+    const animated = isAnimatedSticker(sticker);
+    const label = animated ? "动态贴纸" : "贴纸";
+    const maxFrames = config?.animatedStickerFrames ?? DEFAULT_ANIMATED_STICKER_FRAMES;
+    // A zero frame budget means dynamic stickers should stay visible without vision cost.
+    const animatedDisabled = animated && maxFrames <= 0;
 
-    // emoji_only 或无 vision 能力
-    if (mode === "emoji_only" || !hasVision || !downloadFn || !visionLlmConfigs?.length) {
-        return {
-            index: sticker.messageIndex,
-            description: sticker.emoji
-                ? `[🎭 贴纸: ${sticker.emoji}]`
-                : "[🎭 贴纸]",
-        };
-    }
-
-    // vision_cache: 查缓存
-    if (mode === "vision_cache" && stickerCache) {
+    // Disabled dynamic sticker vision should not reuse stale cached descriptions.
+    if (mode === "vision_cache" && stickerCache && !animatedDisabled) {
         const cached = stickerCache.getStickerDescription(sticker.uniqueFileId);
         if (cached) {
             log.debug("Sticker 缓存命中", { uniqueFileId: sticker.uniqueFileId });
             const emojiTag = formatEmojiTag(cached.emojis ?? cached.emoji ?? sticker.emoji);
             return {
                 index: sticker.messageIndex,
-                description: `[🎭 贴纸${emojiTag}: ${cached.description}]`,
+                description: `[🎭 ${label}${emojiTag}: ${cached.description}]`,
             };
         }
+    }
+
+    // Fall back before downloading when vision is unavailable or explicitly disabled.
+    if (mode === "emoji_only" || animatedDisabled || !hasVision || !downloadFn || !visionLlmConfigs?.length) {
+        if (animatedDisabled) {
+            log.debug("动态贴纸 vision 识别已禁用，降级为 emoji", { uniqueFileId: sticker.uniqueFileId, mimeType: sticker.mimeType });
+        }
+        return {
+            index: sticker.messageIndex,
+            description: sticker.emoji
+                ? `[🎭 ${label}: ${sticker.emoji}]`
+                : `[🎭 ${label}]`,
+        };
     }
 
     // vision_each 或 vision_cache miss: 下载+识别
@@ -534,37 +702,65 @@ async function processSingleSticker(
         const rawBuffer = await downloadFn(sticker.fileId, sticker.chatId, sticker.messageId, sticker.uniqueFileId);
 
         // 保存贴纸原始文件到磁盘（用于后续发送）
+        let savedSticker: ReturnType<MediaDownloader["saveMedia"]> | null = null;
         if (mediaDownloader) {
-            mediaDownloader.saveMedia(Buffer.from(rawBuffer), {
+            savedSticker = mediaDownloader.saveMedia(Buffer.from(rawBuffer), {
                 chatId: sticker.chatId,
                 messageId: sticker.messageId,
                 uniqueFileId: sticker.uniqueFileId,
                 mediaType: "sticker",
                 mimeType: sticker.mimeType ?? "image/webp",
+                fileName: sticker.fileName,
             });
         }
+        const contentHash = savedSticker?.contentHash;
 
-        const { buffer: stickerBuf, mimeType: mime } = await ensureSupportedFormat(rawBuffer, sticker.mimeType ?? "image/webp");
-        const result = await describeSticker(stickerBuf, mime, visionLlmConfigs, sticker.emoji);
+        if (mode === "vision_cache" && stickerCache && contentHash) {
+            stickerCache.linkStickerContent?.(sticker.uniqueFileId, contentHash);
+            const cached = stickerCache.getStickerDescription(sticker.uniqueFileId, contentHash);
+            if (cached) {
+                log.debug("Sticker 内容缓存命中", { uniqueFileId: sticker.uniqueFileId, contentHash });
+                const emojiTag = formatEmojiTag(cached.emojis ?? cached.emoji ?? sticker.emoji);
+                return {
+                    index: sticker.messageIndex,
+                    description: `[🎭 ${label}${emojiTag}: ${cached.description}]`,
+                };
+            }
+        }
+
+        // 动态贴纸：抽帧后多帧识别；静态贴纸：单图识别
+        let frames: Array<{ buffer: Buffer; mimeType: string }>;
+        if (animated) {
+            // The WebM renderer already respects Buffer slices, so avoid copying sticker payloads.
+            frames = (await extractAnimatedStickerFrames(
+                rawBuffer,
+                isTgsSticker(sticker),
+                maxFrames,
+            )).map((buffer) => ({ buffer, mimeType: "image/png" }));
+        } else {
+            const { buffer, mimeType } = await ensureSupportedFormat(rawBuffer, sticker.mimeType ?? "image/webp");
+            frames = [{ buffer, mimeType }];
+        }
+        const result = await describeSticker(frames, animated, visionLlmConfigs, sticker.emoji);
 
         // 写入缓存 (vision_cache mode)
         if (mode === "vision_cache" && stickerCache) {
             const newDefault = config?.newStickerDefault !== "disabled";
-            stickerCache.setStickerDescription(sticker.uniqueFileId, result.description, result.emojis, newDefault);
+            stickerCache.setStickerDescription(sticker.uniqueFileId, result.description, result.emojis, newDefault, contentHash);
         }
 
         const emojiTag = formatEmojiTag(result.emojis.length > 0 ? result.emojis : (result.emoji ?? sticker.emoji));
         return {
             index: sticker.messageIndex,
-            description: `[🎭 贴纸${emojiTag}: ${result.description}]`,
+            description: `[🎭 ${label}${emojiTag}: ${result.description}]`,
         };
     } catch (err) {
-        log.warn("Sticker 识别失败，降级为 emoji", { uniqueFileId: sticker.uniqueFileId, error: String(err) });
+        log.warn("Sticker 识别失败，降级为 emoji", { uniqueFileId: sticker.uniqueFileId, animated, error: String(err) });
         return {
             index: sticker.messageIndex,
             description: sticker.emoji
-                ? `[🎭 贴纸: ${sticker.emoji}]`
-                : "[🎭 贴纸]",
+                ? `[🎭 ${label}: ${sticker.emoji}]`
+                : `[🎭 ${label}]`,
         };
     }
 }
@@ -594,53 +790,75 @@ export async function describeImage(
 
 /**
  * 调用 Vision LLM 描述 Sticker，返回描述 + 多个 emoji 候选
+ *
+ * 静态贴纸传单帧；动态贴纸传按时间顺序抽取的多帧
  */
 async function describeSticker(
-    stickerBuffer: Buffer,
-    mimeType: string,
+    frames: Array<{ buffer: Buffer; mimeType: string }>,
+    animated: boolean,
     visionConfigs: LLMConfig[],
     emoji?: string,
 ): Promise<{ description: string; emoji?: string; emojis: string[] }> {
-    const b64 = stickerBuffer.toString("base64");
-    const dataUri = `data:${mimeType};base64,${b64}`;
+    const imageParts = frames.map(({ buffer, mimeType }) => ({
+        url: `data:${mimeType};base64,${buffer.toString("base64")}`,
+    }));
 
     const emojiHint = emoji ? `（这个贴纸的原始 emoji 是 ${emoji}）` : "";
+    const intro = animated
+        ? `这是一个 Telegram 动态贴纸${emojiHint}，下面 ${imageParts.length} 张图片是从动画中采样的关键帧；先判断整体表情/动作/含义，不要默认写成前后状态变化。只有变化本身清晰可见且是贴纸核心含义时，才简短描述变化。`
+        : `这是一个 Telegram 贴纸图片${emojiHint}。`;
+    const describeHint = "用几个词简短描述贴纸表情/动作/含义。如果贴纸中有文字，结合图片内容理解并描述文字的完整内容。";
     const messages: ChatMessage[] = [
         {
             role: "user",
-            content: `这是一个 Telegram 贴纸图片${emojiHint}。
+            content: `${intro}
 
 请你：
-1. 用几个词简短描述贴纸表情/动作/含义。如果贴纸中有文字，结合图片内容理解并描述文字的完整内容。
+1. ${describeHint}
 2. 生成多个可用于匹配这个贴纸含义的 emoji 候选，输出为数组。候选数量无上限，但至少 2 个；包含主要情绪、近义情绪、动作/语气相关 emoji。若原始 emoji 合理，也应放入数组。
 
 请用以下 JSON 格式回复（仅返回 JSON，不要包含其他内容）：
 {"description": "描述内容", "emojis": ["emoji1", "emoji2", "..."]}`,
-            imageParts: [{ url: dataUri }],
+            imageParts,
         },
     ];
 
     const response = await callLLMWithFallback(messages, visionConfigs, { caller: "vision" });
     const raw = response.content.trim();
 
-    // 尝试解析 JSON
-    try {
-        const jsonStr = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
-        const parsed = JSON.parse(jsonStr);
+    // 尝试解析 JSON（先直接解析，失败再从文本中抽取 {...} 片段救一把）
+    const parsed = parseStickerJson(raw);
+    const description = typeof parsed?.description === "string" ? parsed.description.trim() : "";
+    if (parsed && description) {
         const emojis = normalizeEmojiCandidates(parsed.emojis ?? parsed.emoji, emoji);
         return {
-            description: normalizeVisionDescription(String(parsed.description ?? raw)),
+            description: normalizeVisionDescription(description),
             emoji: emojis[0] ?? (typeof parsed.emoji === "string" ? parsed.emoji : undefined),
             emojis,
         };
-    } catch {
-        log.debug("describeSticker: JSON 解析失败，使用原始文本", { raw: raw.slice(0, 100) });
-        return {
-            description: normalizeVisionDescription(raw),
-            emoji,
-            emojis: normalizeEmojiCandidates(undefined, emoji),
-        };
     }
+
+    // 解析不出结构化描述：绝不能把整段回复当成贴纸描述（否则模型的解释/拒答/报错
+    // 都会被写进贴纸库）。抛错让上层降级为 emoji-only，并且本次不写缓存。
+    log.warn("describeSticker: 无法解析贴纸描述 JSON，降级为 emoji-only", { raw: raw.slice(0, 120) });
+    throw new Error("describeSticker: 贴纸描述 JSON 无法解析");
+}
+
+/** 解析贴纸描述 LLM 回复：先整体解析，失败再抽取首个 {...} 片段重试。失败返回 null。 */
+function parseStickerJson(raw: string): { description?: unknown; emoji?: unknown; emojis?: unknown } | null {
+    const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+    const candidates = [cleaned];
+    const objMatch = cleaned.match(/\{[\s\S]*\}/);
+    if (objMatch && objMatch[0] !== cleaned) candidates.push(objMatch[0]);
+    for (const candidate of candidates) {
+        try {
+            const parsed = JSON.parse(candidate);
+            if (parsed && typeof parsed === "object") {
+                return parsed as { description?: unknown; emoji?: unknown; emojis?: unknown };
+            }
+        } catch { /* 尝试下一个候选 */ }
+    }
+    return null;
 }
 
 function normalizeEmojiCandidates(value: unknown, fallback?: string): string[] {

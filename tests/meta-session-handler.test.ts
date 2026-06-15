@@ -226,7 +226,9 @@ describe("createMetaSessionHandler", () => {
         assert.doesNotMatch(currentPrompt, /## 话题注册表增量/);
         assert.doesNotMatch(currentPrompt, /## 活跃参与者 \(更新\)/);
         assert.match(currentPrompt, /# 注意力切换:/);
-        assert.match(currentPrompt, /## 聊天画像/);
+        // meta.group_model 自 commit 4324688 起改为 delta-only 增量 provider：
+        // 第二轮 group model 未变化时不再重复渲染聊天画像（与上方 messages/topics/profiles 一致）。
+        assert.doesNotMatch(currentPrompt, /## 聊天画像/);
         assert.match(currentPrompt, /## 当前注意力元数据/);
         assert.equal(dispatchProfileSnapshots[0]?.[0]?.[0], "telegram:g1");
         assert.equal((dispatchProfileSnapshots[0]?.[0]?.[1]?.[0] as any)?.userId, "telegram:u1");
@@ -441,7 +443,9 @@ describe("createMetaSessionHandler", () => {
         assert.match(persistedPrompt.content, /## 话题注册表/);
         assert.match(persistedPrompt.content, /## 新消息/);
         assert.doesNotMatch(persistedPrompt.content, /## 当前注意力元数据/);
-        assert.doesNotMatch(persistedPrompt.content, /## 聊天画像/);
+        // meta.group_model 自 commit 4324688 起加入 META_HISTORY_SECTION_ALLOWLIST，
+        // 聊天画像（首轮以全量增量形式 ## 聊天画像增量）现会随历史一同持久化。
+        assert.match(persistedPrompt.content, /## 聊天画像/);
         assert.doesNotMatch(persistedPrompt.content, /请检查是否需要跨群检索/);
 
         await createHandler()([entry], []);

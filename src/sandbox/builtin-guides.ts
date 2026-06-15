@@ -2,8 +2,9 @@
  * builtin-guides.ts — 内置能力指南注册表
  *
  * 这些指南属于框架/内置模块，不来自 workspace/skills。
- * 它们用于 progressive disclosure：Pass 1 只暴露 useXxx() 入口，
- * Pass 2 按需注入完整指南。
+ * 它们用于 progressive disclosure：轻量 prompt 只暴露 useXxx() 入口，
+ * Agent 可以直接执行 useXxx() 让指南进入 observation；若调用相关 API 报错，
+ * session-runner 也能按需注入完整指南。
  */
 
 import { readFileSync } from "node:fs";

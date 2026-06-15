@@ -23,12 +23,12 @@ telegram.sendText: 发送文本消息到指定频道
 ```
 由于这些定义极其轻量，它即便挂载了几十个 Skills，也不会占用系统太多的 Token，保证了 LLM 依然保持敏锐的核心逻辑思考能力。
 
-### Pass 2：按需索取，精准滴灌 (The "Detailed" Pass)
-当 LLM 准备采取行动，生成了如 `await github.listIssues(...)` 的代码时，Sandbox 并不会立刻执行。
-我们的 **API Intent Extractor** 会利用AST静态扫描 LLM 刚刚写下的代码，提取出它意图调用的原生能力。
+### 运行时错误后：按需索取，精准滴灌 (Runtime Recovery)
+当 LLM 准备采取行动，生成了如 `await github.listIssues(...)` 的代码时，Sandbox 会先按原样执行。
+如果代码成功运行，系统不额外注入完整文档，避免把上下文撑大。
 
-如果意图命中了一些复杂的模块（如 `github`），系统会触发 **Pass 2**：
-动态读取这几个具体方法的**完整类型定义（包含详尽的 JSDoc、多行说明、具体参数和示例）**，注入给 LLM，并**直接丢弃/撤销它刚刚盲写的第一轮代码（相当于从历史 N-1 处 fork 了一份消息记录）**。带上完整的“说明书”后，让 LLM 重新生成一次代码。
+只有当代码出现运行时错误时，我们的 **API Intent Extractor** 才会扫描刚刚执行失败的代码，提取其中调用的原生能力。
+如果命中了一些复杂模块（如 `github`），系统会动态读取这些具体方法的**完整类型定义（包含详尽的 JSDoc、多行说明、具体参数和示例）**，作为新的 observation 追加给 LLM。此时**不会删除或撤销上一条 assistant/code 消息**，模型会同时看到原代码、运行时错误和完整“说明书”，再自行修正下一轮代码。
 
 **为什么是最优雅的意图推测？**
 作为底层框架，推测一个 Agent “当前需要什么文档”往往是个难题。传统的做法可能需要前置一个额外的 Router 模型去猜测，或者使用向量检索（RAG）。但在 CodeAct 架构中，最优雅的推测方式就是**让她先发散思维去“盲写代码”**。
@@ -36,7 +36,7 @@ telegram.sendText: 发送文本消息到指定频道
 
 ### 记忆去重与压缩自适应 (Stateless Deduplication & Context Compaction)
 LLM 的交互是在多轮流式对话中进行的：
-- **无状态去重**：每次触发 Pass 2 时，系统会向前追溯历史消息（Messages History）。只要上下文中**已有**这本“说明书”（带有 `### module.method` 等标记），就不会重复注入，避免对话被反复出现的文档撑爆。
+- **无状态去重**：每次运行时错误后准备注入文档时，系统会向前追溯历史消息（Messages History）。只要上下文中**已有**这本“说明书”（带有 `### module.method` 等标记），就不会重复注入，避免对话被反复出现的文档撑爆。
 - **与 Session Compaction 的完美契合**：如果对话过长，旧的文档被上下文截断（Compact）清理掉了怎么办？无需担心！我们的检测机制是**基于当前可见上下文**的。一旦 LLM 的“认知”里失去了这块文档，而它又要调用该方法时，机制会自动补发一次缺失的说明，实现真正的随需取用。
 
 ---
@@ -55,9 +55,9 @@ LLM 的交互是在多轮流式对话中进行的：
 ## 架构优势总结 (Benefits)
 
 1. **零封装成本 (Zero-wrapping cost)**：再也不用痛苦地把原本一个原生函数调用就能解决的事情，费尽心思地转化为各种复杂的 OpenAI JSON Schema Formats（还要维护巨大的参数映射层）。会写 TypeScript 就会写 Tool。
-2. **无限可扩展性 (Infinite Scalability)**：利用“轻量概览 + 按需详述”机制，我们打破了 System Prompt 的长度魔咒。理论上你可以挂载几百个微小而具体的 Skills，LLM 只会在真正需要调用那个模块时，才去索要该模块的详细地图。
+2. **无限可扩展性 (Infinite Scalability)**：利用“轻量概览 + 错误后按需详述”机制，我们打破了 System Prompt 的长度魔咒。理论上你可以挂载几百个微小而具体的 Skills，LLM 只会在真正调用失败、需要修正时，才获得那个模块的详细地图。
 3. **安全与隔离并存 (Safety & Isolation)**：Host 进程仅做纯文本的静态AST分析（绝不会意外 `require` 恶意模块），所有的 npm 模块实例和真正的代码执行都被限定在安全隔离的 Sandbox Worker 内运作。
-4. **像真实程序员一样的工作流 (Human-like Workflow)**：这极度贴近真实程序员的工作状态——面对庞大的不知名 SDK，先通过 IDE 的智能提示看个函数名和短述（Pass 1 引导阶段）；如果真的要写复杂调用，再去悬停展开查看详细的 JSDoc，查阅完整的出入参和示例代码（Pass 2 请求阶段）；确保无误后书写执行。
+4. **像真实程序员一样的工作流 (Human-like Workflow)**：这极度贴近真实程序员的工作状态——面对庞大的不知名 SDK，先通过 IDE 的智能提示看个函数名和短述直接尝试；如果运行时报错，再查看详细的 JSDoc、完整出入参和示例代码，然后修正下一版。
 
 **“Stop teaching LLMs how to parse your JSON tool definitions. Let them write executable code and read JSDoc instead.”**
 
@@ -65,13 +65,13 @@ LLM 的交互是在多轮流式对话中进行的：
 
 
 
-## 实战解读：一次真实的 Pass 1 → Pass 2 流程
+## 实战解读：一次真实的轻量尝试 → 错误后补文档流程
 
 以下基于一次真实的群聊回复任务，展示渐进式披露机制如何在实际对话中运作。
 
 ---
 
-### Pass 1：Agent 只看到"目录"
+### 第 1 轮：Agent 只看到"目录"
 
 在 System Prompt 的 `# 可用 API` 区域，Agent 看到的 `tavily` 模块仅有两行：
 
@@ -99,25 +99,25 @@ console.log("搜索结果:", JSON.stringify(searchResults, null, 2));
 
 ### Intent Extraction：Host 静态扫描意图
 
-代码**不会被立即执行**。Host 进程用正则扫描这段代码，提取出 API 调用意图：
+代码会先按原样执行。如果出现运行时错误，Host 进程再用正则扫描这段失败代码，提取出 API 调用意图：
 
 ```
 检测到意图: tavily.search
 ```
 
-系统判断 `tavily` 是一个需要详细文档的复杂模块，触发 **Pass 2**。
+系统判断 `tavily` 是一个需要详细文档的复杂模块，于是在错误 observation 中追加完整文档。
 
 ---
 
-### Pass 2：精准注入"说明书"，重新生成
+### 错误后：精准注入"说明书"，下一轮修正
 
-系统动态读取 `tavily.d.ts` 中 `search` 方法的**完整类型定义**，将其注入为一条新的 User Message，同时 **丢弃 Agent 刚才盲写的第一轮代码**（从历史 N-1 处 fork）：
+系统动态读取 `tavily.d.ts` 中 `search` 方法的**完整类型定义**，将其追加进包含运行时错误的 User Message；Agent 刚才写下的代码消息保留在历史里：
 
 ```
-[📚 API 文档加载完成]
+[📚 运行时错误后加载 API d.ts 文档]
 
-你打算使用以下 API: tavily.search。
-以下是这些方法的完整类型定义和用法文档，请仔细阅读后编写代码：
+刚才的代码出现了运行时错误，并且用到了以下 API: tavily.search。
+以下是这些方法的完整类型定义和用法文档。请结合上面的错误信息修正代码：
 
 ### tavily.search
 search(
@@ -154,18 +154,18 @@ const searchResult = await tavily.search(
 console.log("搜索结果:", JSON.stringify(searchResult, null, 2));
 ```
 
-对比两次输出：Pass 2 的代码利用了文档中新获知的 `searchDepth: "advanced"` 参数，生成了更精确的调用。
+对比两次输出：修正版代码利用了文档中新获知的 `searchDepth: "advanced"` 参数，生成了更精确的调用。
 
 ---
 
 ### 流程对比一览
 
-| | Pass 1（盲写） | Pass 2（精写） |
+| | 初次尝试（轻量概览） | 错误后修正（完整文档） |
 |---|---|---|
-| **Agent 可见信息** | `search: 搜索网页内容。`（单行） | 完整签名 + JSDoc + 示例 + 返回类型 |
+| **Agent 可见信息** | `search: 搜索网页内容。`（单行） | 运行时错误 + 原代码 + 完整签名 + JSDoc + 示例 + 返回类型 |
 | **Token 开销** | 极低（所有模块概览 ~数百 Token） | 仅注入被调用方法的文档（~数百 Token） |
-| **代码质量** | 能跑但粗糙，缺少可选参数 | 参数精准、符合最佳实践 |
-| **是否执行** | ❌ 拦截，不执行 | ✅ 送入 Sandbox 执行 |
+| **代码质量** | 先试，可能因参数理解不足报错 | 参数精准、符合最佳实践 |
+| **是否执行** | ✅ 先送入 Sandbox 执行 | ✅ 下一轮修正后再执行 |
 
 ---
 

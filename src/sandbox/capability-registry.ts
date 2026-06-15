@@ -10,6 +10,7 @@ import { installSkills } from "./modules/skills/index.js";
 import { createTelegramClientProxy } from "./modules/telegram/index.js";
 import { createDiscordClientProxy } from "./modules/discord/index.js";
 import { createOneBotClientProxy } from "./modules/onebot/index.js";
+import { DEFAULT_BANNED_WORDS } from "../core/banned-words.js";
 
 // ─── 环境接口 ───
 
@@ -36,6 +37,9 @@ let currentPlatform: string = "telegram";
 /** 当前 worker 是否启用重复发送拦截。默认开启。 */
 let currentDeduplicateSentMessages = true;
 
+/** 当前 worker 的禁用词列表。默认使用内置词表。 */
+let currentBannedWords: string[] = DEFAULT_BANNED_WORDS;
+
 /** 设置当前平台（由 sandbox-worker 调用） */
 export function setPlatform(platform: string): void {
     currentPlatform = platform;
@@ -44,6 +48,11 @@ export function setPlatform(platform: string): void {
 /** 设置重复发送拦截开关（由 sandbox-worker 调用）。 */
 export function setDuplicateMessageBlocking(enabled: boolean): void {
     currentDeduplicateSentMessages = enabled !== false;
+}
+
+/** 设置禁用词列表（由 sandbox-worker 调用）。传入空数组则禁用检查。 */
+export function setBannedWords(words: string[]): void {
+    currentBannedWords = Array.isArray(words) ? words : DEFAULT_BANNED_WORDS;
 }
 
 /** 获取当前平台（供 scene.ts 等内部模块使用） */
@@ -71,17 +80,17 @@ export function installCapabilityRegistry(env: CapabilityRegistryEnv): Record<st
     let onebot: unknown = undefined;
 
     if (platform === "discord") {
-        discord = createDiscordClientProxy(env, sentHistory, currentDeduplicateSentMessages);
+        discord = createDiscordClientProxy(env, sentHistory, currentDeduplicateSentMessages, currentBannedWords);
     } else if (platform === "onebot") {
-        onebot = createOneBotClientProxy(env, sentHistory, currentDeduplicateSentMessages);
+        onebot = createOneBotClientProxy(env, sentHistory, currentDeduplicateSentMessages, currentBannedWords);
     } else {
         // 默认 telegram（向后兼容）
-        telegram = createTelegramClientProxy(env, sentHistory, currentDeduplicateSentMessages);
+        telegram = createTelegramClientProxy(env, sentHistory, currentDeduplicateSentMessages, currentBannedWords);
     }
 
     return {
         runtime: installRuntime(env),
-        skills: installSkills(env, sentHistory, currentDeduplicateSentMessages),
+        skills: installSkills(env, sentHistory, currentDeduplicateSentMessages, currentBannedWords),
         telegram,
         discord,
         onebot,

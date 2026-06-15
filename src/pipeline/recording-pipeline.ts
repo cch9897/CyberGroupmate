@@ -17,13 +17,20 @@
 import { EventEmitter } from "node:events";
 import { createLogger } from "../core/logger.js";
 import { callLLMWithFallback, type ChatMessage } from "../core/llm.js";
-import { resolveComponentProfiles, resolveComponentTimeout } from "../core/config.js";
+import { loadConfig, resolveComponentProfiles, resolveComponentTimeout, type LLMConfig, type VisionConfig } from "../core/config.js";
 import { topicClusteringProvider, topicTriageProvider } from "../context-engine/providers/pipeline-providers.js";
-import type { MemoryStoreV2 } from "../memory-v2/index.js";
+import type { MemoryStoreV2, RecentMessageEntry } from "../memory-v2/index.js";
 import { embed } from "../memory-v2/embedding.js";
 import type { EmbeddingConfig } from "../core/config.js";
 import type { TopicRegistry } from "./topic-registry.js";
 import { getRawId, getGroupModelKey, getDunbarTierLabel, ensureCompositeId, getPlatform } from "../core/chat-id.js";
+import {
+    enrichMessages,
+    formatMessageLine,
+    normalizeMessageMediaFields,
+    type RawMessage,
+    type StickerDescriptionLookup,
+} from "../core/message-enricher.js";
 import type {
     Message,
     TopicClusteringResult,
@@ -36,6 +43,17 @@ import { buildTopicSignalEntries, type TopicSignalEntry } from "./topic-signal.j
 import type { StickinessLevel } from "../subagent/types.js";
 
 const log = createLogger("recording-pipeline");
+
+interface RecordingMessageContext {
+    formattedText: string;
+    formattedMessagesById: Map<string, string>;
+}
+
+interface RecordingEnrichConfig {
+    llmConfig: LLMConfig;
+    visionConfig?: VisionConfig;
+    visionLlmConfig?: LLMConfig[];
+}
 
 // ─── 默认值 ───
 
@@ -203,8 +221,9 @@ export class RecordingPipeline extends EventEmitter {
 
             for (const [chatId, chatMessages] of groupedByChat) {
                 const existingTopics = this.registry.getByChat(chatId);
+                const messageContext = await this.buildRecordingMessageContext(chatMessages, chatId);
 
-                const clustering = await this.llmTopicClustering(chatMessages, existingTopics);
+                const clustering = await this.llmTopicClustering(chatMessages, existingTopics, messageContext);
 
                 // 聚类返回空结果时，消息累积回 buffer 等待下轮 flush，不浪费 triage 调用
                 if (clustering.assignments.length === 0) {
@@ -219,7 +238,7 @@ export class RecordingPipeline extends EventEmitter {
                 // ─── Step 2: 摘要 + Triage（clusterOnly 模式跳过）───
                 const triageResult = clusterOnly
                     ? { topics: [] } as TopicSummaryTriageResult
-                    : await this.llmTopicSummaryTriage(chatMessages, clustering, chatId);
+                    : await this.llmTopicSummaryTriage(chatMessages, clustering, chatId, messageContext);
 
                 // ─── Step 3: 更新 TopicRegistry ───
                 const {
@@ -227,7 +246,7 @@ export class RecordingPipeline extends EventEmitter {
                     signalReadyTopics,
                     clusterIdMap,
                     topicMessagesById,
-                } = this.updateRegistry(chatId, chatMessages, clustering, triageResult);
+                } = this.updateRegistry(chatId, chatMessages, clustering, triageResult, messageContext.formattedMessagesById);
 
                 // ─── Step 4: Memory V2 写入 ───
                 if (this.memory) {
@@ -375,7 +394,8 @@ export class RecordingPipeline extends EventEmitter {
      */
     private async llmTopicClustering(
         messages: Message[],
-        existingTopics: Topic[]
+        existingTopics: Topic[],
+        messageContext?: RecordingMessageContext,
     ): Promise<TopicClusteringResult> {
         // 取最近 10 个话题（按活跃时间倒排），避免上下文过长
         const recentTopics = existingTopics
@@ -393,9 +413,8 @@ export class RecordingPipeline extends EventEmitter {
             }).join("\n")
             : "（暂无已有话题）";
 
-        const messagesStr = messages.map(m =>
-            `[${m.id}] ${m.senderName} (${new Date(m.timestamp).toLocaleTimeString()}): ${m.text}`
-        ).join("\n");
+        const messagesStr = messageContext?.formattedText
+            ?? (await this.buildRecordingMessageContext(messages, messages[0]?.chatId ?? "")).formattedText;
 
         const prompt = topicClusteringProvider.render({
             existingTopics: existingTopicsStr,
@@ -437,7 +456,8 @@ export class RecordingPipeline extends EventEmitter {
     private async llmTopicSummaryTriage(
         messages: Message[],
         clustering: TopicClusteringResult,
-        chatId: string
+        chatId: string,
+        messageContext?: RecordingMessageContext,
     ): Promise<TopicSummaryTriageResult> {
         // 按话题分组本批次消息
         const topicGroups = new Map<string, Message[]>();
@@ -451,7 +471,12 @@ export class RecordingPipeline extends EventEmitter {
 
         // 构建每个话题的上下文字符串
         const allTopicIds = Array.from(topicGroups.keys());
-        const topicMessagesStr = this.buildTopicContextStr(allTopicIds, topicGroups, clustering);
+        const topicMessagesStr = this.buildTopicContextStr(
+            allTopicIds,
+            topicGroups,
+            clustering,
+            messageContext?.formattedMessagesById,
+        );
 
         const prompt = topicTriageProvider.render({
             personaName: this.personaName,
@@ -497,7 +522,12 @@ export class RecordingPipeline extends EventEmitter {
             });
 
             // 只对缺失的话题重跑一次
-            const retryStr = this.buildTopicContextStr(missingIds, topicGroups, clustering);
+            const retryStr = this.buildTopicContextStr(
+                missingIds,
+                topicGroups,
+                clustering,
+                messageContext?.formattedMessagesById,
+            );
             const retryPrompt = topicTriageProvider.render({
                 personaName: this.personaName,
                 persona: this.personaDescription,
@@ -532,6 +562,156 @@ export class RecordingPipeline extends EventEmitter {
         return result;
     }
 
+    private async buildRecordingMessageContext(messages: Message[], chatId: string): Promise<RecordingMessageContext> {
+        const stickerDescriptionLookup = this.getStickerDescriptionLookup();
+        const rawMessages = this.buildRecordingRawMessages(messages, chatId);
+        const enrichConfig = this.resolveRecordingEnrichConfig();
+        const enriched = await enrichMessages(rawMessages, {
+            llmConfig: enrichConfig.llmConfig,
+            visionConfig: enrichConfig.visionConfig,
+            visionLlmConfig: enrichConfig.visionLlmConfig,
+            chatId,
+            stickerDescriptionLookup,
+            enableMediaProcessing: false,
+            enableMediaDownload: false,
+            enableOgPreview: false,
+        });
+        const formattedMessagesById = new Map<string, string>();
+        for (const raw of rawMessages) {
+            if (!raw.id) continue;
+            formattedMessagesById.set(raw.id, formatMessageLine(raw, {
+                includeMediaTags: true,
+                stickerDescriptionLookup,
+            }));
+        }
+        return {
+            formattedText: enriched.formattedText,
+            formattedMessagesById,
+        };
+    }
+
+    private resolveRecordingEnrichConfig(): RecordingEnrichConfig {
+        const config = loadConfig();
+        const llmConfig = resolveComponentProfiles("recording_cluster", config)[0];
+        if (!llmConfig) {
+            throw new Error("No LLM profile configured for recording_cluster");
+        }
+        return {
+            llmConfig,
+            visionConfig: config.vision,
+            visionLlmConfig: config.llmRouting.vision
+                ? resolveComponentProfiles("vision", config)
+                : undefined,
+        };
+    }
+
+    private buildRecordingRawMessages(messages: Message[], chatId: string): RawMessage[] {
+        const batchById = new Map(messages.map((message) => [message.id, message]));
+        const missingReplyIds = [...new Set(messages
+            .map((message) => message.replyToMessageId)
+            .filter((messageId): messageId is string => !!messageId && !batchById.has(messageId))
+        )];
+        const memoryReplies = new Map<string, RecentMessageEntry>();
+
+        if (this.memory && missingReplyIds.length > 0) {
+            try {
+                for (const entry of this.memory.getMessagesByIds(String(chatId), missingReplyIds)) {
+                    memoryReplies.set(entry.messageId, entry);
+                }
+            } catch (err) {
+                log.debug("recording 消息 reply 上下文读取失败", { chatId, error: String(err) });
+            }
+        }
+
+        return messages.map((message) => {
+            const replyId = message.replyToMessageId;
+            const batchReply = replyId ? batchById.get(replyId) : undefined;
+            const memoryReply = replyId && !batchReply ? memoryReplies.get(replyId) : undefined;
+            const replyRaw = batchReply
+                ? this.rawMessageFromPipelineMessage(batchReply)
+                : memoryReply
+                    ? this.rawMessageFromMemoryEntry(memoryReply)
+                    : undefined;
+            return this.rawMessageFromPipelineMessage(message, replyRaw);
+        });
+    }
+
+    private rawMessageFromPipelineMessage(message: Message, replyRaw?: RawMessage): RawMessage {
+        const normalized = normalizeMessageMediaFields(message.mediaInfo, message.text);
+        const replyToMsgId = message.replyToMessageId;
+        return {
+            id: message.id,
+            sender: message.senderName?.trim() || message.senderId || "unknown",
+            text: message.text,
+            timestamp: new Date(message.timestamp).toISOString(),
+            replyTo: replyToMsgId ? (replyRaw?.sender ?? `msg#${replyToMsgId}`) : undefined,
+            replyToMsgId,
+            replyToText: replyRaw ? this.formatReplyTargetText(replyRaw) : undefined,
+            mediaType: message.mediaType ?? normalized.mediaType,
+            mediaInfo: normalized.mediaInfo ?? message.mediaInfo,
+            chatId: message.chatId,
+        };
+    }
+
+    private rawMessageFromMemoryEntry(entry: RecentMessageEntry): RawMessage {
+        const normalized = normalizeMessageMediaFields(entry.mediaInfo, entry.text);
+        return {
+            id: entry.messageId,
+            sender: entry.displayName?.trim() || entry.userId || "unknown",
+            text: entry.text,
+            timestamp: entry.timestamp,
+            mediaType: entry.mediaType ?? normalized.mediaType,
+            mediaInfo: normalized.mediaInfo ?? entry.mediaInfo,
+            chatId: entry.chatId,
+        };
+    }
+
+    private formatReplyTargetText(raw: RawMessage): string | undefined {
+        const line = formatMessageLine({
+            ...raw,
+            sender: "reply_target",
+            replyTo: undefined,
+            replyToMsgId: undefined,
+            replyToText: undefined,
+        }, {
+            includeMediaTags: true,
+            stickerDescriptionLookup: this.getStickerDescriptionLookup(),
+        });
+        const marker = " reply_target: ";
+        const markerIndex = line.indexOf(marker);
+        const content = (markerIndex >= 0 ? line.slice(markerIndex + marker.length) : raw.text ?? "").trim();
+        return content || undefined;
+    }
+
+    private formatTopicMessageLines(messages: Message[], formattedMessagesById?: Map<string, string>): string {
+        return messages.map((message) => `  ${this.formatTopicContextLine(message, formattedMessagesById)}`).join("\n");
+    }
+
+    private formatTopicContextLine(message: Message, formattedMessagesById?: Map<string, string>): string {
+        const preformatted = formattedMessagesById?.get(message.id);
+        if (preformatted) return preformatted;
+        return formatMessageLine(this.rawMessageFromPipelineMessage(message), {
+            includeMediaTags: true,
+            stickerDescriptionLookup: this.getStickerDescriptionLookup(),
+        });
+    }
+
+    private applyEnrichedRecentContext(
+        topic: Topic,
+        contextLines: string[],
+        existingLines: string[] = [],
+        maxLines = 8,
+    ): void {
+        topic.recentContext = [...existingLines, ...contextLines].slice(-maxLines).join("\n");
+    }
+
+    private getStickerDescriptionLookup(): StickerDescriptionLookup | undefined {
+        if (!this.memory) return undefined;
+        return {
+            getStickerDescription: (uniqueFileId: string) => this.memory!.getStickerDescription(uniqueFileId),
+        };
+    }
+
     /**
      * 构建话题上下文字符串（供 Step 2 prompt 使用）
      *
@@ -541,11 +721,12 @@ export class RecordingPipeline extends EventEmitter {
     private buildTopicContextStr(
         topicIds: string[],
         topicGroups: Map<string, Message[]>,
-        clustering: TopicClusteringResult
+        clustering: TopicClusteringResult,
+        formattedMessagesById?: Map<string, string>,
     ): string {
         return topicIds.map(topicId => {
             const msgs = topicGroups.get(topicId) ?? [];
-            const newMsgLines = msgs.map(m => `  ${m.senderName}: ${m.text}`).join("\n");
+            const newMsgLines = this.formatTopicMessageLines(msgs, formattedMessagesById);
 
             // 尝试获取旧话题
             const topic = this.registry.get(topicId);
@@ -738,7 +919,8 @@ export class RecordingPipeline extends EventEmitter {
         chatId: string,
         messages: Message[],
         clustering: TopicClusteringResult,
-        triageResult: TopicSummaryTriageResult
+        triageResult: TopicSummaryTriageResult,
+        formattedMessagesById?: Map<string, string>,
     ): {
         topics: Topic[];
         signalReadyTopics: Topic[];
@@ -763,6 +945,7 @@ export class RecordingPipeline extends EventEmitter {
 
         for (const [topicId, topicMsgs] of topicMsgMap) {
             let topic: Topic | undefined;
+            const contextLines = topicMsgs.map((msg) => this.formatTopicContextLine(msg, formattedMessagesById));
 
             // 尝试获取已有话题
             topic = this.registry.get(topicId);
@@ -776,6 +959,7 @@ export class RecordingPipeline extends EventEmitter {
                 // 检查是否是流变
                 const evolution = clustering.evolutions.find(e => e.newTopicLabel === label);
                 topic = this.registry.create(chatId, label, keywords, topicMsgs, evolution?.parentTopicId);
+                this.applyEnrichedRecentContext(topic, contextLines, [], 5);
                 clusterIdMap.set(topic.id, topicId); // topic.id=真实ID, topicId=临时ID
 
                 if (evolution?.parentTopicId) {
@@ -783,7 +967,9 @@ export class RecordingPipeline extends EventEmitter {
                 }
             } else {
                 // 已有话题，追加消息
+                const existingContextLines = topic.recentContext ? topic.recentContext.split("\n") : [];
                 this.registry.addMessages(topicId, topicMsgs);
+                this.applyEnrichedRecentContext(topic, contextLines, existingContextLines, 8);
             }
 
             if (!topic) continue;

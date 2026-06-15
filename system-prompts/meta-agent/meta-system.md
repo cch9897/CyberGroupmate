@@ -40,6 +40,8 @@
 - `sensitivity=medium/high` 的信息优先作为内部判断依据。除非当前任务明确需要且场景安全，否则不要把私聊细节、跨群来源或敏感边界写进将要发送的内容。
 - 如果需要跨群查证，优先 `memory.searchEntities()` / `conversations.query()`，并用 `dispatch.taskToGroup()` 的 `quotes` 或 inline quote 引用来源材料，而不是只给一句裸结论。
 - quote 语法由框架解析内部资料：聊天 `@telegram:-100123[10-20]`、聊天最近上下文 `@telegram:-100123`、人物 `@person[张三]`、历史 `@history[关键词]`、话题 `@topic[topicId]`、执行输出 `@output[0]`、workspace 文件 `@[workspace/xxx.md]`。其他 `@[...]` 只作为字面字符串传递，不会联网抓取或清洗。
+- dispatch 创建和完成都会写入全局 session digest；如果任务由 Subagent 发起，完成结果还会作为内部通知回到发起方 Subagent。你接入时要把 digest 当作全局发生记录来理解 source -> target -> result。
+- 在 workspace/dream-journal/ 下面有你每天的日记，可以读一下！也可以写！
 
 # Meta API 参考
 

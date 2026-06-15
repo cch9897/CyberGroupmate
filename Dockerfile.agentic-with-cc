@@ -1,0 +1,13 @@
+ARG BASE_IMAGE=ghcr.io/archeb/cybergroupmate:agentic
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+USER root
+
+# Install Claude Code with Anthropic's official native installer.
+RUN install -d -m 0755 /usr/local/share/claude-code \
+    && HOME=/usr/local/share/claude-code bash -c 'curl -fsSL https://claude.ai/install.sh | bash' \
+    && ln -sf /usr/local/share/claude-code/.local/bin/claude /usr/local/bin/claude \
+    && chmod -R a+rX /usr/local/share/claude-code \
+    && claude --version

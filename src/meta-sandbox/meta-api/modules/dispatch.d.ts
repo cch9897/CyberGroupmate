@@ -53,6 +53,9 @@ interface DispatchTaskResult {
 interface DispatchedTaskStatus {
     taskId: string;
     chatId: string;
+    sourceType?: "meta" | "subagent";
+    sourceChatId?: string;
+    sourceTaskId?: string;
     contentDirection: string;
     toneGuidance?: string;
     quotes?: string[];
@@ -76,6 +79,7 @@ declare const dispatch: {
      *
      * chatId 必须使用注意力切换头部里的 composite chatId，例如 "telegram:-1001234567890"。
      * dispatch 会自动解析 quote 并注入 Subagent 的任务 prompt；已移除 taskSpec.context。
+     * dispatch 创建与完成都会写入全局 session digest；如果发起方是 Subagent，完成结果还会发回该 Subagent。
      * 当派发的是提问、跨群转述、等待群友回应或重要回复时，优先在同一次调用里填写 tracking。
      *
      * @param chatId 目标 composite chatId。

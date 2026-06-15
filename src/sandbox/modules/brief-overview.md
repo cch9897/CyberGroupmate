@@ -12,12 +12,13 @@ discord.d.ts — Discord 平台 API 系统注入的 Discord host proxy 接口。
 
 - `sendText`: 发送文本消息到指定频道。
 - `sendMedia`: 发送媒体消息（附件）到指定频道。支持 URL 和本地文件路径（支持绝对路径或基于 cwd 工作区的相对路径）。
+- `sendReaction`: 对指定消息添加表情反应。支持 Unicode emoji、自定义 emoji ID、name:id 或 Discord emoji mention 格式。
 - `sendTyping`: 在频道中显示 "正在输入..." 状态。
 
 ## dispatch
-dispatch.d.ts — Subagent 任务派发 API 当前 Subagent 可以把任务派发给另一个群/私聊绑定的 Subagent。 派发后目标 Subagent 会收到同一套 quote 解析后的任务上下文。
+dispatch.d.ts — Subagent 跨聊天会话派发 API 任何需要在其他聊天执行操作的场景都必须通过 dispatch 派发，由目标聊天的 Subagent 执行。 绝对禁止用平台 API（sendText / sendMedia 等）直接向非当前聊天发送消息。 派发后目标 Subagent 会收到同一套 quote 解析后的任务上下文。
 
-- `taskToGroup`: 向指定群组派发一个任务，由目标群的 Subagent 执行回复、reaction 或其他群内行动。 chatId 必须使用 composite chatId，例如 "telegram:-1001234567890"。 当前 Subagent 不能用 dispatch 给自己派任务；当前群内行动直接调用平台 API。 不要使用已废弃的 context 字段；需要搬运材料时写 quotes 或 inline quote。
+- `taskToGroup`: 向指定聊天派发一个任务，由目标聊天的 Subagent 在其绑定的聊天中执行。 这是跨聊天操作的唯一正确方式。绝对禁止用平台 API 直接向其他聊天发送消息。 chatId 必须使用 composite chatId，例如 "telegram:-1001234567890"。 当前 Subagent 不能用 dispatch 给自己派任务；当前聊天内行动直接调用平台 API。 目标任务完成后，结果会作为内部通知发回发起方 Subagent；全局 session digest 也会记录 source -> target -> result。
 - `getTask`: 查询已派发任务的状态与执行结果；不存在时返回 null。
 - `listTasks`: 列出已派发任务，可按 chatId/status 分页过滤。
 
@@ -26,6 +27,7 @@ filesystem.d.ts — 文件系统操作模块类型定义 所有路径操作限�
 
 - `readFile`: 读取文件内容。
 - `writeFile`: 写入文件。如果目标目录不存在会自动创建。
+- `writeFileBinary`: 以二进制模式写入文件（base64 字符串 → 二进制字节）。 **保存 Telegram 下载媒体时必须用这个方法**，不能用 writeFile()。 `telegram.downloadMedia()` / `telegram.downloadAsBuffer()` 返回的 `data.buffer` 是 base64 字符串； 若用 `fs.writeFile(path, data.buffer)` 写入，会把 base64 文本当 UTF-8 存储，导致图片/文件损坏。
 - `appendFile`: 追加写入文件。文件不存在时会自动创建。
 - `replace`: 按字符串查找并替换文件内容，类似 sed。 默认仅替换第一个匹配；传 all=true 可全量替换。
 - `patch`: 对文件应用 unified diff patch。 适合 agent 在读取带行号内容后做小范围修改。
@@ -108,6 +110,7 @@ shell.d.ts — 终端 Tab 管理模块 提供类似 tmux/terminal tabs 的多终
 - `listTabs`: 列出所有存活的终端 Tab 及其状态。
 - `detach`: 分离当前主终端到后台，并立刻获得一个全新的 default 终端。 当主终端被长时间运行的命令（如 `npm run dev`）阻塞时： 1. 当前 default 终端被重命名为 newTabId 并移入后台 2. 系统自动创建全新的 default 终端 3. 后续 ```bash``` 代码块将在新终端中执行
 - `read`: 读取指定终端的输出历史。 用于排查超时命令的残留输出，或查看后台服务日志。 默认读取 default 终端，可指定 tabId 读取后台终端。
+- `runBackground`: 短命令用 ```bash``` 阻塞拿输出；长任务才用本方法后台启动。立即返回 tabId，完成或超时时自动唤醒；不会 kill 进程。
 - `sendInput`: 向指定终端注入按键输入。 用于应对交互式 CLI 的确认提示（如 "Is this ok? (y/N)"）。 也可发送 Ctrl+C（"\x03"）来优雅地中断进程。
 - `kill`: 销毁指定终端中的所有进程并回收该 tab。 如果销毁的是 default 终端，会自动创建新的 default。
 - `cwd`: 获取当前主终端的工作目录。
@@ -133,6 +136,7 @@ telegram.d.ts — Telegram 平台 API 这是系统注入的 Telegram host proxy 
 - `useChatAdministration`: 加载群组/频道管理指南。用于建群建频道、成员权限、管理员、标题描述头像、慢速模式和内容保护等管理操作；调用本方法只披露指南。
 - `useInvites`: 加载邀请链接与入群请求指南。用于创建/编辑/撤销邀请链接、查看邀请成员、处理 join request 或预览邀请链接；调用本方法只披露指南。
 - `useForumTopics`: 加载论坛话题指南。用于确认群是否开启 Forum、列出话题或定位 topic id；调用本方法只披露相关 API。
+- `useMediaDownload`: 加载媒体下载指南。包含：1) 用 fs.writeFileBinary() 正确保存 base64 buffer 的方法；2) GIF/短视频抽帧分析时避免 60s 超时的策略（默认 4-6 帧、复用已有文件、先发进度）。遇到 downloadMedia 或 GIF 分析相关问题时调用。
 - `sendText`: 发送普通文本消息
 - `sendMedia`: 发送媒体消息。支持 URL 和本地文件路径（支持绝对路径或基于 cwd 工作区的相对路径）。
 - `sendFile`: 发送磁盘文件到聊天。支持绝对路径或基于 cwd 的相对路径。host 侧读取文件并上传。始终作为文件/文档发送。
@@ -152,7 +156,8 @@ telegram.d.ts — Telegram 平台 API 这是系统注入的 Telegram host proxy 
 - `getChatMembers`: 分页拉取群组成员列表
 - `getMessages`: 按消息 ID 精确获取一条或多条消息。（在别人回复或者提及某消息但是你看不见的时候，善用该函数爬楼获取上下文）
 - `getMessageReactions`: 主动拉取某条消息的表态（Reaction）汇总数据。
-- `downloadMedia`: 下载媒体文件的二进制数据。返回 base64 编码的 buffer 和文件大小。 需要传入通过 mediaInfo.fileId 获取的文件标识符。
+- `downloadMedia`: 下载媒体文件的二进制数据。返回 base64 编码的 buffer 和文件大小。 优先传入 msg.mediaInfo.fileId，不要把整个 msg.mediaInfo 当作 location 传入；也可以直接传 mtcute 返回的 Photo/FileLocation 等带 __mtcuteRef 的对象。
+- `downloadAsBuffer`: mtcute 原生 downloadAsBuffer 透传。返回值在 sandbox 中表示为 base64 buffer。 ⚠️ **重要**：此方法对 `location` 类型容错较低。 - ✅ 接受：fileId 字符串、带 `__mtcuteRef` 的 mtcute 原生对象（如 `getProfilePhotos` 返回的 photo 对象） - ❌ 不接受：`msg.mediaInfo`（普通 plain object，没有 `__mtcuteRef`）——会报 "Unknown object undefined" 大多数场景建议优先用 `downloadMedia`（容错更好），仅在需要 mtcute 原生对象时用此方法。
 - `joinChat`: 加入一个群聊或频道
 - `leaveChat`: 退出一个群聊或频道
 - `readHistory`: 将指定会话的所有未读消息标记为已读
