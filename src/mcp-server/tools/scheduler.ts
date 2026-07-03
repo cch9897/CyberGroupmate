@@ -45,6 +45,36 @@ export function registerSchedulerTools(mcp: McpServer, deps: McpServerDeps): voi
     );
 
     mcp.tool(
+        "reminder_update",
+        "Edit an existing one-time reminder. Changes take effect on the next scheduler check.",
+        {
+            id: z.string().describe("Reminder ID to edit"),
+            name: z.string().optional().describe("New reminder name"),
+            callback: z.string().optional().describe("New callback text"),
+            bindingId: z.string().optional().describe("New binding ID"),
+            triggerAt: z.string().optional().describe("New ISO timestamp to trigger at"),
+            delayMinutes: z.number().optional().describe("New delay in minutes from now"),
+        },
+        async ({ id, name, callback, bindingId, triggerAt, delayMinutes }) => {
+            const patch: {
+                name?: string;
+                callback?: string;
+                bindingId?: string;
+                triggerAt?: string;
+                delayMinutes?: number;
+            } = {};
+            if (name !== undefined) patch.name = name;
+            if (callback !== undefined) patch.callback = callback;
+            if (bindingId !== undefined) patch.bindingId = bindingId;
+            if (triggerAt !== undefined) patch.triggerAt = triggerAt;
+            if (delayMinutes !== undefined) patch.delayMinutes = delayMinutes;
+            const result = await deps.metaApi.remind.update(id, patch);
+            deps.globalState.save();
+            return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+        },
+    );
+
+    mcp.tool(
         "cron_list",
         "List all cron jobs, optionally filtered by binding ID.",
         {
@@ -67,6 +97,28 @@ export function registerSchedulerTools(mcp: McpServer, deps: McpServerDeps): voi
         },
         async ({ name, cronExpr, callback, bindingId }) => {
             const result = await deps.metaApi.cron.set({ name, cronExpr, callback, bindingId });
+            return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+        },
+    );
+
+    mcp.tool(
+        "cron_update",
+        "Edit an existing cron job. Changes take effect on the next scheduler check.",
+        {
+            id: z.string().describe("Cron job ID to edit"),
+            name: z.string().optional().describe("New cron job name"),
+            cronExpr: z.string().optional().describe("New cron expression"),
+            callback: z.string().optional().describe("New callback text"),
+            bindingId: z.string().optional().describe("New binding ID"),
+        },
+        async ({ id, name, cronExpr, callback, bindingId }) => {
+            const patch: { name?: string; cronExpr?: string; callback?: string; bindingId?: string } = {};
+            if (name !== undefined) patch.name = name;
+            if (cronExpr !== undefined) patch.cronExpr = cronExpr;
+            if (callback !== undefined) patch.callback = callback;
+            if (bindingId !== undefined) patch.bindingId = bindingId;
+            const result = await deps.metaApi.cron.update(id, patch);
+            deps.globalState.save();
             return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
         },
     );

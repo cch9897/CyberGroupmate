@@ -373,9 +373,14 @@ describe("Telegram builtin guides", () => {
         const adapter = new TelegramAdapter(makeConfig(), nc, async () => "", () => {}, async () => fakeClient);
         await adapter.start();
         const result = await adapter.handleCall("telegram.mtcute", ["updateProfile", { bio: "hello" }]) as any;
+        const direct = await adapter.handleCall("telegram.updateProfile", [{ bio: "direct" }]) as any;
 
-        assert.deepEqual(calls, [{ method: "updateProfile", params: { bio: "hello" } }]);
+        assert.deepEqual(calls, [
+            { method: "updateProfile", params: { bio: "hello" } },
+            { method: "updateProfile", params: { bio: "direct" } },
+        ]);
         assert.equal(result.bio, "hello");
+        assert.equal(direct.bio, "direct");
 
         await assert.rejects(
             () => adapter.handleCall("telegram.mtcute", ["signIn", {}]),

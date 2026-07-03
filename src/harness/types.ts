@@ -33,6 +33,13 @@ export interface HarnessLauncher {
 export interface HarnessNotify {
     content: string;
     source?: string;
+    actorId?: string;
+    runId?: string;
+    triggerReason?: string;
+    sourceChatId?: string;
+    sourceChatTitle?: string;
+    taskId?: string;
+    metadata?: Record<string, unknown>;
 }
 
 export type HarnessRunEventStream = "system" | "stdout" | "stderr";

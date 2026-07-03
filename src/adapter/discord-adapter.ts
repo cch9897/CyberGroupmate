@@ -369,6 +369,8 @@ export class DiscordAdapter implements PlatformAdapter {
 
     getWriteMethods(): string[] {
         return [
+            "discord.send",
+            "discord.createMessage",
             "discord.sendText",
             "discord.sendMedia",
             "discord.sendReaction",
@@ -389,6 +391,32 @@ export class DiscordAdapter implements PlatformAdapter {
         const callStart = Date.now();
         try {
             switch (method) {
+            case "discord.send":
+            case "discord.createMessage": {
+                const target = this.parseTarget(this.stripDiscordMentionDisplayLabels(String(args[0] ?? "")));
+                log.info("discord.nativeSend:start", { requestId, method, target: target.raw, channelId: target.channelId });
+                const channel = await this.resolveTextChannel(target, method === "discord.send" ? "send" : "createMessage", requestId);
+                const channelId = channel.id ?? target.channelId;
+                const sendOpts = await this.normalizeDiscordNativeSendOptions(args[1], requestId, channelId);
+                const textLength = typeof sendOpts === "string"
+                    ? sendOpts.length
+                    : typeof sendOpts.content === "string"
+                        ? sendOpts.content.length
+                        : 0;
+
+                const sendStart = Date.now();
+                const sent = await channel.send(sendOpts);
+                log.info("discord.nativeSend:success", {
+                    requestId,
+                    method,
+                    channelId,
+                    durationMs: Date.now() - callStart,
+                    sendDurationMs: Date.now() - sendStart,
+                    messageId: sent?.id,
+                    textLength,
+                });
+                return this.normalizeOutgoingMessage(sent);
+            }
             case "discord.sendText": {
                 // args: [chatId, text, opts?]
                 const target = this.parseTarget(this.stripDiscordMentionDisplayLabels(String(args[0] ?? "")));
@@ -677,6 +705,47 @@ export class DiscordAdapter implements PlatformAdapter {
             };
         }
         return {};
+    }
+
+    private async normalizeDiscordNativeSendOptions(value: unknown, requestId: string, channelId: string): Promise<Record<string, unknown> | string> {
+        if (typeof value === "string") {
+            return this.stripDiscordMentionDisplayLabels(value);
+        }
+        if (!value || typeof value !== "object" || Array.isArray(value)) {
+            return { content: String(value ?? "") };
+        }
+
+        const raw = value as Record<string, unknown>;
+        const out: Record<string, unknown> = { ...raw };
+        if (typeof out.content === "string") {
+            out.content = this.stripDiscordMentionDisplayLabels(out.content);
+        }
+
+        if (Array.isArray(raw.files)) {
+            const files = await Promise.all(raw.files.map(async (item, index) => {
+                if (typeof item === "string" || Buffer.isBuffer(item) || item instanceof Uint8Array) {
+                    const prepared = await this.buildAttachment(item, undefined, requestId, channelId);
+                    return { attachment: prepared.data, name: prepared.name };
+                }
+                if (item && typeof item === "object") {
+                    const rec = item as Record<string, unknown>;
+                    const source = rec.attachment ?? rec.file ?? rec.data ?? rec.url;
+                    if (source != null) {
+                        const name = typeof rec.name === "string"
+                            ? rec.name
+                            : typeof rec.fileName === "string"
+                                ? rec.fileName
+                                : undefined;
+                        const prepared = await this.buildAttachment(source, name, requestId, channelId);
+                        return { ...rec, attachment: prepared.data, name: prepared.name };
+                    }
+                }
+                throw new Error(`discord.send: unsupported files[${index}]`);
+            }));
+            out.files = files;
+        }
+
+        return out;
     }
 
     private enrichDiscordMentionDisplayNames(text: string, message?: any): string {

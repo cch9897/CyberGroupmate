@@ -151,12 +151,22 @@ const SESSION_LIFECYCLE_METHODS = new Set([
     "logOut",
 ]);
 
+const EXCLUDED_NATIVE_METHODS = new Set([
+    ...SESSION_LIFECYCLE_METHODS,
+    // Raw MTProto is intentionally kept behind purpose-built host helpers.
+    "call",
+]);
+
 export const TELEGRAM_MTCUTE_PASSTHROUGH_METHODS: ReadonlySet<string> = new Set(
     Object.values(TELEGRAM_MTCUTE_GUIDE_METHODS).flat(),
 );
 
 export function isAllowedTelegramMtcutePassthroughMethod(methodName: string): boolean {
     return TELEGRAM_MTCUTE_PASSTHROUGH_METHODS.has(methodName) && !SESSION_LIFECYCLE_METHODS.has(methodName);
+}
+
+export function isBlockedTelegramMtcuteNativeMethod(methodName: string): boolean {
+    return EXCLUDED_NATIVE_METHODS.has(methodName);
 }
 
 export const TELEGRAM_MTCUTE_WRITE_METHODS = new Set([

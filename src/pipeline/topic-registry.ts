@@ -227,7 +227,10 @@ export class TopicRegistry extends EventEmitter {
         const topic = this.topics.get(topicId);
         if (!topic) return;
 
-        topic.decision = decision;
+        topic.decision = {
+            ...decision,
+            reason: decision.reason.replace(/[\n\r]+/g, " ").trim(),
+        };
         topic.lastTriagedAt = Date.now();
     }
 

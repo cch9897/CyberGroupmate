@@ -632,6 +632,50 @@ describe("MainAgentLoop meta session path", () => {
         }
     });
 
+    it("routes proactive idle to consciousness harness when a handler is configured", async () => {
+        const dir = tempDir();
+        const globalState = new GlobalState({
+            filePath: join(dir, "global-state.json"),
+            autoSaveInterval: 0,
+        });
+        const accumulator = new AttentionAccumulator(globalState, { windowMs: 0, topN: 2 });
+        const callbackQueue = new CallbackQueue();
+        const subagentManager = new SubagentManager({ sessionsDir: join(dir, "sessions") });
+        const loop = new MainAgentLoop(accumulator, callbackQueue, subagentManager, {}, globalState);
+        const originalNow = Date.now;
+        const fifteenMinutes = 15 * 60 * 1000;
+        const now = 1_800_000_000_000;
+        const routedPayloads: Array<{ id: string; description: string; enqueuedAt: number }> = [];
+        let metaCalls = 0;
+
+        loop.setMetaSessionHandler(async () => {
+            metaCalls += 1;
+            return { endReason: "end_turn", sessionDigest: "should not run" };
+        });
+        loop.setProactiveIdleHandler((payload) => {
+            routedPayloads.push(payload);
+            return true;
+        });
+
+        Date.now = () => now + fifteenMinutes;
+        try {
+            (loop as any).lastNonIdleActivityAt = now;
+            (loop as any).lastProactiveIdleAt = 0;
+
+            const result = await loop.tick();
+
+            assert.deepEqual(result.phase3Attended, []);
+            assert.equal(metaCalls, 0);
+            assert.equal(accumulator.getActiveCount(), 0);
+            assert.equal(routedPayloads.length, 1);
+            assert.equal(routedPayloads[0]?.id, `idle:${now + fifteenMinutes}`);
+            assert.equal(routedPayloads[0]?.description, "系统空闲，执行一次主动巡视");
+        } finally {
+            Date.now = originalNow;
+            globalState.dispose();
+        }
+    });
+
     it("includes recent direct-address messages in the meta prompt", async () => {
         const dir = tempDir();
         const globalState = new GlobalState({

@@ -50,7 +50,7 @@ export function writeHarnessInstructionsWithRestore(
                 rmSync(instructionPath, { force: true });
             }
         } catch {
-            /* 还原失败不应影响主流程；下次做梦前会重新备份当时的内容 */
+            /* 还原失败不应影响主流程；下次 harness 启动前会重新备份当时的内容 */
         }
     };
 

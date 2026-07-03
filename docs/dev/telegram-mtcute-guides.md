@@ -4,7 +4,7 @@
 
 ## 设计目标
 
-Telegram / MTProto 能力很大，不适合把所有 API 都常驻放进 Agent 的 brief。项目把低频、流程型、成组使用的能力收束成 `telegram.useXxx()` guide 入口。`useXxx()` 本身不会执行实际平台操作，而是把完整说明作为执行输出返回给 Agent；真正执行时，Agent 直接调用 guide 中披露的 `telegram.<method>(...)`。如果后续调用报运行时错误，session-runner 也会按需把相关 guide / d.ts 文档注入到 observation 中。
+Telegram / MTProto 能力很大，不适合把所有 API 都常驻放进 Agent 的 brief。项目把低频、流程型、成组使用的能力收束成 `telegram.useXxx()` guide 入口。`useXxx()` 本身不会执行实际平台操作，而是把完整说明作为执行输出返回给 Agent；真正执行时，Agent 直接调用 mtcute 原生 `telegram.<method>(...)`。如果后续调用报运行时错误，session-runner 也会按需把相关 guide / d.ts 文档注入到 observation 中。
 
 例子：
 
@@ -28,7 +28,7 @@ Telegram guide 的目标不是把 mtcute 全量映射出来，而是让 Agent �
 - 群/频道管理：建群建频道、资料、权限、成员限制、管理员、事件日志。
 - 邀请链接、论坛话题、Stories、投票/Todo、inline bot。
 
-默认不暴露：
+默认不放入 brief / guide：
 
 - 通讯录和联系人管理。
 - Telegram Business 配置。
@@ -43,9 +43,10 @@ Telegram guide 的目标不是把 mtcute 全量映射出来，而是让 Agent �
 ## 关键文件
 
 - `src/core/telegram-mtcute-passthrough.ts`
-  - `TELEGRAM_MTCUTE_GUIDE_METHODS`：按 guide 分组列出允许转发的 mtcute high-level methods。
+  - `TELEGRAM_MTCUTE_GUIDE_METHODS`：按 guide 分组列出用于文档发现的 mtcute high-level methods。
   - `TELEGRAM_MTCUTE_WRITE_METHODS`：会改变 Telegram 状态的写方法集合。
   - `getTelegramMtcuteWriteTarget()`：从写方法参数中提取目标 chat，用于绑定聊天写限制。
+  - `isBlockedTelegramMtcuteNativeMethod()`：阻断会话生命周期和裸 MTProto `call` 等不应暴露给 sandbox 的入口。
 - `src/tools/generate-telegram-mtcute-guides.ts`
   - 从本地 `node_modules/@mtcute/core/highlevel/client.d.ts` 抽取真实 TypeScript 签名、JSDoc、参数注释和相关类型声明。
   - `GUIDE_META` 存放生成 guide 的中文说明、使用要点和少量项目特有补充。
@@ -57,9 +58,9 @@ Telegram guide 的目标不是把 mtcute 全量映射出来，而是让 Agent �
 - `src/sandbox/modules/telegram/telegram.d.ts`
   - 暴露给 Agent 的 Telegram brief 类型定义。
 - `src/sandbox/modules/telegram/index.ts`
-  - `useXxx()` activator 和 generic mtcute passthrough proxy。
+  - `useXxx()` activator、原生 `telegram.<method>(...)` 动态 proxy 和冻结兜底逻辑。
 - `src/adapter/telegram-adapter.ts`
-  - `telegram.mtcute` host call 会按 allowlist 把方法和参数转发给当前 mtcute client。
+  - 直接处理常驻方法；其他 `telegram.<method>` 会按原方法名和参数转发给当前 mtcute client，并执行 sandbox policy。
   - 像 `telegram.forwardMessage()` 这种一行就能完成用户意图的封装保留为顶层 host call。
 
 ## 更新 guide 说明
@@ -105,7 +106,7 @@ npm run gen:module-docs
 npm install @mtcute/node@latest
 ```
 
-2. 在 `src/core/telegram-mtcute-passthrough.ts` 的 `TELEGRAM_MTCUTE_GUIDE_METHODS` 中把方法名放进合适分组。
+2. 在 `src/core/telegram-mtcute-passthrough.ts` 的 `TELEGRAM_MTCUTE_GUIDE_METHODS` 中把方法名放进合适分组；这只影响 guide 文档发现，不是运行时转发白名单。
 3. 如果方法会改变 Telegram 状态，把方法名加入 `TELEGRAM_MTCUTE_WRITE_METHODS`。
 4. 如果写方法作用于某个 chat，在 `getTelegramMtcuteWriteTarget()` 中补目标 chat 提取逻辑，保证绑定聊天的写限制仍然生效。
 5. 运行：

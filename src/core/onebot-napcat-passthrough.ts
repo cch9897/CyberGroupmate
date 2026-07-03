@@ -113,6 +113,10 @@ export const ONEBOT_NAPCAT_GUIDE_ACTIONS = {
 export type OneBotNapCatGuideGroup = keyof typeof ONEBOT_NAPCAT_GUIDE_ACTIONS;
 
 export const ONEBOT_NAPCAT_WRITE_ACTIONS = new Set<string>([
+    "send_msg",
+    "send_group_msg",
+    "send_private_msg",
+    "delete_msg",
     "mark_msg_as_read",
     "mark_group_msg_as_read",
     "mark_private_msg_as_read",
@@ -189,6 +193,10 @@ export function isAllowedOneBotNapCatAction(action: string): boolean {
     return ALLOWED_ACTIONS.has(normalizeOneBotNapCatAction(action));
 }
 
+export function isBlockedOneBotNapCatAction(action: string): boolean {
+    return ONEBOT_NAPCAT_EXCLUDED_ACTIONS.has(normalizeOneBotNapCatAction(action));
+}
+
 export function getOneBotNapCatGuideGroupForAction(action: string): OneBotNapCatGuideGroup | undefined {
     const normalized = normalizeOneBotNapCatAction(action);
     for (const [group, actions] of Object.entries(ONEBOT_NAPCAT_GUIDE_ACTIONS) as Array<[OneBotNapCatGuideGroup, readonly string[]]>) {
@@ -210,6 +218,14 @@ export function getOneBotNapCatWriteTarget(action: string, params: unknown): str
     const normalized = normalizeOneBotNapCatAction(action);
     if (!isOneBotNapCatWriteAction(normalized)) return undefined;
     const rec = params && typeof params === "object" ? params as Record<string, unknown> : {};
+
+    if (normalized === "send_msg") {
+        const messageType = String(rec.message_type ?? "").trim();
+        if (messageType === "group" && rec.group_id != null) return compositeChatId("group", rec.group_id);
+        if (messageType === "private" && rec.user_id != null) return compositeChatId("private", rec.user_id);
+    }
+    if (normalized === "send_group_msg" && rec.group_id != null) return compositeChatId("group", rec.group_id);
+    if (normalized === "send_private_msg" && rec.user_id != null) return compositeChatId("private", rec.user_id);
 
     if (rec.group_id != null) return compositeChatId("group", rec.group_id);
     if (rec.user_id != null) {

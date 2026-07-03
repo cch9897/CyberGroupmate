@@ -1,10 +1,10 @@
 # OneBot NapCat Guides
 
-本文档记录 OneBot/NapCat 内置 guide 的维护方式。设计参考 Telegram mtcute guides：顶层 brief 只保留高频、单步、语义稳定的 CyberGroupmate API；NapCat 的大面接口通过 `onebot.useXxx()` guide 按需披露，并用受控 `onebot.callApi()` passthrough 执行。
+本文档记录 OneBot/NapCat 内置 guide 的维护方式。设计参考 Telegram mtcute guides：顶层 brief 优先暴露 OneBot/NapCat 原生 action 名和 params 形状；项目旧 wrapper 只保留兼容，不再作为扩展新能力的入口。
 
 ## 设计目标
 
-NapCat 的 API 面覆盖消息、群管理、文件、用户资料、系统状态、扩展能力和敏感凭证，不适合全部常驻放进 Agent brief。项目把低频、流程型、成组使用的能力收束成 guide：
+NapCat 的 API 面覆盖消息、群管理、文件、用户资料、系统状态、扩展能力和敏感凭证，不适合全部常驻展开在 Agent brief。项目把低频、流程型、成组使用的能力收束成 guide：
 
 ```ts
 await onebot.useMessages();
@@ -14,24 +14,34 @@ await onebot.useUsersAndProfile();
 await onebot.useSystemUtilities();
 ```
 
-`useXxx()` 本身不会执行 QQ 操作，而是把完整说明作为执行输出返回给 Agent。真正执行时，Agent 调用 guide 中披露的：
+`useXxx()` 本身不会执行 QQ 操作，而是把完整说明作为执行输出返回给 Agent。真正执行时，Agent 优先调用 OneBot/NapCat 原生 action 方法或 `callApi(action, params)`：
 
 ```ts
+await onebot.send_group_msg({ group_id: 123456, message: "hello" });
 await onebot.callApi("get_group_info", { group_id: 123456 });
 ```
 
-`sendText()`、`sendMedia()`、`downloadMedia()` 这类一行就能表达用户意图的函数仍然常驻暴露。
+`sendText()`、`sendMessage()`、`sendAt()`、`sendMedia()` 这类 CyberGroupmate wrapper 冻结为兼容兜底；平台新增参数和能力不再加到 wrapper 上，直接走原生 action。
 
 ## 顶层 brief API
 
 适合放在一级 API 的标准：
 
-- 高频：群聊回复、发图、发表情、撤回、下载媒体、精确读取一条消息。
-- 单步语义：调用名本身已经表达用户意图，不需要先学习一组 NapCat 参数。
-- 项目封装有额外保护：重复发送拦截、绑定聊天写限制、humanized delay、跨机器文件转 data URL、媒体落盘到 CyberGroupmate workspace。
+- 原生优先：OneBot/NapCat 已有 action 的，暴露原 action 名和 params 对象。
+- 兼容兜底：旧 wrapper 保留重复发送拦截、绑定聊天写限制、humanized delay、跨机器文件兜底等项目保护，但不扩展新平台参数。
+- 敏感拦截：凭证、裸 packet、退出/删友/重启等危险 action 仍由 host policy 拦截。
 
 当前保留：
 
+- `callApi`
+- `send_group_msg`
+- `send_private_msg`
+- `send_msg`
+- `delete_msg`
+- `get_msg`
+- `mention`
+- `sendMessage`
+- `sendAt`（支持单个 QQ、数组或逗号分隔字符串；发送时会展开为多个 OneBot `at` 消息段）
 - `sendText`
 - `sendMedia`
 - `sendFile`
@@ -186,8 +196,9 @@ await onebot.callApi("get_group_info", { group_id: 123456 });
 ## 关键文件
 
 - `src/core/onebot-napcat-passthrough.ts`
-  - `ONEBOT_NAPCAT_GUIDE_ACTIONS`：按 guide 分组列出允许转发的 NapCat actions。
+  - `ONEBOT_NAPCAT_GUIDE_ACTIONS`：按 guide 分组列出用于文档发现的 NapCat actions。
   - `ONEBOT_NAPCAT_WRITE_ACTIONS`：会改变 QQ/NapCat 状态的写动作集合。
+  - `ONEBOT_NAPCAT_EXCLUDED_ACTIONS`：始终阻断的敏感/危险 action。
   - `getOneBotNapCatWriteTarget()`：从写动作参数中提取目标 chat，用于绑定聊天写限制。
 - `src/sandbox/builtin-guides/onebot/`
   - 手写 OneBot/NapCat guide。
@@ -196,20 +207,20 @@ await onebot.callApi("get_group_info", { group_id: 123456 });
 - `src/sandbox/modules/onebot/onebot.d.ts`
   - 暴露给 Agent 的 OneBot brief 类型定义。
 - `src/sandbox/modules/onebot/index.ts`
-  - `useXxx()` activator、顶层封装和 guide-only `callApi()` sandbox proxy。
+  - `useXxx()` activator、原生 action 动态 proxy、`callApi()` proxy 和冻结 wrapper。
 - `src/adapter/onebot-adapter.ts`
-  - `onebot.callApi` host call 按 allowlist 转发给 NapCat websocket action。
+  - `onebot.callApi` 与 `onebot.<action>` host call 转发给 NapCat websocket action，并执行危险 action 拦截与写目标保护。
 
 ## 新增 guide 或动作
 
 如果新增 NapCat action：
 
 1. 在 NapCat llms 索引中确认接口存在，再打开对应 `.md` 看真实 path 和参数。
-2. 判断它是否应该是顶层单步语义，还是属于某个 guide。
-3. Guide 动作加入 `src/core/onebot-napcat-passthrough.ts` 的 `ONEBOT_NAPCAT_GUIDE_ACTIONS`。
+2. 不要新增 wrapper 参数；优先让 Agent 直接用 `onebot.<action>(params)` 或 `onebot.callApi(action, params)`。
+3. 如果需要 guide 帮 Agent 发现它，把动作加入 `ONEBOT_NAPCAT_GUIDE_ACTIONS` 并更新对应 `use*.md`。
 4. 如果动作会改变状态，加入 `ONEBOT_NAPCAT_WRITE_ACTIONS`。
 5. 如果写动作作用于某个群或私聊，在 `getOneBotNapCatWriteTarget()` 中补目标提取逻辑。
-6. 更新对应 `src/sandbox/builtin-guides/onebot/use*.md`。
+6. 如果动作涉及凭证、裸协议包、退出/删友/重启等危险能力，加入 `ONEBOT_NAPCAT_EXCLUDED_ACTIONS`。
 7. 如果新增 `useXxx()` 分类，同步修改：
    - `src/sandbox/builtin-guides.ts`
    - `src/sandbox/modules/onebot/onebot.d.ts`

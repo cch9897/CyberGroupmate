@@ -7,12 +7,16 @@ import type {
     MessageSearchResult,
     PersonGroupProfile,
     PersonIdentity,
+    SessionDigestEntry,
+    SessionDigestSearchOptions,
+    TimelineEntry,
+    TimelineOptions,
     TopicSearchResult,
     UserProfileSearchResult,
     MemoryStoreV2,
 } from "../../memory-v2/index.js";
-import type { GlobalState } from "../../main-agent/global-state.js";
 import { timestampInputToIso } from "../../core/timezone.js";
+import { isPrivateChat, scrubAssociatedMemoriesByVisibility, scrubFactsByVisibility, scrubRowsByVisibility, type PolicyContext } from "../../core/visibility-policy.js";
 
 export interface MemorySearchEntitiesOptions {
     chatId?: string;
@@ -44,7 +48,7 @@ export interface MemoryIdentityMatch {
 export interface MemorySearchEntitiesResult {
     identities: MemoryIdentityMatch[];
     recentSessions: TopicSearchResult[];
-    sessionDigests: Array<{ createdAt: string; content: string }>;
+    sessionDigests: SessionDigestEntry[];
     coreFacts: FactSearchResult[];
     topicKeywords: string[];
 }
@@ -98,16 +102,59 @@ type MemoryEntityReader = Pick<MemoryStoreV2,
     "getRecentInteractions" |
     "getRecentTopics" |
     "queryMessages"
+    | "listSessionDigests"
+    | "searchAgentMemory"
+    | "getTimeline"
 >;
 
-type SessionDigestReader = Pick<GlobalState, "getSessionDigests">;
 
 const DEFAULT_SEARCH_LIMIT = 10;
 const MAX_SEARCH_LIMIT = 50;
 const DEFAULT_DOSSIER_LIMIT = 3;
 const MAX_DOSSIER_LIMIT = 10;
 
-export function createMemoryApi(memory: MemoryEntityReader, globalState?: SessionDigestReader) {
+/**
+ * R1（聚合）— 就地擦除一个 identity match 的 profile.recentFacts 里来自私密会话的 fact。
+ * identity 的 profile 由 getUserProfile 跨会话构建、不带 visibility 过滤，是私密 fact 的旁路泄露点。
+ */
+export function scrubMatchProfile(match: MemoryIdentityMatch | undefined, ctx: PolicyContext): void {
+    const profile = match?.profile as {
+        recentFacts?: FactSearchResult[];
+        groupProfile?: { chatId?: string } | null;
+    } | undefined;
+    if (!profile) return;
+    if (Array.isArray(profile.recentFacts)) {
+        profile.recentFacts = scrubFactsByVisibility(profile.recentFacts, ctx, "memory.identityProfile").kept;
+    }
+    // groupProfile 是按 chatId 取的本群画像；若来自私密会话且 ≠ 当前会话，整块丢弃（含 recentEpisodes 摘要）。
+    const gpChatId = profile.groupProfile?.chatId;
+    if (gpChatId && gpChatId !== ctx.boundChatId && isPrivateChat(gpChatId, ctx.deps)) {
+        profile.groupProfile = null;
+    }
+}
+
+/** 批量擦除 identity match 列表（resolvePerson.matches / searchEntities.identities 共用）。 */
+export function scrubIdentityMatches(matches: MemoryIdentityMatch[] | undefined, ctx: PolicyContext): void {
+    for (const match of matches ?? []) scrubMatchProfile(match, ctx);
+}
+
+/**
+ * R1（聚合）— 就地按 viewer 的 visibility 兜底擦除人物档案里来自私密会话的数据。
+ * 两个 chokepoint（subagent host-call-handler / meta wrapper）共用，避免重复枚举 dossier 字段。
+ */
+export function scrubDossiers(dossiers: MemoryPersonDossier[] | undefined, ctx: PolicyContext): void {
+    for (const d of dossiers ?? []) {
+        scrubMatchProfile(d.match, ctx); // match.profile.recentFacts 也是泄露点
+        d.facts = scrubFactsByVisibility(d.facts ?? [], ctx, "memory.getPersonDossier").kept;
+        d.recentMessages = scrubRowsByVisibility(d.recentMessages ?? [], (r) => r.chatId, ctx).kept;
+        d.recentTopics = scrubRowsByVisibility(d.recentTopics ?? [], (r) => r.chatId, ctx).kept;
+        d.recentTopics = scrubAssociatedMemoriesByVisibility(d.recentTopics, ctx, "memory.getPersonDossier.recentTopics").kept;
+        d.recentInteractions = scrubRowsByVisibility(d.recentInteractions ?? [], (r) => r.chatId, ctx).kept;
+        d.groupProfiles = scrubRowsByVisibility(d.groupProfiles ?? [], (r) => r.chatId, ctx).kept;
+    }
+}
+
+export function createMemoryApi(memory: MemoryEntityReader) {
     return {
         resolvePerson: async (
             query: string,
@@ -229,7 +276,7 @@ export function createMemoryApi(memory: MemoryEntityReader, globalState?: Sessio
                 .slice(0, limit);
             const topicKeywords = [...new Set(recentSessions.flatMap((session) => session.keywords))]
                 .slice(0, limit * 5);
-            const sessionDigests = searchSessionDigests(globalState, normalizedQuery, limit);
+            const sessionDigests = memory.searchAgentMemory(normalizedQuery, { chatId: options.chatId, after, before, limit });
 
             return {
                 identities,
@@ -237,6 +284,37 @@ export function createMemoryApi(memory: MemoryEntityReader, globalState?: Sessio
                 sessionDigests,
                 coreFacts,
                 topicKeywords,
+            };
+        },
+
+        searchAgentMemory: async (
+            query: string,
+            options: SessionDigestSearchOptions = {},
+        ): Promise<{ sessionDigests: SessionDigestEntry[] }> => {
+            const normalizedQuery = query.trim();
+            if (!normalizedQuery) return { sessionDigests: [] };
+            const limit = clampLimit(options.limit, DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT);
+            return {
+                sessionDigests: memory.searchAgentMemory(normalizedQuery, {
+                    ...options,
+                    limit,
+                    after: timestampInputToIso(options.after) ?? undefined,
+                    before: timestampInputToIso(options.before) ?? undefined,
+                }),
+            };
+        },
+
+        getTimeline: async (
+            options: TimelineOptions = {},
+        ): Promise<{ entries: TimelineEntry[] }> => {
+            const limit = clampLimit(options.limit, 30, 100);
+            return {
+                entries: memory.getTimeline({
+                    ...options,
+                    limit,
+                    after: timestampInputToIso(options.after) ?? undefined,
+                    before: timestampInputToIso(options.before) ?? undefined,
+                }),
             };
         },
     };
@@ -508,20 +586,3 @@ function normalizeForMatch(value: string | undefined): string {
     return (value ?? "").trim().toLocaleLowerCase();
 }
 
-function searchSessionDigests(
-    globalState: SessionDigestReader | undefined,
-    query: string,
-    limit: number,
-): Array<{ createdAt: string; content: string }> {
-    if (!globalState) {
-        return [];
-    }
-    const lowered = query.toLocaleLowerCase();
-    return globalState.getSessionDigests()
-        .filter((digest) =>
-            digest.content.toLocaleLowerCase().includes(lowered)
-            || digest.createdAt.toLocaleLowerCase().includes(lowered)
-        )
-        .slice(-limit)
-        .reverse();
-}

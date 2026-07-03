@@ -2,22 +2,11 @@
  * banned-words.ts — Subagent 发言前禁用词检查
  *
  * 提供发送文本前的禁用词扫描能力。
- * 词表默认内置一组在 SOUL.md 中明确禁用的中文口癖词，
- * 也可以通过 config.yaml 的 subagent.bannedWords 覆盖。
+ * 词表通过 config.yaml 的 subagent.bannedWords 或 Dashboard 配置。
  */
 
-/** 默认禁用词列表（来自 SOUL.md，避免 AI 口癖出现在发言中）。 */
-export const DEFAULT_BANNED_WORDS: string[] = [
-    "确实",
-    "笑死",
-    "还真是",
-    "接住",
-    "抓住",
-    "你说得对",
-    "说得对",
-    "不绕",
-    "我认了",
-];
+/** 禁用词列表为空时不拦截任何消息；实际词表由配置管理。 */
+export const DEFAULT_BANNED_WORDS: string[] = [];
 
 /**
  * 在文本中查找匹配的禁用词，返回命中词列表（去重）。

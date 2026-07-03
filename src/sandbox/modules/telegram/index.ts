@@ -12,7 +12,7 @@ import type { CapabilityRegistryEnv } from "../../capability-registry.js";
 import { resolve as pathResolve } from "node:path";
 import { existsSync } from "node:fs";
 import { loadBuiltinGuideContent } from "../../builtin-guides.js";
-import { isAllowedTelegramMtcutePassthroughMethod } from "../../../core/telegram-mtcute-passthrough.js";
+import { isBlockedTelegramMtcuteNativeMethod } from "../../../core/telegram-mtcute-passthrough.js";
 import { DEFAULT_BANNED_WORDS, findBannedWords, buildBannedWordWarning } from "../../../core/banned-words.js";
 
 // ─── 工具函数 ───
@@ -41,6 +41,14 @@ export function formatTelegramAck(prefix: string, payload: unknown): string {
     if (msgId !== undefined) parts.push(`msg=${String(msgId)}`);
     if (text) parts.push(`text=${text}`);
     return parts.join(" ");
+}
+
+function telegramInputText(value: unknown): string {
+    if (typeof value === "string") return value;
+    if (value && typeof value === "object" && typeof (value as { text?: unknown }).text === "string") {
+        return (value as { text: string }).text;
+    }
+    return String(value ?? "");
 }
 
 // ─── Telegram 客户端代理 ───
@@ -206,18 +214,19 @@ export function createTelegramClientProxy(
         useMediaDownload: async () => useTelegramGuide("useMediaDownload"),
 
         getMe: async () => callTelegramHost("telegram.getMe", []),
-        sendText: async (chatId: number | string, text: string, opts?: { replyTo?: number }) => {
+        sendText: async (chatId: number | string, text: unknown, opts?: Record<string, unknown>) => {
+            const plainText = telegramInputText(text);
             // ── 禁用词拦截 ──
             if (bannedWords.length > 0) {
-                const found = findBannedWords(text, bannedWords);
+                const found = findBannedWords(plainText, bannedWords);
                 if (found.length > 0) {
-                    const warning = buildBannedWordWarning(found, text);
+                    const warning = buildBannedWordWarning(found, plainText);
                     env.emitOutput(warning);
                     env.notifyHost({
                         type: "system.banned_word_blocked",
                         scene: "telegram",
                         chatId: String(chatId),
-                        text,
+                        text: plainText,
                         foundWords: found,
                         timestamp: Date.now(),
                     });
@@ -225,20 +234,20 @@ export function createTelegramClientProxy(
                 }
             }
             // ── 重复消息拦截 ──
-            if (shouldBlockDuplicate(String(chatId), text)) {
-                const warning = `[⚠ 运行时警告: 重复消息已拦截] 目标 chat=${String(chatId)} 的消息 "${text.length > 80 ? text.slice(0, 80) + '...' : text}" 与本次 session 中已发送的消息内容完全一致，已自动拦截，不会重复发送。`;
+            if (shouldBlockDuplicate(String(chatId), plainText)) {
+                const warning = `[⚠ 运行时警告: 重复消息已拦截] 目标 chat=${String(chatId)} 的消息 "${plainText.length > 80 ? plainText.slice(0, 80) + '...' : plainText}" 与本次 session 中已发送的消息内容完全一致，已自动拦截，不会重复发送。`;
                 env.emitOutput(warning);
                 env.notifyHost({
                     type: "system.duplicate_message_blocked",
                     scene: "telegram",
                     chatId: String(chatId),
-                    text,
+                    text: plainText,
                     timestamp: Date.now(),
                 });
                 return null;
             }
             const sent = hydrateTelegramMessage(await callTelegramHost("telegram.sendText", [chatId, text, opts]));
-            recordSentIfDedupEnabled(String(chatId), text);
+            recordSentIfDedupEnabled(String(chatId), plainText);
             env.emitOutput(formatTelegramAck("[Telegram] sendText ok", sent));
             // 发射 agent_message_sent 通知，供 SentMessageCollector 捕获
             env.notifyHost({
@@ -246,7 +255,7 @@ export function createTelegramClientProxy(
                 scene: "telegram",
                 chatId: String(chatId),
                 messageId: typeof sent === "object" && sent && "id" in sent ? (sent as { id?: unknown }).id : undefined,
-                text,
+                text: plainText,
                 replyToMessageId: opts?.replyTo,
                 timestamp: Date.now(),
             });
@@ -566,15 +575,16 @@ export function createTelegramClientProxy(
         get(target, prop, receiver) {
             if (typeof prop !== "string") return Reflect.get(target, prop, receiver);
             if (prop in target) return Reflect.get(target, prop, receiver);
-            if (!isAllowedTelegramMtcutePassthroughMethod(prop)) return undefined;
+            if (prop === "then" || prop === "catch" || prop === "finally" || prop === "toJSON") return undefined;
+            if (isBlockedTelegramMtcuteNativeMethod(prop)) return undefined;
             if (prop.startsWith("iter")) {
                 return async function* (...args: unknown[]) {
-                    const result = await callTelegramHost("telegram.mtcute", [prop, ...args]);
+                    const result = await callTelegramHost(`telegram.${prop}`, args);
                     if (!Array.isArray(result)) return;
                     for (const item of result) yield item;
                 };
             }
-            return async (...args: unknown[]) => callTelegramHost("telegram.mtcute", [prop, ...args]);
+            return async (...args: unknown[]) => callTelegramHost(`telegram.${prop}`, args);
         },
     });
 }

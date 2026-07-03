@@ -12,6 +12,7 @@
   import ReflectionTab from "./config/ReflectionTab.svelte";
   import ContextBudgetTab from "./config/ContextBudgetTab.svelte";
   import EmbeddingTab from "./config/EmbeddingTab.svelte";
+  import PrivacyTab from "./config/PrivacyTab.svelte";
   import VisionTab from "./config/VisionTab.svelte";
   import DashboardTab from "./config/DashboardTab.svelte";
   import SubagentTab from "./config/SubagentTab.svelte";
@@ -42,6 +43,7 @@
   let newProfileName = "";
   let newKeyword = "";
   let newBaseSkill = "";
+  let newBannedWord = "";
   /** 当前展开的 profile 名称集合 */
   let expandedProfiles = new Set();
 
@@ -56,6 +58,7 @@
     { id: "reflection", label: "反思引擎", icon: "fa-brain" },
     { id: "contextBudget", label: "上下文预算", icon: "fa-sliders" },
     { id: "embedding", label: "Embedding", icon: "fa-vector-square" },
+    { id: "privacy", label: "隐私兜底", icon: "fa-shield-halved" },
     { id: "vision", label: "Vision", icon: "fa-eye" },
     { id: "dashboard", label: "Dashboard", icon: "fa-gauge-high" },
     { id: "subagent", label: "CodeAct", icon: "fa-robot" },
@@ -67,7 +70,7 @@
     { id: "envVars", label: "环境变量", icon: "fa-key" },
   ];
 
-  const RESTART_SECTIONS = new Set(["embedding", "dashboard", "backgroundAgent"]);
+  const RESTART_SECTIONS = new Set(["embedding", "privacy", "dashboard", "backgroundAgent"]);
   const RESTART_FIELDS = {
     telegram: ["mode", "botToken", "apiId", "apiHash", "phone"],
     discord: ["botToken"],
@@ -103,6 +106,11 @@
       if (config.dashboard.host == null || config.dashboard.host === "") {
         config.dashboard.host = "127.0.0.1";
       }
+      if (!config.privacy) config.privacy = { sensitiveChats: [], dmAutoPrivate: true, allowLlmMarkSensitive: true, enforce: "block" };
+      if (!config.privacy.sensitiveChats) config.privacy.sensitiveChats = [];
+      if (config.privacy.dmAutoPrivate == null) config.privacy.dmAutoPrivate = true;
+      if (config.privacy.allowLlmMarkSensitive == null) config.privacy.allowLlmMarkSensitive = true;
+      if (!config.privacy.enforce) config.privacy.enforce = "block";
       if (!config.subagent) config.subagent = {};
       if (config.subagent.restrictAdapterWritesToBoundChat == null) {
         config.subagent.restrictAdapterWritesToBoundChat = false;
@@ -114,6 +122,9 @@
       if (!config.subagent.metaHistory) config.subagent.metaHistory = {};
       if (!config.subagent.baseSkills) config.subagent.baseSkills = [
         "runtime", "fs", "skills", "mcp", "cron", "todo", "memory", "dispatch", "vision", "shell",
+      ];
+      if (!config.subagent.bannedWords) config.subagent.bannedWords = [
+        "确实", "笑死", "还真是", "接住", "抓住", "你说得对", "说得对", "不绕", "我认了",
       ];
       if (!config.llmRouting) config.llmRouting = {};
       if (!config.llmRouting.timeouts) config.llmRouting.timeouts = {};
@@ -336,6 +347,25 @@
   function resetBaseSkills() {
     config.subagent.baseSkills = [
       "runtime", "fs", "skills", "mcp", "cron", "todo", "memory", "dispatch", "vision", "shell",
+    ];
+    config = config;
+  }
+  // ── Banned Words helpers ──
+  function addBannedWord() {
+    const w = newBannedWord.trim();
+    if (!w) return;
+    if (!config.subagent.bannedWords) config.subagent.bannedWords = [];
+    if (!config.subagent.bannedWords.includes(w)) {
+      config.subagent.bannedWords = [...config.subagent.bannedWords, w];
+    }
+    newBannedWord = "";
+  }
+  function removeBannedWord(w) {
+    config.subagent.bannedWords = config.subagent.bannedWords.filter((x) => x !== w);
+  }
+  function resetBannedWords() {
+    config.subagent.bannedWords = [
+      "确实", "笑死", "还真是", "接住", "抓住", "你说得对", "说得对", "不绕", "我认了",
     ];
     config = config;
   }
@@ -596,6 +626,8 @@
             <ContextBudgetTab bind:config />
           {:else if currentSection === "embedding"}
             <EmbeddingTab bind:config {pwFocus} {pwBlur} />
+          {:else if currentSection === "privacy"}
+            <PrivacyTab bind:config />
           {:else if currentSection === "vision"}
             <VisionTab bind:config />
           {:else if currentSection === "dashboard"}
@@ -607,6 +639,10 @@
               {addBaseSkill}
               {removeBaseSkill}
               {resetBaseSkills}
+              bind:newBannedWord
+              {addBannedWord}
+              {removeBannedWord}
+              {resetBannedWords}
             />
           {:else if currentSection === "recordingPipeline"}
             <RecordingPipelineTab bind:config />

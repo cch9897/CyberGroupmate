@@ -19,7 +19,19 @@ function scopeByChatId(ctx: ResolveContext): string | undefined {
 }
 
 interface MetaHistoricalData {
-    sessionDigests: Array<{ createdAt: string; content: string }>;
+    sessionDigests: Array<{
+        id?: string;
+        createdAt: string;
+        content: string;
+        kind?: string;
+        actorType?: string;
+        actorId?: string;
+        sourceChatId?: string | null;
+        sourceChatTitle?: string | null;
+        targetChatId?: string | null;
+        taskId?: string | null;
+        runId?: string | null;
+    }>;
 }
 
 interface MetaTodoItem {
@@ -176,6 +188,23 @@ function formatTodoLine(item: MetaTodoItem): string {
     return `- [${item.bindingId}] ${item.key}: ${item.content}${item.dueAt ? ` (dueAt=${formatTsForPrompt(item.dueAt)})` : ""}${item.expired ? " (expired)" : ""}`;
 }
 
+function formatSessionDigestLine(item: MetaHistoricalData["sessionDigests"][number]): string {
+    const sourceParts = [
+        item.actorType,
+        item.actorId,
+        item.sourceChatTitle || item.sourceChatId,
+        item.kind,
+    ].filter(Boolean);
+    const source = sourceParts.length > 0 ? ` [${sourceParts.join(" / ")}]` : "";
+    const refs = [
+        item.taskId ? `task=${item.taskId}` : "",
+        item.runId ? `run=${item.runId}` : "",
+        item.targetChatId ? `target=${item.targetChatId}` : "",
+    ].filter(Boolean);
+    const refText = refs.length > 0 ? ` (${refs.join(", ")})` : "";
+    return `- [${formatTsForPrompt(item.createdAt)}]${source}${refText} ${item.content}`;
+}
+
 function formatRemovedTodoLine(item: MetaTodoItem): string {
     const previous = item.content ? ` (原: ${item.content})` : "";
     return `- [${item.bindingId}] ${item.key}: 已移除${previous}`;
@@ -329,7 +358,7 @@ export const metaHistoricalProvider: SectionProvider<MetaHistoricalData> = {
         }
         const limit = typeof ctx.sessionDigestLimit === "number"
             ? Math.min(Math.max(Math.floor(ctx.sessionDigestLimit), 1), 30)
-            : 10;
+            : 30;
         return { sessionDigests: sessionDigests.slice(-limit) };
     },
     diff(current, committed): DiffResult<MetaHistoricalData> {
@@ -341,11 +370,11 @@ export const metaHistoricalProvider: SectionProvider<MetaHistoricalData> = {
             };
         }
 
-        const committedSet = new Set(
-            committed.sessionDigests.map((item) => `${item.createdAt}::${item.content}`)
-        );
+        const digestKey = (item: MetaHistoricalData["sessionDigests"][number]) =>
+            item.id ?? `${item.createdAt}::${item.content}`;
+        const committedSet = new Set(committed.sessionDigests.map(digestKey));
         const deltaDigests = current.sessionDigests.filter(
-            (item) => !committedSet.has(`${item.createdAt}::${item.content}`)
+            (item) => !committedSet.has(digestKey(item))
         );
 
         return {
@@ -361,7 +390,7 @@ export const metaHistoricalProvider: SectionProvider<MetaHistoricalData> = {
     render(data) {
         return [
             "# 历史 Session Digests",
-            ...data.sessionDigests.map((item) => `- [${formatTsForPrompt(item.createdAt)}] ${item.content}`),
+            ...data.sessionDigests.map(formatSessionDigestLine),
         ].join("\n");
     },
     renderDelta(delta) {
@@ -372,7 +401,7 @@ export const metaHistoricalProvider: SectionProvider<MetaHistoricalData> = {
         return [
             "# 历史 Session Digests",
             `(增量: ${delta.sessionDigests.length} 条)`,
-            ...delta.sessionDigests.map((item) => `- [${formatTsForPrompt(item.createdAt)}] ${item.content}`),
+            ...delta.sessionDigests.map(formatSessionDigestLine),
         ].join("\n");
     },
 };

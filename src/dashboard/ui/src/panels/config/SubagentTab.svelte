@@ -4,6 +4,10 @@
   export let addBaseSkill;
   export let removeBaseSkill;
   export let resetBaseSkills;
+  export let newBannedWord = "";
+  export let addBannedWord;
+  export let removeBannedWord;
+  export let resetBannedWords;
 </script>
 
 <h3 class="card-title text-sm">
@@ -237,6 +241,33 @@
       <i class="fa-solid fa-plus"></i> 添加
     </button>
     <button class="btn btn-xs btn-outline btn-ghost" on:click={resetBaseSkills} title="重置为默认值">
+      <i class="fa-solid fa-rotate-left"></i>
+    </button>
+  </div>
+  <div class="divider text-xs opacity-50 my-3"><i class="fa-solid fa-ban mr-1"></i>禁用词 (Banned Words)</div>
+  <p class="text-xs opacity-40 mb-2">
+    发言中包含以下词语时，消息将被拦截并要求 LLM 改写。清空列表可完全禁用检查。
+  </p>
+  <div class="flex flex-wrap gap-1.5 mb-2">
+    {#each config.subagent.bannedWords || [] as w}
+      <span class="badge badge-sm badge-outline badge-warning gap-1">
+        {w}
+        <button class="btn btn-ghost btn-xs px-0" on:click={() => removeBannedWord(w)}>×</button>
+      </span>
+    {/each}
+  </div>
+  <div class="flex gap-1">
+    <input
+      type="text"
+      class="input input-xs input-bordered flex-1"
+      bind:value={newBannedWord}
+      placeholder="添加禁用词…"
+      on:keydown={(e) => e.key === "Enter" && addBannedWord()}
+    />
+    <button class="btn btn-xs btn-outline btn-warning" on:click={addBannedWord}>
+      <i class="fa-solid fa-plus"></i> 添加
+    </button>
+    <button class="btn btn-xs btn-outline btn-ghost" on:click={resetBannedWords} title="重置为默认值">
       <i class="fa-solid fa-rotate-left"></i>
     </button>
   </div>

@@ -39,9 +39,10 @@ export interface DispatchTaskResult {
 }
 
 export interface DispatchSource {
-    type: "meta" | "subagent";
+    type: "meta" | "subagent" | "harness";
     chatId?: string;
     taskId?: string;
+    runId?: string;
 }
 
 export interface DispatchTaskOptions {
@@ -144,6 +145,7 @@ export function createDispatchApi(deps: DispatchApiDeps) {
                 sourceType: source.type,
                 sourceChatId: source.chatId,
                 sourceTaskId: source.taskId,
+                sourceRunId: source.runId,
                 contentDirection: taskSpec.contentDirection,
                 toneGuidance: taskSpec.toneGuidance,
                 quotes: taskSpec.quotes,
@@ -153,8 +155,16 @@ export function createDispatchApi(deps: DispatchApiDeps) {
                 tracking: taskSpec.tracking,
                 createdAt: task.createdAt,
             });
-            deps.globalState?.addSessionDigest?.(formatDispatchCreatedDigest(source, chatId, taskId, taskSpec));
-
+            deps.globalState?.addSessionDigest?.(formatDispatchCreatedDigest(source, chatId, taskId, taskSpec), {
+                kind: "dispatch_created",
+                actorType: source.type === "subagent" ? "subagent" : source.type === "harness" ? "harness" : "meta",
+                actorId: source.chatId,
+                sourceChatId: source.chatId,
+                targetChatId: chatId,
+                taskId,
+                runId: source.runId,
+                tags: ["dispatch"],
+            });
             executor.enqueue(task);
             deps.accumulator.markActioned(chatId);
             await deps.onTaskDispatched?.(task);
@@ -188,6 +198,14 @@ function normalizeDispatchSource(source?: DispatchSource): DispatchSource {
             taskId: source.taskId,
         };
     }
+    if (source?.type === "harness") {
+        return {
+            type: "harness",
+            chatId: source.chatId,
+            taskId: source.taskId,
+            runId: source.runId,
+        };
+    }
     return { type: "meta" };
 }
 
@@ -199,6 +217,8 @@ function formatDispatchCreatedDigest(
 ): string {
     const sourceLabel = source.type === "subagent"
         ? `Subagent ${source.chatId}${source.taskId ? ` task=${source.taskId}` : ""}`
+        : source.type === "harness"
+            ? `Harness${source.chatId ? ` ${source.chatId}` : ""}${source.runId ? ` run=${source.runId}` : ""}`
         : "Meta";
     const quoteCount = taskSpec.quotes?.length ?? 0;
     return [
@@ -271,12 +291,12 @@ async function buildDispatchContext(
     taskSpec: DispatchTaskSpec,
     groundingContext?: string,
     activeUserProfiles?: ActiveUserProfile[],
-    deps?: Pick<DispatchApiDeps, "globalState" | "getQuoteOutput" | "workspaceRoot">,
+    deps?: Pick<DispatchApiDeps, "getQuoteOutput" | "workspaceRoot">,
 ): Promise<GroupContextPackage> {
     const groupModel = typeof memory.getGroupModel === "function"
         ? memory.getGroupModel(getGroupModelKey(chatId))
         : null;
-    const quoteContext = await resolveDispatchQuoteContext(memory, taskSpec, deps);
+    const quoteContext = await resolveDispatchQuoteContext(memory, chatId, taskSpec, deps);
     return {
         depth: 2,
         chatId,
@@ -297,8 +317,9 @@ async function buildDispatchContext(
 
 async function resolveDispatchQuoteContext(
     memory: MemoryStoreV2,
+    targetChatId: string,
     taskSpec: DispatchTaskSpec,
-    deps?: Pick<DispatchApiDeps, "globalState" | "getQuoteOutput" | "workspaceRoot">,
+    deps?: Pick<DispatchApiDeps, "getQuoteOutput" | "workspaceRoot">,
 ) {
     const refs = collectQuoteRefs({
         contentDirection: taskSpec.contentDirection,
@@ -310,7 +331,8 @@ async function resolveDispatchQuoteContext(
     }
     return resolveQuoteRefs(refs, {
         memory,
-        globalState: deps?.globalState,
+        // 派发目标会话：引用「目标会话自己」的私密内容放行（在本会话内服务），跨别的私密会话才拦/scrub。
+        boundChatId: targetChatId,
         getOutput: deps?.getQuoteOutput,
         workspaceRoot: deps?.workspaceRoot,
     });

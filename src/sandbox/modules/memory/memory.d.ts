@@ -264,6 +264,62 @@ interface MemoryModule {
         }>;
     }>;
 
+    /**
+     * 搜索 agent 自己的长期意识/意图记忆：Meta 决策、subagent 回调、harness 做梦、派发结果等。
+     */
+    searchAgentMemory(query: string, options?: {
+        chatId?: string;
+        actorType?: "meta" | "subagent" | "harness" | "system";
+        kind?: string;
+        after?: number;
+        before?: number;
+        limit?: number;
+    }): Promise<{
+        sessionDigests: Array<{
+            id?: string;
+            createdAt: number;
+            content: string;
+            kind?: string;
+            actorType?: "meta" | "subagent" | "harness" | "system";
+            actorId?: string;
+            sourceChatId?: string | null;
+            sourceChatTitle?: string | null;
+            targetChatId?: string | null;
+            taskId?: string | null;
+            runId?: string | null;
+            tags?: string[];
+            importance?: number;
+            visibility?: "private" | "contextual" | "public";
+            metadata?: Record<string, unknown>;
+        }>;
+    }>;
+
+    /**
+     * 获取近期时间线，合并 session digests 与话题摘要。
+     */
+    getTimeline(options?: {
+        chatId?: string;
+        after?: number;
+        before?: number;
+        limit?: number;
+        includeTopics?: boolean;
+        includeDigests?: boolean;
+    }): Promise<{
+        entries: Array<{
+            type: "session_digest" | "topic";
+            timestamp: number;
+            chatId?: string | null;
+            title?: string;
+            content: string;
+            refId?: string;
+            metadata?: Record<string, unknown>;
+        }>;
+    }>;
+
+    /** 
+     * 语义检索记忆（事实 + 话题）。
+     * 话题按当前会话收窄；核心事实（人物画像类）为全局知识，仍可能返回。
+     */
     semanticSearch(query: string, options?: {
         scope?: "facts" | "topics" | "all";
         limit?: number;

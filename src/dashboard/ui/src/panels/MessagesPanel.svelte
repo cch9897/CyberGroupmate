@@ -17,6 +17,7 @@
     getPlatform,
     platformLabel,
   } from "../lib/utils.js";
+  import { sortChatIdsByLastMessage } from "../lib/chat-order.js";
 
   let flushing = false;
   let reflecting = false;
@@ -122,12 +123,16 @@
   let streamEl;
   let showSidebar = false;
 
-  $: allChatIds = [
-    ...new Set([
-      ...$appState.groups.map((g) => g.chatId),
-      ...$messages.map((m) => m.chatId),
-    ]),
-  ];
+  $: allChatIds = sortChatIdsByLastMessage(
+    [
+      ...new Set([
+        ...$appState.groups.map((g) => g.chatId),
+        ...$messages.map((m) => m.chatId),
+      ]),
+    ],
+    $appState.groups,
+    $messages,
+  );
   $: filtered = $selectedChatId
     ? $messages.filter((m) => m.chatId === $selectedChatId)
     : $messages;

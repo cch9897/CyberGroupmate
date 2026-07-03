@@ -99,6 +99,16 @@ describe("createMemoryApi", () => {
 
         memory.storeFact("u1", "alice 是前端程序员", "biographical");
         memory.storeFact("u2", "bob 擅长 Rust 和 Python", "biographical");
+        memory.appendSessionDigest({
+            createdAt: "2026-01-05T00:00:00.000Z",
+            content: "Meta 想跟进 Soha 的 Chiikawa Park 话题",
+            kind: "meta_turn",
+            actorType: "meta",
+            actorId: "__meta__",
+            sourceChatId: "__meta__",
+            targetChatId: "g1",
+            tags: ["followup"],
+        });
     });
 
     after(() => {
@@ -167,16 +177,33 @@ describe("createMemoryApi", () => {
     });
 
     it("searches session digests from global state", async () => {
-        const api = createMemoryApi(memory, {
-            getSessionDigests: () => [
-                { createdAt: "2026-01-01T00:00:00.000Z", content: "普通巡检无事项" },
-                { createdAt: "2026-01-02T00:00:00.000Z", content: "需要跟进 Soha 的 Chiikawa Park 话题" },
-            ],
-        } as any);
+        const api = createMemoryApi(memory);
         const result = await api.searchEntities("soha", { limit: 10 });
 
-        assert.deepEqual(result.sessionDigests, [
-            { createdAt: "2026-01-02T00:00:00.000Z", content: "需要跟进 Soha 的 Chiikawa Park 话题" },
-        ]);
+        assert.equal(result.sessionDigests.length, 1);
+        assert.equal(result.sessionDigests[0].kind, "meta_turn");
+        assert.equal(result.sessionDigests[0].actorType, "meta");
+        assert.equal(result.sessionDigests[0].targetChatId, "g1");
+        assert.match(result.sessionDigests[0].content, /Chiikawa Park/);
+    });
+
+    it("searches agent memory and returns timeline entries", async () => {
+        const api = createMemoryApi(memory);
+        const agentMemory = await api.searchAgentMemory("Chiikawa", { limit: 5 });
+        assert.equal(agentMemory.sessionDigests.length, 1);
+        assert.equal(agentMemory.sessionDigests[0].sourceChatId, "__meta__");
+
+        const timeline = await api.getTimeline({ limit: 10, includeTopics: false });
+        assert.ok(timeline.entries.some((entry) => entry.type === "session_digest" && entry.content.includes("Chiikawa")));
+    });
+
+    it("migrates legacy session digests idempotently", () => {
+        const legacy = [{ createdAt: "2026-01-06T00:00:00.000Z", content: "legacy dream note" }];
+        assert.equal(memory.migrateLegacySessionDigests(legacy), 1);
+        assert.equal(memory.migrateLegacySessionDigests(legacy), 0);
+        const rows = memory.searchAgentMemory("legacy dream", { limit: 10 });
+        assert.equal(rows.length, 1);
+        assert.equal(rows[0].kind, "legacy");
+        assert.equal(rows[0].metadata?.migratedFrom, "global-state.sessionDigests");
     });
 });

@@ -21,7 +21,7 @@ import type { FactSearchResult, InteractionSearchResult, MemoryStoreV2, RecentMe
 import { SandboxPool } from "../sandbox/sandbox-pool.js";
 import { NotificationCenter } from "../event/notification-center.js";
 import { runCodeActSession, SentMessageCollector, type SessionResult, type SentMessageRecord } from "../sandbox/session-runner.js";
-import { loadModuleRegistry, lookupFullDocs, generateBriefOverview, mergeModuleRegistries, type ModuleEntry } from "../sandbox/modules/module-registry.js";
+import { loadModuleRegistry, lookupFullDocs, generateBriefOverview, gatePrivacyMarkSensitive, mergeModuleRegistries, type ModuleEntry } from "../sandbox/modules/module-registry.js";
 import { getMcpModuleEntries } from "../sandbox/modules/mcp-bridge/index.js";
 import { parseAllSkillDocs } from "../sandbox/skill-loader.js";
 import { buildPrefixMap } from "../sandbox/api-intent-extractor.js";
@@ -45,11 +45,13 @@ import { createLogger } from "../core/logger.js";
 import { formatTsForPrompt, normalizeProgrammaticTimestamps, sanitizePromptTimestamps } from "../core/timezone.js";
 import { getRawId, ensureCompositeId, getPlatform, getGroupModelKey } from "../core/chat-id.js";
 import type { GlobalState } from "../main-agent/global-state.js";
+import { EventEmitter } from "node:events";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { shouldCompact, compact as contextManagerCompact } from "../memory-v2/context-manager.js";
 import { DEFAULT_BANNED_WORDS } from "../core/banned-words.js";
+import { registerPendingMessageSignal, type PendingMessageSignal } from "../sandbox/send-interrupt.js";
 
 const log = createLogger("code-act-executor");
 
@@ -89,7 +91,9 @@ function formatFactForPrompt(fact: PromptFact, memory: MemoryStoreV2 | undefined
         fact.visibility ? `visibility=${fact.visibility}` : "",
         fact.sensitivity ? `sensitivity=${fact.sensitivity}` : "",
     ].filter(Boolean).join("；");
-    return `- [${subject} · ${fact.category}] ${fact.content}${sourceParts ? ` (${sourceParts})` : ""}`;
+    // 结构化事实带 [主体 · 类别] 前缀；无 subject 的兜底直接出正文。
+    const head = subject ? `[${subject} · ${fact.category}] ` : "";
+    return `- ${head}${fact.content}${sourceParts ? ` (${sourceParts})` : ""}`;
 }
 
 function formatInteractionForPrompt(item: PromptInteraction, memory: MemoryStoreV2 | undefined): string {
@@ -240,13 +244,13 @@ const PLATFORM_MODULES: Record<string, string> = {
  * workspace/skills/ 里的 TS Skills 的 .d.ts，提取每个方法的一句话 brief 签名。
  * 完整文档由 session-runner 在运行时错误后按需注入。
  */
-export function loadApiTypeDefs(platform: string = "telegram", allowedModules?: Set<string>): string {
+export function loadApiTypeDefs(platform: string = "telegram", allowedModules?: Set<string>, allowMarkSensitive: boolean = true): string {
     try {
         // 确保 registry 已加载（合并内置模块与动态 TS Skills）
         const registry = getModuleRegistryCache();
 
-        // 当有 allowedModules 过滤时，不使用缓存（每次 task 可能不同）
-        const cacheKey = allowedModules ? null : platform;
+        // 当有 allowedModules 过滤时，不使用缓存（每次 task 可能不同）；缓存键带 allowMarkSensitive。
+        const cacheKey = allowedModules ? null : `${platform}:${allowMarkSensitive ? 1 : 0}`;
         let moduleBrief = cacheKey ? _apiBriefCache.get(cacheKey) : undefined;
         if (!moduleBrief) {
             if (registry.length === 0) {
@@ -261,8 +265,11 @@ export function loadApiTypeDefs(platform: string = "telegram", allowedModules?: 
                     }
                 }
 
-                // 按平台过滤模块
-                const filteredRegistry = registry.filter(mod => !excludedModules.has(mod.name));
+                // 按平台过滤模块 + 按 allowMarkSensitive 剔除 privacy.markSensitive
+                const filteredRegistry = gatePrivacyMarkSensitive(
+                    registry.filter(mod => !excludedModules.has(mod.name)),
+                    allowMarkSensitive,
+                );
 
                 // 生成轻量概览（包含内置模块 + TS Skills + AgentSkills）
                 moduleBrief = generateBriefOverview(filteredRegistry, allowedModules);
@@ -395,6 +402,19 @@ function formatExecutionRecordForCompact(rec: SessionExecutionRecord): string | 
 }
 
 /**
+ * session endReason → 派发任务终态映射：
+ *   - error       → ERROR
+ *   - interrupted → SKIPPED（被新消息/用户打断，是主动让路，非失败，不应误记 COMPLETED）
+ *   - 其余（end_turn / max_turns）→ COMPLETED
+ * 注意：TIMEOUT 不在此产生——它只由 GlobalState 启动对账（进程中途退出残留 RUNNING）补写。
+ */
+export function endReasonToTaskStatus(endReason: string | undefined): SubagentCallback["status"] {
+    return endReason === "error" ? "ERROR"
+        : endReason === "interrupted" ? "SKIPPED"
+            : "COMPLETED";
+}
+
+/**
  * CodeActExecutor — per-group CodeAct 执行器
  *
  * 注意：Sandbox 实例由 SandboxPool 管理，此处只持有引用。
@@ -436,6 +456,8 @@ export class CodeActExecutor {
 
     /** 层 2: 消息前送缓冲区 — NC hook 在 session 执行期间推入新消息 */
     private pendingMessages: PostTaskReactionMessage[] = [];
+    private pendingMessageVersion = 0;
+    private readonly pendingMessageEmitter = new EventEmitter();
 
     /** Memory 引用（层 1 用于刷新目标消息） */
     private memory: MemoryStoreV2 | null = null;
@@ -671,7 +693,7 @@ export class CodeActExecutor {
         // 2. 渲染系统 prompt (subagent.md §12.2 ➎ — 稳定部分，保持 Mustache 模板)
         const currentConfig = loadConfig();
         const baseSkills = currentConfig.subagent?.baseSkills ?? [
-            "runtime", "fs", "skills", "mcp", "cron", "todo", "memory", "dispatch", "vision", "shell",
+            "runtime", "fs", "skills", "mcp", "cron", "todo", "memory", "privacy", "dispatch", "vision", "shell",
         ];
         const platform = getPlatform(this.chatId);
         const allowedSkills = new Set<string>([
@@ -684,7 +706,10 @@ export class CodeActExecutor {
         const systemVars = {
             personaName: this.personaName,
             personaDescription: this.personaDescription,
-            apiTypeDefs: loadApiTypeDefs(platform, allowedSkills),
+            apiTypeDefs: loadApiTypeDefs(platform, allowedSkills, currentConfig.privacy?.allowLlmMarkSensitive !== false),
+            // 隐私 prompt 指引选择性注入：fence 仅 enforce!=off 时讲；markSensitive 指引还需 allowLlmMarkSensitive。
+            privacyGuidance: currentConfig.privacy?.enforce !== "off",
+            privacyMarkGuidance: currentConfig.privacy?.enforce !== "off" && currentConfig.privacy?.allowLlmMarkSensitive !== false,
             platformModule: platform,
             hasTodos: todoItems.length > 0,
             todosText: todoItems.map((item) =>
@@ -710,6 +735,7 @@ export class CodeActExecutor {
         } else if (!isContinuation) {
             const topicSummary = ctx.topicSummary ?? "";
             const toneGuidance = ctx.toneGuidance ?? "";
+            // 主动记忆：由 dispatch 显式预置（task.memoryContext）；未预置则本轮不注入。
             const memoryContext = task.memoryContext;
             const explicitMemoryContextText = memoryContext
                 ? [
@@ -790,6 +816,9 @@ export class CodeActExecutor {
             taskPrompt = taskPromptParts.join("\n\n");
         }
 
+        // per-profile replyPrompt 的注入已下沉到 LLM 调用层（session-runner → callLLM applyReplyPrompt），
+        // 按实际选中的 profile 在调用时追加，fallback 切换 profile 时也能用对自己的 replyPrompt。
+
         // ═══ Fix 2: 构建 messages 时注入历史 session 上下文 ═══
         const messages: ChatMessage[] = [
             { role: "system", content: systemPrompt, cacheBreakpoint: true },
@@ -857,6 +886,7 @@ export class CodeActExecutor {
         });
 
         let sessionResult: SessionResult;
+        const unregisterPendingSignal = registerPendingMessageSignal(this.chatId, this.createPendingMessageSignal());
         try {
             sessionResult = await runCodeActSession(
                 messages,
@@ -884,6 +914,7 @@ export class CodeActExecutor {
                 renderResult?.manifest,
             );
         } finally {
+            unregisterPendingSignal();
             // 停止 typing 指示
             if (typingTimer) clearInterval(typingTimer);
             // 清理监听器，释放 sandbox
@@ -930,14 +961,15 @@ export class CodeActExecutor {
         });
 
         // 5. 构建 callback
-        const isError = sessionResult.endReason === "error";
+        // endReason → 终态映射（见 endReasonToTaskStatus）。
+        const status: SubagentCallback["status"] = endReasonToTaskStatus(sessionResult.endReason);
         const callback: SubagentCallback = {
             taskId: task.taskId,
             chatId: this.chatId,
             chatTitle: ctx.chatTitle ?? ctx.groupModel?.chatTitle,
             isDirectMessage: ctx.isDirectMessage,
             executionType: "CODEACT",
-            status: isError ? "ERROR" : "COMPLETED",
+            status,
             summary: thinkingTranscript,
             replyContent: sessionResult.turns
                 .filter((t: any) => t.role === "assistant" && t.content)
@@ -980,6 +1012,7 @@ export class CodeActExecutor {
         return callback;
     }
 
+    /** 按 task 建议的 emoji 选出可发送的贴纸候选（去重、过滤不可用/.webm，上限 12，超额随机抽样）。 */
     private buildAvailableStickers(task: CodeActReplyTask): Array<{ emoji?: string; emojis?: string[]; description: string; uniqueFileId: string }> | undefined {
         if (!this.memory) return undefined;
 
@@ -1107,6 +1140,8 @@ export class CodeActExecutor {
      */
     pushPendingMessage(msg: PostTaskReactionMessage): void {
         this.pendingMessages.push(msg);
+        this.pendingMessageVersion++;
+        this.pendingMessageEmitter.emit("pending-message", this.pendingMessageVersion);
         log.debug("pushPendingMessage", {
             chatId: this.chatId,
             msgId: msg.messageId,
@@ -1115,6 +1150,41 @@ export class CodeActExecutor {
             directReason: msg.directReason,
             hasMedia: !!msg.mediaInfo,
             bufferSize: this.pendingMessages.length,
+        });
+    }
+
+    private createPendingMessageSignal(): PendingMessageSignal {
+        return {
+            getVersion: () => this.pendingMessageVersion,
+            getPendingCount: () => this.pendingMessages.length,
+            onChange: (listener) => {
+                this.pendingMessageEmitter.on("pending-message", listener);
+                return () => this.pendingMessageEmitter.off("pending-message", listener);
+            },
+            waitForChange: (sinceVersion, timeoutMs) => this.waitForPendingMessageChange(sinceVersion, timeoutMs),
+        };
+    }
+
+    private waitForPendingMessageChange(sinceVersion: number, timeoutMs: number): Promise<boolean> {
+        if (this.pendingMessageVersion !== sinceVersion) return Promise.resolve(true);
+        if (timeoutMs <= 0) return Promise.resolve(false);
+
+        return new Promise((resolve) => {
+            let settled = false;
+            const cleanup = () => {
+                this.pendingMessageEmitter.off("pending-message", onPendingMessage);
+                clearTimeout(timer);
+            };
+            const finish = (changed: boolean) => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                resolve(changed);
+            };
+            const onPendingMessage = () => finish(true);
+            const timer = setTimeout(() => finish(false), timeoutMs);
+            if (timer.unref) timer.unref();
+            this.pendingMessageEmitter.on("pending-message", onPendingMessage);
         });
     }
 
@@ -1349,6 +1419,17 @@ export class CodeActExecutor {
                 }
 
                 const task = this.taskQueue.shift()!;
+                const updatedTask = this.globalState?.updateDispatchedSubagentTask(task.taskId, {
+                    status: "RUNNING",
+                });
+                log.info("processNext: task dequeued", {
+                    chatId: this.chatId,
+                    taskId: task.taskId,
+                    remainingQueueSize: this.taskQueue.length,
+                    statusMarkedRunning: !!updatedTask,
+                    skipRefreshTaskMessages: !!task.skipRefreshTaskMessages,
+                    isContinuation: !!task.continuationPrompt,
+                });
 
                 // 层 1: 执行前刷新目标消息。轻量续接任务只追加一条 continuation prompt。
                 if (!task.skipRefreshTaskMessages && !task.continuationPrompt) {

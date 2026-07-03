@@ -133,12 +133,32 @@ export interface LLMCallOptions {
     prefill?: string;
     /** Stop sequences — LLM 遇到这些字符串时停止生成 */
     stop?: string[];
+    /**
+     * 应用当前 profile 的 per-profile 补充提示词（LLMConfig.replyPrompt）：贴到最后一条 user 消息末尾
+     * （recency 最高，紧贴生成）。在 callLLM 入口按"实际选中的 profile"应用，使 fallback 切换 profile 时
+     * 用的是该 profile 自己的 replyPrompt，而非固定的 profile[0]。仅 reply 路径（session-runner）开启。
+     */
+    applyReplyPrompt?: boolean;
     /** 请求超时（毫秒）。来自 llmRouting.timeouts[component]，未设置则使用默认 60000 */
     timeoutMs?: number;
+    /**
+     * 覆盖单 profile 内的重试次数（默认 MAX_RETRIES=3）。设为 0 表示不重试，
+     * 失败立即抛出让上层 fallback / 自适应处理。用于 reflection 这类"重试同一超大
+     * prompt 无意义、应改为收缩 prompt 重试"的调用方。
+     */
+    maxRetries?: number;
     /** Profile 名称（用于限速器按 profile 限速） */
     profileName?: string;
     /** 调用时对应的 ContextEngine manifest（供 Dashboard 可视化） */
     contextManifest?: ContextManifest;
+    /** 外部取消信号。用于上层在新消息到达时中断本次推理并重建 prompt。 */
+    abortSignal?: AbortSignal;
+}
+
+export const LLM_PENDING_MESSAGE_ABORT = "pending_message";
+
+export function isLLMInterruptedByPendingMessage(err: unknown): boolean {
+    return err instanceof Error && err.message.includes(LLM_PENDING_MESSAGE_ABORT);
 }
 
 let _callIdCounter = 0;
@@ -241,11 +261,30 @@ function isAuthError(err: unknown): boolean {
  * @param options - 可选的调用参数覆盖
  * @returns LLM 响应（含生成文本和 token 用量）
  */
+/** 把 replyPrompt 追加到最后一条字符串内容的 user 消息末尾，返回新数组（不修改入参）。 */
+function appendReplyPrompt(messages: ChatMessage[], replyPrompt: string): ChatMessage[] {
+    for (let i = messages.length - 1; i >= 0; i--) {
+        const m = messages[i];
+        if (m.role === "user" && typeof m.content === "string") {
+            const copy = messages.slice();
+            copy[i] = { ...m, content: m.content ? `${m.content}\n\n${replyPrompt}` : replyPrompt };
+            return copy;
+        }
+    }
+    return messages;
+}
+
 export async function callLLM(
     messages: ChatMessage[],
     config: LLMConfig,
     options?: LLMCallOptions
 ): Promise<LLMResponse> {
+    // ── per-profile replyPrompt：按实际选中的 profile 追加到最后一条 user 消息（不改原数组） ──
+    // 放在 callLLM 入口，使 fallback 选中 configs[i] 时用的是 configs[i] 自己的 replyPrompt。
+    if (options?.applyReplyPrompt && config.replyPrompt) {
+        messages = appendReplyPrompt(messages, config.replyPrompt);
+    }
+
     // ── Pool 模式：委托给 callLLMWithPool ──
     if (config.pool && config.pool.members.length > 0) {
         return callLLMWithPool(messages, config, options);
@@ -397,13 +436,14 @@ async function _callLLMSingleKeyInner(
     }
 
     const timeoutMs = options?.timeoutMs ?? 60_000;
+    const maxRetries = options?.maxRetries ?? MAX_RETRIES;
 
     // 创建主 AbortController 用于 Dashboard 取消
     let currentController = new AbortController();
     _activeControllers.set(callId, currentController);
 
     try {
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
         // 检查是否已被用户取消（上一次循环中可能被 abort）
         // 如果被取消，重置 controller 以便下一次 fetch 正常使用
         let wasUserRetry = false;
@@ -417,7 +457,9 @@ async function _callLLMSingleKeyInner(
 
             // 创建本次 fetch 的 AbortSignal：合并超时 + 用户取消
             const timeoutSignal = AbortSignal.timeout(timeoutMs);
-            const combinedSignal = AbortSignal.any([timeoutSignal, currentController.signal]);
+            const combinedSignals = [timeoutSignal, currentController.signal];
+            if (options?.abortSignal) combinedSignals.push(options.abortSignal);
+            const combinedSignal = AbortSignal.any(combinedSignals);
 
             // ── Provider dispatch ──
             let result: LLMResponse;
@@ -478,6 +520,27 @@ async function _callLLMSingleKeyInner(
                 _activeControllers.set(callId, currentController);
             }
 
+            const externalAbortReason = options?.abortSignal?.reason;
+            const isPendingMessageAbort = options?.abortSignal?.aborted && (
+                externalAbortReason === LLM_PENDING_MESSAGE_ABORT ||
+                (externalAbortReason instanceof DOMException && externalAbortReason.message === LLM_PENDING_MESSAGE_ABORT)
+            );
+            if (isPendingMessageAbort) {
+                if (llmEvents.listenerCount("llm:response") > 0) {
+                    const responseEvent: LLMResponseEvent = {
+                        callId,
+                        caller,
+                        contentPreview: "",
+                        contentLength: 0,
+                        durationMs: Date.now() - startTime,
+                        error: "interrupted_by_pending_message",
+                        timestamp: new Date().toISOString(),
+                    };
+                    llmEvents.emit("llm:response", responseEvent);
+                }
+                throw new Error(LLM_PENDING_MESSAGE_ABORT);
+            }
+
             const isRateLimit =
                 err instanceof Error &&
                 (err.message.includes("429") ||
@@ -516,9 +579,9 @@ async function _callLLMSingleKeyInner(
 
             const reason = isUserAbort ? "user_retry" : isRateLimit ? "rate_limit" : isServerError ? "server_error" : isNetworkError ? "network_error" : isEmptyResponse ? "empty_response" : "quota_or_billing";
 
-            if (isRetryable && attempt < MAX_RETRIES) {
+            if (isRetryable && attempt < maxRetries) {
                 const delay = wasUserRetry ? 0 : (RETRY_DELAYS[attempt] ?? 4000);
-                log.warn(`LLM call failed (attempt ${attempt + 1}/${MAX_RETRIES}), retrying in ${delay}ms`, {
+                log.warn(`LLM call failed (attempt ${attempt + 1}/${maxRetries}), retrying in ${delay}ms`, {
                     caller,
                     error: err instanceof Error ? err.message : String(err),
                     reason,
@@ -530,7 +593,7 @@ async function _callLLMSingleKeyInner(
                         callId,
                         caller,
                         attempt: attempt + 1,
-                        maxRetries: MAX_RETRIES,
+                        maxRetries,
                         error: err instanceof Error ? err.message : String(err),
                         reason,
                         retryDelayMs: delay,
@@ -596,6 +659,9 @@ export async function callLLMWithFallback(
         try {
             return await callLLM(messages, configs[i], options);
         } catch (err) {
+            if (isLLMInterruptedByPendingMessage(err)) {
+                throw err;
+            }
             lastError = err instanceof Error ? err : new Error(String(err));
 
             // 最后一个 config 也失败 → 抛出

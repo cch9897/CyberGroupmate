@@ -21,7 +21,8 @@ function isAttentionSource(value: string): value is AttentionSource {
         || value === "SCHEDULER"
         || value === "WAKE_CONDITION"
         || value === "TOPIC_SIGNAL"
-        || value === "PROACTIVE_IDLE";
+        || value === "PROACTIVE_IDLE"
+        || value === "BACKGROUND_AGENT";
 }
 
 function toAttentionItem(item: SignalPoolItem): AttentionItem {

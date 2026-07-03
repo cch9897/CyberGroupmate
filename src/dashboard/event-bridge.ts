@@ -433,10 +433,12 @@ export class EventBridge {
         const groups: Record<string, unknown>[] = [];
         for (const sub of subagentManager.getAllSubagents()) {
             const gm = this.deps.memory.getGroupModel(getGroupModelKey(sub.chatId));
+            const lastMessageAt = this.deps.memory.getRecentMessages(sub.chatId, 1)[0]?.timestamp ?? "";
             groups.push({
                 chatId: sub.chatId,
                 chatTitle: gm?.chatTitle || "",
                 isDirectMessage: !!gm?.isDirectMessage,
+                lastMessageAt,
                 engagement: sub.observer.getEngagementScore(),
                 bufferSize: sub.observer.getBufferSize(),
                 topicCount: sub.topicRegistry.getAll().length,
@@ -451,6 +453,13 @@ export class EventBridge {
                 lastCallbacks: sub.lastCallbacks,
             });
         }
+        groups.sort((a, b) => {
+            const at = Date.parse(String(a.lastMessageAt || ""));
+            const bt = Date.parse(String(b.lastMessageAt || ""));
+            const av = Number.isFinite(at) ? at : 0;
+            const bv = Number.isFinite(bt) ? bt : 0;
+            return bv - av;
+        });
 
         const metaCodeAct = getMetaCodeActState();
         const metaHistoryStatus = getMetaHistoryWindowStatus(globalState.getMetaSessionHistory());

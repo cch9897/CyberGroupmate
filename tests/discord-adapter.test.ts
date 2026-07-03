@@ -194,6 +194,52 @@ describe("DiscordAdapter", () => {
         }
     });
 
+    it("should expose native discord send options", async () => {
+        const nc = makeNC();
+        const adapter = new DiscordAdapter({ botToken: "token" }, nc);
+        let sentOptions: Record<string, unknown> | string | undefined;
+
+        (adapter as any).client = {
+            channels: {
+                async fetch(id: string) {
+                    assert.equal(id, "channel-1");
+                    return {
+                        id: "channel-1",
+                        isTextBased: () => true,
+                        async send(opts: Record<string, unknown> | string) {
+                            sentOptions = opts;
+                            return {
+                                id: "msg-native-1",
+                                content: typeof opts === "string" ? opts : opts.content,
+                                channel: { id: "channel-1" },
+                                createdAt: new Date("2026-05-20T00:00:00.000Z"),
+                            };
+                        },
+                    };
+                },
+            },
+        };
+
+        try {
+            await adapter.handleCall("discord.send", [
+                "discord:channel-1",
+                {
+                    content: "<@1485835320535810058>(Miu) 收到",
+                    embeds: [{ title: "ok" }],
+                    reply: { messageReference: "msg-0" },
+                },
+            ]);
+
+            assert.deepEqual(sentOptions, {
+                content: "<@1485835320535810058> 收到",
+                embeds: [{ title: "ok" }],
+                reply: { messageReference: "msg-0" },
+            });
+        } finally {
+            nc.dispose();
+        }
+    });
+
     it("should react to fetched Discord messages", async () => {
         const nc = makeNC();
         const adapter = new DiscordAdapter({ botToken: "token" }, nc);

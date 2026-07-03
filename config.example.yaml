@@ -298,6 +298,13 @@ reflection:
 # 控制文本向量化和向量搜索的行为
 # 所有字段可选，缺省使用括号内默认值
 embedding:
+  # 总开关：是否启用向量 embedding 检索。默认 false。
+  #   false → 主 bot 不算向量，本地召回走 FTS5/LIKE 关键词（离线、零成本）。
+  #   true  → 写入时**异步**生成向量、recall 走向量语义检索（更好的近义/跨表述召回）。
+  #           注意：开启会在每条 fact/topic 写入 + 每次 recall 时调用 embedding API（有成本/延迟）。
+  #           开启后需对存量数据跑一次：`npx tsx src/cli.ts memory backfill-embeddings`
+  enabled: false
+
   # 提供者: openai (OpenAI 兼容 API) | local (本地 hash-based)
   provider: local
 
@@ -331,6 +338,25 @@ embedding:
   # dimensions: 768
   # similarity_metric: dot_product
 
+# ─── 全局隐私兜底（按会话分级的私密 / 公开控制） ───
+# bot 的每一次跨会话读写（查聊天记录、查人物档案、跨会话发送 / dispatch、记忆召回）都会
+# 受控，防止把私密群 / 私聊的内容带到无关会话。
+privacy:
+  # 始终视为私密的会话 ID（敏感群 / 私聊），格式见下方示例。
+  # LLM 也可在运行时用 privacy.markSensitive() 追加（只进不出，持久化在 GroupModel），
+  # 例如群里有人表达"不希望 bot 把这里的话带出去"时主动收紧。
+  # sensitive_chats:
+  #   - "telegram:-1001234567890"
+  #   - "onebot:private:123456789"
+  sensitive_chats: []
+  # 私聊(DM)是否自动判为私密（默认 true，与 fact 默认 visibility 一致）。
+  dm_auto_private: true
+  # 是否允许 LLM 在运行时用 privacy.markSensitive() 自行把会话加入私密名单（只进不出）。
+  # 默认 true；设 false 则私密名单只能由管理员在上方 sensitive_chats 配置，LLM 调用会被拒绝。
+  allow_llm_mark_sensitive: true
+  # 越界处理: block（拦截，默认）| warn（仅在日志/Dashboard 告警，不拦截，便于上线先观察）| off（关闭兜底）
+  enforce: block
+
 # ─── Dashboard 监控仪表盘 ───
 # 实时可视化系统状态、消息流、队列、决策等
 dashboard:
@@ -348,8 +374,8 @@ dashboard:
 # 对外暴露 Prometheus 兼容的 /metrics 端点，供 Grafana / Prometheus 抓取
 # 所有字段可选，缺省使用括号内安全默认值
 metrics:
-  # 是否启用（默认 true）
-  enabled: true
+  # 是否启用（默认 false）
+  enabled: false
   # ⚠️ 绑定地址（默认 "127.0.0.1" = 仅本机可访问）
   # 强烈建议保持此值。若需要远端 Prometheus 抓取，请使用 nginx/Caddy 反向代理
   # 并配置 IP allowlist，而非直接修改此字段为 0.0.0.0。
@@ -370,7 +396,7 @@ metrics:
 #   # Subagent 发言前禁用词检查列表。包含任一词语的文字消息将被拦截，
 #   # 并向 LLM 上下文发出警告，要求修改措辞后重新发送。
 #   # 传空列表（[]）可完全禁用此检查。
-#   # 不填时使用内置默认词表（"确实"、"笑死"、"接住" 等口癖词）。
+#   # 也可通过 Dashboard → CodeAct 配置面板管理。
 #   banned_words:
 #     - 确实
 #     - 笑死

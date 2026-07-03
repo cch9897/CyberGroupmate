@@ -78,6 +78,11 @@ export interface LLMConfig {
     errorContentPatterns?: string[];
     /** OpenAI Responses API 请求模式：stream / non_stream。仅 provider=openai_responses 时生效，默认 non_stream。 */
     responsesRequestMode?: "stream" | "non_stream";
+    /**
+     * 仅在「生成回复」时（session/executor reply 路径）注入的额外提示词，贴在 task prompt 最末尾（recency 最高，紧贴生成）。
+     * 不影响 memory / meta / 决策路由等其它用途；system prompt 与 persona 均不改动。
+     */
+    replyPrompt?: string;
 }
 
 /** 相似度度量方法 */
@@ -85,6 +90,12 @@ export type SimilarityMetric = "cosine" | "dot_product" | "euclidean" | "manhatt
 
 /** Embedding 配置 */
 export interface EmbeddingConfig {
+    /**
+     * 是否启用向量 embedding 检索。默认 false：主 bot 路径不算 embedding，
+     * 本地召回走 FTS5/LIKE 关键词。设 true 才会在写入时（异步）生成向量、recall 用向量。
+     * 开启后需对存量 fact/topic 跑一次 `cli memory backfill-embeddings`。
+     */
+    enabled: boolean;
     /** 提供者：openai 兼容 API 或本地 hash-based */
     provider: "openai" | "local";
     /** API base URL（OpenAI 兼容） */
@@ -281,7 +292,7 @@ export interface SubagentExternalConfig {
     /**
      * Subagent 发言前禁用词列表。
      * 若文本消息中包含列表中的任一词语，发送将被拦截并向 LLM 发出警告提示改写。
-     * 若不配置，使用内置默认词表（见 src/core/banned-words.ts DEFAULT_BANNED_WORDS）。
+     * 通过 Dashboard 或 config.yaml 配置；未配置时不拦截。
      */
     bannedWords?: string[];
     cosineDecay?: {
@@ -399,7 +410,7 @@ export interface DashboardExternalConfig {
 
 /** Metrics Exporter 配置 */
 export interface MetricsConfig {
-    /** 是否启用。默认 true */
+    /** 是否启用。默认 false */
     enabled?: boolean;
     /**
      * 绑定地址。默认且强烈推荐保持 "127.0.0.1"（仅本机可访问）。
@@ -426,7 +437,14 @@ export interface EnvironmentVariable {
     scope: "both" | "host" | "sandbox";
 }
 
-/** MCP Server 预配置（config.yaml 中声明，Sandbox 启动时自动连接） */
+/**
+ * MCP Server 预配置（config.yaml 中声明，Sandbox 启动时自动连接）。
+ *
+ * command / args / env / url / headers 的字符串值支持 `${VAR}` 环境变量插值——
+ * VAR 取自 env_vars 注入器（scope=host/both，写入 host 进程 process.env），
+ * 在连接/请求时解析，密钥不会以明文落盘到 mcp-connections.json。
+ * 例：headers: { Authorization: "Bearer ${ZAI_API_KEY}" }
+ */
 export interface McpServerPreConfig {
     /** 显示名称（也是 tool 命名空间） */
     name: string;
@@ -459,6 +477,25 @@ export interface GroundingConfig {
 }
 
 /**
+ * 全局隐私兜底配置（visibility-policy）。
+ * 把 visibility 提升为按 chat 分级的全局概念，在代码层兜底防止跨群/跨私聊的隐私泄露。
+ * 详见 src/core/visibility-policy.ts。
+ */
+export interface PrivacyConfig {
+    /** 人工种子：始终视为私密/敏感的 composite chatId（敏感群 / 私聊）。 */
+    sensitiveChats: string[];
+    /** 私聊(DM)是否自动判为私密。默认 true（与 fact 默认 visibility 一致）。 */
+    dmAutoPrivate: boolean;
+    /**
+     * 是否允许 LLM 在运行时用 privacy.markSensitive() 自行把会话加入私密名单（只进不出，持久化在 GroupModel）。
+     * 默认 true。设 false 则只能由管理员通过 sensitiveChats 配置，LLM 调用会被拒绝。
+     */
+    allowLlmMarkSensitive: boolean;
+    /** 越界处理模式：block（拦截，默认）| warn（仅告警不拦截，便于上线观察）| off（关闭兜底）。 */
+    enforce: "block" | "warn" | "off";
+}
+
+/**
  * 维护约定：这里能配置的，dashboard 也必须能配置。
  * 每新增一个字段，请同步三处：① 上面对应的解析函数（parseXxxConfig）；
  * ② serializeConfigToObject 的序列化（写回 yaml）；③ dashboard UI（src/dashboard/ui/src/panels/config/ 下对应的 *Tab.svelte）。
@@ -477,6 +514,8 @@ export interface AppConfig {
     reflection: ReflectionExternalConfig;
     contextBudget?: ContextBudgetConfig;
     embedding: EmbeddingConfig;
+    /** 全局隐私兜底（按 chat 分级的 visibility 控制） */
+    privacy: PrivacyConfig;
     subagent?: SubagentExternalConfig;
     dashboard?: DashboardExternalConfig;
     vision?: VisionConfig;
@@ -523,12 +562,20 @@ const DEFAULT_LLM: LLMConfig = {
 };
 
 const DEFAULT_EMBEDDING: EmbeddingConfig = {
+    enabled: false,
     provider: "local",
     baseUrl: "https://api.openai.com/v1",
     apiKey: "",
     model: "text-embedding-3-small",
     dimensions: 128,
     similarityMetric: "cosine",
+};
+
+const DEFAULT_PRIVACY: PrivacyConfig = {
+    sensitiveChats: [],
+    dmAutoPrivate: true,
+    allowLlmMarkSensitive: true,
+    enforce: "block",
 };
 
 // ─── 配置加载 ───
@@ -675,6 +722,7 @@ export function loadConfig(configPath?: string, forceReload?: boolean): AppConfi
         },
         contextBudget: parsedContextBudget,
         embedding: parseEmbeddingConfig(fileConfig),
+        privacy: parsePrivacyConfig(fileConfig),
         subagent: parseSubagentConfig(fileConfig),
         dashboard: parseDashboardConfig(fileConfig),
         vision: parseVisionConfig(fileConfig),
@@ -736,10 +784,13 @@ export function resolveComponentTimeout(component: RoutingComponentKey, config?:
     return undefined;
 }
 
-/** 获取 embedding 配置 */
-export function resolveEmbeddingConfig(config?: AppConfig): EmbeddingConfig {
+/**
+ * 获取生效的 embedding 配置：embedding.enabled=false 时返回 undefined（关键词召回，不写向量、不打 embedding API）。
+ * 单一闸口——所有调用方（main / cli）都经此判定，避免各处自行决定是否启用而漂移。
+ */
+export function resolveEmbeddingConfig(config?: AppConfig): EmbeddingConfig | undefined {
     const cfg = config ?? loadConfig();
-    return cfg.embedding;
+    return cfg.embedding?.enabled ? cfg.embedding : undefined;
 }
 
 export function clearConfigCache(): void {
@@ -753,7 +804,15 @@ export function clearConfigCache(): void {
 function parseEmbeddingConfig(fileConfig: Record<string, unknown>): EmbeddingConfig {
     const raw = (fileConfig.embedding ?? {}) as Record<string, unknown>;
 
+    // 稳健布尔解析：YAML 原生 true/false 直接用；字符串 true/yes/on/1 视为开；其余/缺省回退默认（不 fail-open）。
+    const rawEnabled = raw.enabled;
+    const enabled = typeof rawEnabled === "boolean" ? rawEnabled
+        : typeof rawEnabled === "number" ? rawEnabled !== 0
+        : typeof rawEnabled === "string" ? ["true", "yes", "on", "1", "enabled"].includes(rawEnabled.trim().toLowerCase())
+        : DEFAULT_EMBEDDING.enabled;
+
     const result: EmbeddingConfig = {
+        enabled,
         provider: (str(raw.provider) as "openai" | "local") ?? DEFAULT_EMBEDDING.provider,
         baseUrl: str(raw.base_url) ?? DEFAULT_EMBEDDING.baseUrl,
         apiKey: str(raw.api_key) ?? DEFAULT_EMBEDDING.apiKey,
@@ -961,6 +1020,39 @@ function parseRecordingPipelineConfig(fileConfig: Record<string, unknown>): Reco
 
 // ─── Grounding 配置解析 ───
 
+function parsePrivacyConfig(fileConfig: Record<string, unknown>): PrivacyConfig {
+    const raw = (fileConfig.privacy && typeof fileConfig.privacy === "object")
+        ? fileConfig.privacy as Record<string, unknown>
+        : {};
+    const enforceRaw = str(raw.enforce);
+    const enforce: PrivacyConfig["enforce"] =
+        enforceRaw === "warn" || enforceRaw === "off" || enforceRaw === "block"
+            ? enforceRaw
+            : DEFAULT_PRIVACY.enforce;
+
+    const explicit = Array.isArray(raw.sensitive_chats) ? (raw.sensitive_chats as unknown[]).map(String) : [];
+    const sensitiveChats = [...new Set(explicit)];
+
+    // 健壮布尔解析：识别 YAML/字符串的真/假写法；无法识别（含空串）回退默认，绝不 fail-open 成 true。
+    // （yaml@2 不会把 off/yes/no 当布尔，会留成字符串，故必须显式覆盖。）
+    const parseBool = (v: unknown, dflt: boolean): boolean => {
+        if (v == null) return dflt;
+        if (typeof v === "boolean") return v;
+        if (typeof v === "number") return v !== 0;
+        const s = String(v).trim().toLowerCase();
+        if (["false", "no", "off", "0", "n", "disabled"].includes(s)) return false;
+        if (["true", "yes", "on", "1", "y", "enabled"].includes(s)) return true;
+        return dflt;
+    };
+
+    return {
+        sensitiveChats,
+        dmAutoPrivate: parseBool(raw.dm_auto_private, DEFAULT_PRIVACY.dmAutoPrivate),
+        allowLlmMarkSensitive: parseBool(raw.allow_llm_mark_sensitive, DEFAULT_PRIVACY.allowLlmMarkSensitive),
+        enforce,
+    };
+}
+
 function parseGroundingConfig(fileConfig: Record<string, unknown>): GroundingConfig | undefined {
     const raw = fileConfig.grounding as Record<string, unknown> | undefined;
     if (!raw || typeof raw !== "object") return undefined;
@@ -1113,6 +1205,7 @@ function parseLLMProfile(raw: Record<string, unknown>): LLMConfig {
             ? raw.error_content_patterns.map(String)
             : undefined,
         responsesRequestMode: (str(raw.responses_request_mode) as "stream" | "non_stream" | undefined),
+        replyPrompt: str(raw.reply_prompt),
     };
 }
 
@@ -1221,6 +1314,7 @@ export function serializeConfigToObject(config: AppConfig): Record<string, unkno
         if (p.customHeaders && Object.keys(p.customHeaders).length > 0) entry.custom_headers = p.customHeaders;
         if (p.errorContentPatterns && p.errorContentPatterns.length > 0) entry.error_content_patterns = p.errorContentPatterns;
         if (p.responsesRequestMode) entry.responses_request_mode = p.responsesRequestMode;
+        if (p.replyPrompt) entry.reply_prompt = p.replyPrompt;
         if (p.supportsPrefill === false) entry.supports_prefill = false;
         if (p.pricing) {
             const pricing: Record<string, unknown> = {
@@ -1379,6 +1473,7 @@ export function serializeConfigToObject(config: AppConfig): Record<string, unkno
 
     // embedding
     const emb: Record<string, unknown> = {
+        enabled: config.embedding.enabled,
         provider: config.embedding.provider,
         base_url: config.embedding.baseUrl,
         api_key: config.embedding.apiKey,
@@ -1531,6 +1626,14 @@ export function serializeConfigToObject(config: AppConfig): Record<string, unkno
             scope: ev.scope,
         }));
     }
+
+    // privacy（全局 visibility 兜底）
+    obj.privacy = {
+        sensitive_chats: config.privacy?.sensitiveChats ?? DEFAULT_PRIVACY.sensitiveChats,
+        dm_auto_private: config.privacy?.dmAutoPrivate ?? DEFAULT_PRIVACY.dmAutoPrivate,
+        allow_llm_mark_sensitive: config.privacy?.allowLlmMarkSensitive ?? DEFAULT_PRIVACY.allowLlmMarkSensitive,
+        enforce: config.privacy?.enforce ?? DEFAULT_PRIVACY.enforce,
+    };
 
     // grounding
     if (config.grounding) {

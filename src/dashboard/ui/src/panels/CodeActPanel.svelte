@@ -1,7 +1,8 @@
 <script>
-  import { appState, selectedCodeActChatId, activeTab, codeActProgress, clearCodeActProgress } from '../lib/stores.js';
+  import { appState, selectedCodeActChatId, activeTab, codeActProgress, clearCodeActProgress, messages } from '../lib/stores.js';
   import { api } from '../lib/api.js';
   import { getGroupLabel, formatCodeActContent, isAtBottom, scrollToBottom, getPlatform, platformLabel } from '../lib/utils.js';
+  import { sortGroupsByLastMessage } from '../lib/chat-order.js';
   import { onDestroy, tick } from 'svelte';
   import MonacoEditor from '../components/MonacoEditor.svelte';
 
@@ -25,7 +26,7 @@
   let debugTypesLoading = false;
   let debugOutputEl;
 
-  $: groups = $appState.groups;
+  $: groups = sortGroupsByLastMessage($appState.groups, $messages);
   $: metaCodeAct = $appState.metaCodeAct || { chatId: META_CHAT_ID, sessionSize: 0, executionCount: 0, queueSize: 0, isProcessing: false };
   $: metaHistoryBudget = sessionData.historyBudget || metaCodeAct.historyBudget;
   $: if ($activeTab === 'codeact' && $selectedCodeActChatId) refreshSession($selectedCodeActChatId);

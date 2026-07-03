@@ -38,6 +38,34 @@ interface MemorySearchEntitiesOptions {
     limit?: number;
 }
 
+interface MemorySessionDigest {
+    id?: string;
+    /** Unix epoch milliseconds. */
+    createdAt: number;
+    content: string;
+    kind?: string;
+    actorType?: "meta" | "subagent" | "harness" | "system";
+    actorId?: string;
+    sourceChatId?: string | null;
+    sourceChatTitle?: string | null;
+    targetChatId?: string | null;
+    taskId?: string | null;
+    runId?: string | null;
+    tags?: string[];
+    importance?: number;
+    visibility?: "private" | "contextual" | "public";
+    metadata?: Record<string, unknown>;
+}
+
+interface MemoryTimelineOptions {
+    chatId?: string;
+    after?: number;
+    before?: number;
+    limit?: number;
+    includeTopics?: boolean;
+    includeDigests?: boolean;
+}
+
 interface MemoryIdentityMatch {
     identity: {
         userId: string;
@@ -69,7 +97,7 @@ interface MemorySearchEntitiesResult {
         keywords: string[];
         participants: string[];
     }>;
-    sessionDigests: Array<{ createdAt: number; content: string }>;
+    sessionDigests: MemorySessionDigest[];
     coreFacts: Array<{
         factId: string;
         subject: string;
@@ -171,4 +199,26 @@ declare const memory: {
      * console.log(JSON.stringify(result.coreFacts, null, 2));
      */
     searchEntities(query: string, options?: MemorySearchEntitiesOptions): Promise<MemorySearchEntitiesResult>;
+
+    /**
+     * 专门检索 agent 自己的意识流/意图记忆，包括 Meta 决策、subagent 回调、harness 做梦结果和 follow-up 想法。
+     */
+    searchAgentMemory(query: string, options?: MemorySearchEntitiesOptions & {
+        actorType?: "meta" | "subagent" | "harness" | "system";
+        kind?: string;
+        tags?: string[];
+    }): Promise<{ sessionDigests: MemorySessionDigest[] }>;
+
+    /**
+     * 获取跨 session digests 和 topics 的近期时间线，用于回顾最近发生了什么、agent 本来想做什么。
+     */
+    getTimeline(options?: MemoryTimelineOptions): Promise<{ entries: Array<{
+        type: "session_digest" | "topic";
+        timestamp: number;
+        chatId?: string | null;
+        title?: string;
+        content: string;
+        refId?: string;
+        metadata?: Record<string, unknown>;
+    }> }>;
 };

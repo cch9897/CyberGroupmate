@@ -10,8 +10,10 @@ shared/cron.d.ts — 定时任务管理模块类型定义 通过 Host 侧 Global
 ## discord
 discord.d.ts — Discord 平台 API 系统注入的 Discord host proxy 接口。 提供给 Agent 在 sandbox 执行时作为 TypeScript 强类型上下文参考。 平台连接与消息监听由宿主侧 DiscordAdapter 管理。
 
-- `sendText`: 发送文本消息到指定频道。
-- `sendMedia`: 发送媒体消息（附件）到指定频道。支持 URL 和本地文件路径（支持绝对路径或基于 cwd 工作区的相对路径）。
+- `send`: Discord.js 原生 TextBasedChannel.send(options) 风格入口。 channelId 由 CyberGroupmate 用来定位频道；options 保持 discord.js MessageCreateOptions 形状。 旧 sendText/sendMedia wrapper 只保留兼容，不再扩展新 Discord 参数。
+- `createMessage`: Discord REST create message 风格别名，参数同 discord.send(channelId, options)。
+- `sendText`: 发送文本消息到指定频道。兼容 wrapper，冻结为兜底用法；新参数优先用 discord.send。
+- `sendMedia`: 发送媒体消息（附件）到指定频道。兼容 wrapper，冻结为兜底用法；新参数优先用 discord.send。 支持 URL 和本地文件路径（支持绝对路径或基于 cwd 工作区的相对路径）。
 - `sendReaction`: 对指定消息添加表情反应。支持 Unicode emoji、自定义 emoji ID、name:id 或 Discord emoji mention 格式。
 - `sendTyping`: 在频道中显示 "正在输入..." 状态。
 
@@ -38,7 +40,7 @@ filesystem.d.ts — 文件系统操作模块类型定义 所有路径操作限�
 - `stat`: 获取文件或目录的状态信息。
 
 ## todo
-shared/todo.d.ts — 不只是代办，可以当你的记事本用。 用于持久化当前群的待办、规则和长期约定（比如群规、话语风格、被教导的/发现的事实性记忆）。 数据按群隔离，可选设置到期时间。“定期、到期提醒”类请使用 remind 或者 cron 模块。
+shared/todo.d.ts — 不只是代办，可以当你的记事本用。 用于持久化当前群的待办、规则和长期约定（比如群规、话语风格、被教导的/发现的事实性记忆）。 数据按群隔离，可选设置到期时间。“定期、到期提醒”类请使用 remind 或者 cron 模块。 未传 dueAt 时默认 30 天后过期；每次 upsert 都会刷新默认过期时间。永久规则必须显式设置 forever: true。
 
 - `list`: 列出当前群的 todo。
 - `get`: 获取单个 todo。
@@ -63,7 +65,7 @@ modules/memory.d.ts — 记忆检索模块类型定义
 - `getRecentInteractions`: getRecentInteractions(chatId?, userId?, limit?)
 - `resolvePerson`: resolvePerson(query, options?)
 - `getPersonDossier`: getPersonDossier(queryOrUserId, options?)
-- `semanticSearch`: semanticSearch(query, options?)
+- `semanticSearch`: 语义检索记忆（事实 + 话题）。 话题按当前会话收窄；核心事实（人物画像类）为全局知识，仍可能返回。
 
 ## onebot
 onebot.d.ts — QQ / OneBot 平台 API 系统注入的 OneBot host proxy 接口。 也会以 `qq` 别名暴露给 sandbox。
@@ -74,14 +76,29 @@ onebot.d.ts — QQ / OneBot 平台 API 系统注入的 OneBot host proxy 接口�
 - `useUsersAndProfile`: 加载 OneBot/NapCat 用户与资料指南。用于好友列表、陌生人资料、最近会话、点赞、好友请求和账号资料等成组能力；调用本方法只披露指南。
 - `useSystemUtilities`: 加载 OneBot/NapCat 工具指南。用于版本/状态探测、发送能力检查、OCR、URL 安全检查、频道资料和 AI 语音等低频能力；调用本方法只披露指南。
 - `getMessage`: 根据 OneBot 消息 ID 获取消息详情。
-- `sendText`: 发送文本消息。
-- `sendMedia`: 发送媒体消息。支持本地文件路径或 URL。 当 `type` 为 `audio` / `voice` 时，QQ/NapCat 不支持 `replyTo`，该参数会被忽略。
-- `sendFile`: 发送文件。
-- `sendSticker`: 发送贴纸或图片表情。
-- `sendFace`: 发送 QQ 系统表情（CQ face）。
+- `callApi`: 调用 OneBot/NapCat 原生 action，参数保持平台原始 params 对象。 这是新增能力的首选入口；旧 sendText/sendMedia wrapper 只保留兼容，不再扩展新平台参数。
+- `send_group_msg`: OneBot 原生 send_group_msg(params)。参数名和行为保持 OneBot/NapCat 原样。
+- `send_private_msg`: OneBot 原生 send_private_msg(params)。参数名和行为保持 OneBot/NapCat 原样。
+- `send_msg`: OneBot 原生 send_msg(params)，可用 message_type/group_id/user_id 选择目标。
+- `delete_msg`: OneBot 原生 delete_msg(params)。
+- `get_msg`: OneBot 原生 get_msg(params)。
+- `mention`: 构造 OneBot 标准 @ 消息段。只构造 segment，不会发送。兼容辅助函数，冻结为兜底用法。
+- `sendMessage`: 发送 OneBot 标准消息。message 可以是 CQ 字符串或消息段数组。兼容辅助函数，冻结为兜底用法。 用于文本、@、回复、图片、语音、视频、文件、表情等混合消息。
+- `sendAt`: 在群聊里 @ 指定 QQ 用户并追加文本。兼容辅助函数，冻结为兜底用法。 userId 支持裸 QQ 号、onebot:<qq>、onebot:private:<qq>、"all"、数组或逗号分隔字符串。
+- `sendText`: 发送文本消息。兼容 wrapper，冻结为兜底用法；新参数优先用 send_group_msg/send_private_msg/callApi。
+- `sendMedia`: 发送媒体消息。兼容 wrapper，冻结为兜底用法；新参数优先用 OneBot 原生 action。 支持本地文件路径或 URL。当 `type` 为 `audio` / `voice` 时，QQ/NapCat 不支持 `replyTo`，该参数会被忽略。
+- `sendFile`: 发送文件。兼容 wrapper，冻结为兜底用法；新参数优先用 OneBot 原生 action。
+- `sendSticker`: 发送贴纸或图片表情。兼容 wrapper，冻结为兜底用法；新参数优先用 OneBot 原生 action。
+- `sendFace`: 发送 QQ 系统表情（CQ face）。兼容 wrapper，冻结为兜底用法；新参数优先用 OneBot 原生 action。
 - `sendTyping`: OneBot 无 typing 指示，此方法为 no-op。
 - `deleteMessages`: 撤回消息。
 - `downloadMedia`: 下载 QQ 媒体到 CyberGroupmate 本机 workspace/Downloads/。 mediaRef 可以是图片/媒体 file、URL、base64/data URL，也可以直接传 OneBot 消息 ID； 传消息 ID 时会通过 NapCat get_msg 解析消息里的图片/媒体段。
+
+## privacy
+modules/privacy.d.ts — 隐私分级模块类型定义 全局 visibility 兜底：系统会按 chat 分级（private / shared）在代码层拦截跨会话的隐私泄露。 你不需要手动检查权限——读取其它私密会话的数据会被自动过滤/遮蔽，从私密会话向外发送/派发会直接报错。 本模块让你可以「主动收紧」：把某个会话标记为敏感（只进不出），以及查询某会话当前的隐私状态。
+
+- `markSensitive`: 把某个会话标记为敏感/私密（append-only：只进不出，标记后无法撤销，重启后依然生效）。 典型场景：群里有人表达出对「bot 把这里的对话带到别处 / 记住并外泄」的担忧时， 你可以主动调用本方法把当前会话收紧为私密。之后： - 在别的会话里再也无法读到本会话的消息/话题/私密 fact； - 绑定在本会话时，向其它会话 sendText / dispatch 会被代码拦截。 注意：管理员可通过 privacy.allow_llm_mark_sensitive=false 禁用本方法；被禁用时调用会抛错。
+- `status`: 查询某会话当前的隐私状态（visibility 及其来源）。
 
 ## runtime
 shared/runtime.d.ts — 系统级能力
@@ -137,7 +154,7 @@ telegram.d.ts — Telegram 平台 API 这是系统注入的 Telegram host proxy 
 - `useInvites`: 加载邀请链接与入群请求指南。用于创建/编辑/撤销邀请链接、查看邀请成员、处理 join request 或预览邀请链接；调用本方法只披露指南。
 - `useForumTopics`: 加载论坛话题指南。用于确认群是否开启 Forum、列出话题或定位 topic id；调用本方法只披露相关 API。
 - `useMediaDownload`: 加载媒体下载指南。包含：1) 用 fs.writeFileBinary() 正确保存 base64 buffer 的方法；2) GIF/短视频抽帧分析时避免 60s 超时的策略（默认 4-6 帧、复用已有文件、先发进度）。遇到 downloadMedia 或 GIF 分析相关问题时调用。
-- `sendText`: 发送普通文本消息
+- `sendText`: mtcute 原生 sendText(chatId, text, params?)。text 支持 string 或 { text, entities }，params 保留 mtcute CommonSendParams 及新增字段。
 - `sendMedia`: 发送媒体消息。支持 URL 和本地文件路径（支持绝对路径或基于 cwd 工作区的相对路径）。
 - `sendFile`: 发送磁盘文件到聊天。支持绝对路径或基于 cwd 的相对路径。host 侧读取文件并上传。始终作为文件/文档发送。
 - `sendSticker`: 发送贴纸。通过 uniqueFileId 引用本地已缓存的贴纸文件。

@@ -53,7 +53,8 @@ export const COLUMN_WHITELIST = {
         "chat_title", "description", "dominant_language",
         "communication_norms", "active_members", "avg_messages_per_day",
         "peak_hours", "agent_role", "engagement_level", "recent_feedback",
-        "hot_topics", "taboo_topics", "last_reflected_at", "is_direct_message", "updated_at",
+        "hot_topics", "taboo_topics", "last_reflected_at", "is_direct_message",
+        "marked_sensitive", "sensitive_reason", "sensitive_at", "updated_at",
     ],
     interactions: [
         "chat_id", "user_id", "topic_id", "type", "summary",
@@ -62,6 +63,11 @@ export const COLUMN_WHITELIST = {
     message_log: [
         "message_id", "chat_id", "user_id", "display_name",
         "text", "reply_to_message_id", "timestamp", "media_type", "media_info",
+    ],
+    session_digests: [
+        "kind", "actor_type", "actor_id", "source_chat_id", "source_chat_title",
+        "target_chat_id", "task_id", "run_id", "content", "tags", "importance",
+        "visibility", "metadata", "embedding", "created_at",
     ],
 } as const;
 

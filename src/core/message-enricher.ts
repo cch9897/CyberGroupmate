@@ -233,7 +233,14 @@ export async function enrichMessages(
 
     // ─── 2. Vision 批量处理 ───
     if (options.enableMediaProcessing !== false && attachments.length > 0) {
-        log.info("媒体富化开始", { count: attachments.length, chatId: options.chatId });
+        log.info("媒体富化开始", {
+            count: attachments.length,
+            chatId: options.chatId,
+            mediaDownloadEnabled,
+            hasDownloadFn: !!downloadFn,
+            hasMediaDownloader: !!mediaDownloader,
+            mediaTypes: options.mediaTypes,
+        });
         try {
             const processed = await processMediaBatch(
                 attachments,
@@ -254,7 +261,11 @@ export async function enrichMessages(
                     m.processedMedia.push(pm);
                 }
             }
-            log.info("媒体富化完成", { processed: processed.length, chatId: options.chatId });
+            log.info("媒体富化完成", {
+                processed: processed.length,
+                chatId: options.chatId,
+                attachmentCount: attachments.length,
+            });
         } catch (err) {
             log.warn("媒体富化失败，继续使用占位符", { chatId: options.chatId, error: String(err) });
         }

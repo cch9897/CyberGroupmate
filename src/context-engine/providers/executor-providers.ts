@@ -14,7 +14,7 @@
 
 import type { SectionProvider, ResolveContext, DiffResult } from "../types.js";
 import { deriveChatType } from "../prompt-renderer-utils.js";
-import { formatTsForPrompt } from "../../core/timezone.js";
+import { formatTsForPrompt, getWeekdayLabel } from "../../core/timezone.js";
 
 // ─── ResolveContext 扩展（executor 专用字段） ───
 
@@ -38,7 +38,14 @@ export interface ExecutorResolveContext extends ResolveContext {
     targetMessages?: string;
     availableStickers?: Array<{ emoji?: string; emojis?: string[]; description: string; uniqueFileId: string }>;
     groundingContext?: string;
-    sessionDigests?: Array<{ createdAt: string; content: string }>;
+    sessionDigests?: Array<{
+        createdAt: string;
+        content: string;
+        kind?: string;
+        actorType?: string;
+        sourceChatId?: string | null;
+        targetChatId?: string | null;
+    }>;
     sessionDigestLimit?: number;
     imageParts?: unknown[];
     useSkills?: string[];
@@ -61,7 +68,19 @@ interface ExecutorTargetMessagesData {
 }
 
 interface ExecutorSessionDigestsData {
-    sessionDigests: Array<{ createdAt: string; content: string }>;
+    sessionDigests: Array<{
+        id?: string;
+        createdAt: string;
+        content: string;
+        kind?: string;
+        actorType?: string;
+        actorId?: string;
+        sourceChatId?: string | null;
+        sourceChatTitle?: string | null;
+        targetChatId?: string | null;
+        taskId?: string | null;
+        runId?: string | null;
+    }>;
 }
 
 const TARGET_MESSAGE_HEADER_RE = /^\[[^\]]*\] \[msgId:([^\]]+)\] /;
@@ -306,25 +325,59 @@ function renderTargetMessagesBody(data: ExecutorTargetMessagesData): string {
 }
 
 function clampSessionDigestLimit(value: unknown): number {
-    if (typeof value !== "number" || !Number.isFinite(value)) return 10;
+    if (typeof value !== "number" || !Number.isFinite(value)) return 30;
     return Math.max(1, Math.min(30, Math.floor(value)));
+}
+
+function stripDigestForSubagent(content: string): string {
+    const match = content.match(/\[SESSION_DIGEST\]([\s\S]*?)(?:\[\/SESSION_DIGEST\]|$)/);
+    if (match?.[1]?.trim()) return match[1].trim();
+    return content
+        .split("；")
+        .filter((seg) => !seg.startsWith("summary=") && !seg.startsWith("sent="))
+        .join("；");
+}
+
+function formatSessionDigestLine(item: ExecutorSessionDigestsData["sessionDigests"][number]): string {
+    const sourceParts = [
+        item.actorType,
+        item.actorId,
+        item.sourceChatTitle || item.sourceChatId,
+        item.kind,
+    ].filter(Boolean);
+    const source = sourceParts.length > 0 ? ` [${sourceParts.join(" / ")}]` : "";
+    const refs = [
+        item.taskId ? `task=${item.taskId}` : "",
+        item.runId ? `run=${item.runId}` : "",
+        item.targetChatId ? `target=${item.targetChatId}` : "",
+    ].filter(Boolean);
+    const refText = refs.length > 0 ? ` (${refs.join(", ")})` : "";
+    return `- [${formatTsForPrompt(item.createdAt)}]${source}${refText} ${stripDigestForSubagent(item.content)}`;
 }
 
 // ═══ 0. Meta Session Digests ═══
 
-/** Meta 历史 Session Digests — delta-only（给 subagent 同步总编排者最近状态增量） */
+/** 历史 Session Digests — delta-only（meta 和本体相关的摘要增量） */
 export const executorSessionDigestsProvider: SectionProvider<ExecutorSessionDigestsData> = {
     schema: {
         name: "executor.session_digests",
-        label: "Meta 历史 Session Digests",
+        label: "历史 Session Digests",
         source: "globalState.sessionDigests",
         cache: "delta",
         history: "delta-only",
     },
     resolve(ctx: ExecutorResolveContext) {
         if (!ctx.sessionDigests?.length) return null;
+        const myChat = ctx.chatId;
+        const visible = ctx.sessionDigests.filter((d) => {
+            if (d.actorType === "meta" || d.sourceChatId === "__meta__") return true;
+            if (d.sourceChatId === myChat || d.targetChatId === myChat) return true;
+            if (!d.sourceChatId && !d.targetChatId) return true;
+            return false;
+        });
+        if (!visible.length) return null;
         const limit = clampSessionDigestLimit(ctx.sessionDigestLimit);
-        return { sessionDigests: ctx.sessionDigests.slice(-limit) };
+        return { sessionDigests: visible.slice(-limit) };
     },
     diff(current, committed): DiffResult<ExecutorSessionDigestsData> {
         if (!committed) {
@@ -335,11 +388,11 @@ export const executorSessionDigestsProvider: SectionProvider<ExecutorSessionDige
             };
         }
 
-        const committedSet = new Set(
-            committed.sessionDigests.map((item) => `${item.createdAt}::${item.content}`)
-        );
+        const digestKey = (item: ExecutorSessionDigestsData["sessionDigests"][number]) =>
+            item.id ?? `${item.createdAt}::${item.content}`;
+        const committedSet = new Set(committed.sessionDigests.map(digestKey));
         const deltaDigests = current.sessionDigests.filter(
-            (item) => !committedSet.has(`${item.createdAt}::${item.content}`)
+            (item) => !committedSet.has(digestKey(item))
         );
 
         return {
@@ -355,7 +408,7 @@ export const executorSessionDigestsProvider: SectionProvider<ExecutorSessionDige
     render(data) {
         return [
             "# 历史 Session Digests",
-            ...data.sessionDigests.map((item) => `- [${formatTsForPrompt(item.createdAt)}] ${item.content}`),
+            ...data.sessionDigests.map(formatSessionDigestLine),
         ].join("\n");
     },
     renderDelta(delta) {
@@ -366,7 +419,7 @@ export const executorSessionDigestsProvider: SectionProvider<ExecutorSessionDige
         return [
             "# 历史 Session Digests",
             `(增量: ${delta.sessionDigests.length} 条)`,
-            ...delta.sessionDigests.map((item) => `- [${formatTsForPrompt(item.createdAt)}] ${item.content}`),
+            ...delta.sessionDigests.map(formatSessionDigestLine),
         ].join("\n");
     },
 };
@@ -379,6 +432,7 @@ export const executorHeaderProvider: SectionProvider<{
     chatType: string;
     chatTitle: string;
     taskId: string;
+    weekday: string;
 }> = {
     schema: {
         name: "executor.header",
@@ -393,11 +447,13 @@ export const executorHeaderProvider: SectionProvider<{
             chatType: deriveChatType(ctx.isDirectMessage),
             chatTitle: ctx.chatTitle ?? ctx.chatId,
             taskId: ctx.taskId,
+            weekday: getWeekdayLabel(),
         };
     },
     render(data) {
         return [
             `═══ ${data.taskId} ═══`,
+            ...(data.weekday ? [`今天: ${data.weekday}`] : []),
             `聊天对象: ${data.chatTitle}(${data.chatId}) [${data.chatType}]`,
         ].join("\n");
     },

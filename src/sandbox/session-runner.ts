@@ -15,7 +15,14 @@
 
 import { Sandbox, ExecutionResult } from "./sandbox.js";
 import type { NotificationCenter } from "../event/notification-center.js";
-import { callLLMWithFallback, ChatMessage, LLMResponse, type ImagePart } from "../core/llm.js";
+import {
+    callLLMWithFallback,
+    ChatMessage,
+    isLLMInterruptedByPendingMessage,
+    LLM_PENDING_MESSAGE_ABORT,
+    LLMResponse,
+    type ImagePart,
+} from "../core/llm.js";
 import type { LLMConfig } from "../core/config.js";
 import type { ContextManifest } from "../context-engine/types.js";
 import { ulid } from "ulid";
@@ -28,6 +35,11 @@ import {
     normalizeMessageMediaFields,
     type StickerDescriptionLookup,
 } from "../core/message-enricher.js";
+import {
+    getPendingMessageSignal,
+    parseSendInterruptedPayload,
+    type InterruptedSendPayload,
+} from "./send-interrupt.js";
 
 // ─── CodeAct Progress Events ───
 
@@ -180,6 +192,9 @@ const DEFAULT_MAX_TURNS = 30;
 
 /** 代码执行输出最大字符数 */
 const MAX_OUTPUT_CHARS = 32768;
+
+/** LLM 推理中收到新消息后稍等片刻，合并连续 direct attention */
+const LLM_PENDING_ABORT_DEBOUNCE_MS = 2000;
 
 /** 模型显式终止标记 */
 const END_TURN_MARKER = "<end_task>";
@@ -348,6 +363,38 @@ ${fullDocs}
 注意：获取完信息 console.log 出来看看再决定下一步行动。`;
 }
 
+function stripNewMessageHeader(content: string): string {
+    return content.replace(/^\[📩 新消息到达\]\n?/, "").trim();
+}
+
+function buildInterruptedSendObservation(
+    sentConfirmation: string,
+    sentCount: number,
+    pendingContent?: string,
+): string {
+    const parts: string[] = [];
+    parts.push(sentCount > 0
+        ? "[📩 发送过程中收到新消息，后续发送已暂停]"
+        : "[📩 发送前收到新消息，原计划发送已暂停]");
+
+    if (sentConfirmation) {
+        parts.push(sentConfirmation.replace("[📤 已发送消息确认]", "[📤 已发送]"));
+    }
+
+    if (pendingContent?.trim()) {
+        parts.push(`[👂 新消息]\n${stripNewMessageHeader(pendingContent)}`);
+    }
+
+    parts.push([
+        "[⏸ 原计划未发送]",
+        "剩余 1 条消息未发送。",
+    ].join("\n"));
+
+    parts.push("请基于已发送内容、新消息和未发送草稿重新判断下一步。不要重复发送已经发送过的内容；如果未发送草稿仍然合适，可以修改后继续发送。");
+
+    return parts.join("\n\n");
+}
+
 // ─── Session Runner ───
 
 /**
@@ -495,14 +542,62 @@ export async function runCodeActSession(
         // ─── 调用 LLM ───
         let llmResponse: LLMResponse;
         const configs = Array.isArray(llmConfig) ? llmConfig : [llmConfig];
+        const pendingSignal = chatId ? getPendingMessageSignal(chatId) : undefined;
+        const pendingAbortController = pendingSignal && pendingSignal.getPendingCount() === 0
+            ? new AbortController()
+            : undefined;
+        let unsubscribePendingAbort: (() => void) | undefined;
+        let pendingAbortTimer: ReturnType<typeof setTimeout> | undefined;
+        if (pendingSignal && pendingAbortController) {
+            const pendingVersion = pendingSignal.getVersion();
+            unsubscribePendingAbort = pendingSignal.onChange(() => {
+                if (
+                    !pendingAbortController.signal.aborted &&
+                    !pendingAbortTimer &&
+                    pendingSignal.getVersion() !== pendingVersion
+                ) {
+                    pendingAbortTimer = setTimeout(() => {
+                        if (!pendingAbortController.signal.aborted) {
+                            pendingAbortController.abort(new DOMException(LLM_PENDING_MESSAGE_ABORT, "AbortError"));
+                        }
+                    }, LLM_PENDING_ABORT_DEBOUNCE_MS);
+                    if (pendingAbortTimer.unref) pendingAbortTimer.unref();
+                }
+            });
+        }
         try {
             llmResponse = await callLLMWithFallback(messages, configs, {
                 caller: "session-runner",
+                // reply 路径：让实际选中的 profile 追加自己的 replyPrompt（fallback 时不会错用 profile[0] 的）。
+                applyReplyPrompt: true,
                 ...(prefill ? { prefill } : {}),
                 ...(stopSequences ? { stop: stopSequences } : {}),
                 ...(contextManifest ? { contextManifest } : {}),
+                ...(pendingAbortController ? { abortSignal: pendingAbortController.signal } : {}),
             });
         } catch (err: unknown) {
+            if (isLLMInterruptedByPendingMessage(err)) {
+                const drained = await pendingMessagesDrain?.();
+                if (drained) {
+                    const sanitizedContent = sanitizePromptTimestamps(drained.content);
+                    log.info(`Turn ${turnNum}: LLM 推理被新消息中断，注入后重算`, {
+                        length: drained.content.length,
+                        hasImages: !!drained.imageParts?.length,
+                    });
+                    messages.push({
+                        role: "user",
+                        content: sanitizedContent,
+                        ...(drained.imageParts?.length ? { imageParts: drained.imageParts } : {}),
+                    });
+                    emitProgress({
+                        turn: turnNum,
+                        phase: "new_messages",
+                        userMessage: sanitizedContent,
+                        isProcessing: true,
+                    });
+                    continue;
+                }
+            }
             const errorMsg =
                 err instanceof Error ? err.message : String(err);
 
@@ -517,6 +612,9 @@ export async function runCodeActSession(
                 endReason: "error",
                 error: `LLM call failed: ${errorMsg}`,
             };
+        } finally {
+            if (pendingAbortTimer) clearTimeout(pendingAbortTimer);
+            unsubscribePendingAbort?.();
         }
 
         let rawAssistantText = llmResponse.content;
@@ -658,6 +756,7 @@ export async function runCodeActSession(
         const outputParts: string[] = [];
         let executionHadRuntimeError = false;
         const runtimeErrorCodeParts: string[] = [];
+        let interruptedSendPayload: InterruptedSendPayload | null = null;
 
         for (let codeIndex = 0; codeIndex < finalCodeBlocks.length; codeIndex++) {
             const block = finalCodeBlocks[codeIndex];
@@ -676,6 +775,14 @@ export async function runCodeActSession(
                     error: result.error,
                     output: result.output,
                 });
+
+                if (result.error) {
+                    const payload = parseSendInterruptedPayload(result.output);
+                    if (payload) {
+                        interruptedSendPayload = payload;
+                        break;
+                    }
+                }
 
                 if (result.output) {
                     const truncated = truncateOutput(result.output);
@@ -728,6 +835,39 @@ export async function runCodeActSession(
         }
 
         turns.push(turn);
+
+        if (interruptedSendPayload) {
+            let sentConfirmation = "";
+            let interruptedSentCount = 0;
+            if (sentMessageCollector) {
+                const turnSent = sentMessageCollector.drainTurn();
+                const turnDupWarnings = sentMessageCollector.drainDuplicateWarnings();
+                interruptedSentCount = turnSent.length;
+                sentConfirmation = sentMessageCollector.formatAsObservation(turnSent, turnDupWarnings);
+            }
+            const pending = await pendingMessagesDrain?.();
+            const observation = sanitizePromptTimestamps(
+                buildInterruptedSendObservation(sentConfirmation, interruptedSentCount, pending?.content),
+                "timestamp",
+            );
+            log.info(`Turn ${turnNum}: 发送被新消息打断，已注入 observation`, {
+                method: interruptedSendPayload.method,
+                chatId: interruptedSendPayload.chatId,
+                hasPendingImages: !!pending?.imageParts?.length,
+            });
+            emitProgress({
+                turn: turnNum,
+                phase: "observation",
+                executionOutput: observation,
+                isProcessing: true,
+            });
+            messages.push({
+                role: "user",
+                content: observation,
+                ...(pending?.imageParts?.length ? { imageParts: pending.imageParts } : {}),
+            });
+            continue;
+        }
 
         // ─── 组装 observation ───
         let observation = outputParts.join("\n\n");

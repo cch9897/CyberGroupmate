@@ -27,6 +27,14 @@ export function formatDiscordAck(prefix: string, payload: unknown): string {
     return parts.join(" ");
 }
 
+function discordMessageContent(value: unknown): string {
+    if (typeof value === "string") return value;
+    if (value && typeof value === "object" && typeof (value as { content?: unknown }).content === "string") {
+        return (value as { content: string }).content;
+    }
+    return "";
+}
+
 // ─── Discord 客户端代理 ───
 
 export function createDiscordClientProxy(
@@ -109,6 +117,92 @@ export function createDiscordClientProxy(
     }
 
     return {
+        send: async (channelId: string, options: string | Record<string, unknown>) => {
+            const text = discordMessageContent(options);
+            if (text && bannedWords.length > 0) {
+                const found = findBannedWords(text, bannedWords);
+                if (found.length > 0) {
+                    const warning = buildBannedWordWarning(found, text);
+                    env.emitOutput(warning);
+                    env.notifyHost({
+                        type: "system.banned_word_blocked",
+                        scene: "discord",
+                        chatId: channelId,
+                        text,
+                        foundWords: found,
+                        timestamp: Date.now(),
+                    });
+                    return null;
+                }
+            }
+            if (text && shouldBlockDuplicate(channelId, text)) {
+                const warning = `[⚠ 运行时警告: 重复消息已拦截] 目标 channel=${channelId} 的消息 "${text.length > 80 ? text.slice(0, 80) + '...' : text}" 与本次 session 中已发送的消息内容完全一致，已自动拦截，不会重复发送。`;
+                env.emitOutput(warning);
+                env.notifyHost({
+                    type: "system.duplicate_message_blocked",
+                    scene: "discord",
+                    chatId: channelId,
+                    text,
+                    timestamp: Date.now(),
+                });
+                return null;
+            }
+            const sent = await env.callHost("discord.send", [channelId, options]);
+            if (text) recordSentIfDedupEnabled(channelId, text);
+            env.emitOutput(formatDiscordAck("[Discord] send ok", sent));
+            env.notifyHost({
+                type: "system.agent_message_sent",
+                scene: "discord",
+                chatId: channelId,
+                messageId: typeof sent === "object" && sent && "id" in sent ? (sent as { id?: unknown }).id : undefined,
+                text: text || "[message]",
+                timestamp: Date.now(),
+            });
+            return sent;
+        },
+        createMessage: async (channelId: string, options: string | Record<string, unknown>) => {
+            const text = discordMessageContent(options);
+            if (text && bannedWords.length > 0) {
+                const found = findBannedWords(text, bannedWords);
+                if (found.length > 0) {
+                    const warning = buildBannedWordWarning(found, text);
+                    env.emitOutput(warning);
+                    env.notifyHost({
+                        type: "system.banned_word_blocked",
+                        scene: "discord",
+                        chatId: channelId,
+                        text,
+                        foundWords: found,
+                        timestamp: Date.now(),
+                    });
+                    return null;
+                }
+            }
+            if (text && shouldBlockDuplicate(channelId, text)) {
+                const warning = `[⚠ 运行时警告: 重复消息已拦截] 目标 channel=${channelId} 的消息 "${text.length > 80 ? text.slice(0, 80) + '...' : text}" 与本次 session 中已发送的消息内容完全一致，已自动拦截，不会重复发送。`;
+                env.emitOutput(warning);
+                env.notifyHost({
+                    type: "system.duplicate_message_blocked",
+                    scene: "discord",
+                    chatId: channelId,
+                    text,
+                    timestamp: Date.now(),
+                });
+                return null;
+            }
+            const sent = await env.callHost("discord.createMessage", [channelId, options]);
+            if (text) recordSentIfDedupEnabled(channelId, text);
+            env.emitOutput(formatDiscordAck("[Discord] createMessage ok", sent));
+            env.notifyHost({
+                type: "system.agent_message_sent",
+                scene: "discord",
+                chatId: channelId,
+                messageId: typeof sent === "object" && sent && "id" in sent ? (sent as { id?: unknown }).id : undefined,
+                text: text || "[message]",
+                timestamp: Date.now(),
+            });
+            return sent;
+        },
         sendText: async (channelId: string, text: string, opts?: { replyTo?: string }) => {
             // ── 禁用词拦截 ──
             if (bannedWords.length > 0) {

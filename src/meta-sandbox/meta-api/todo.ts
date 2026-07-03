@@ -1,5 +1,5 @@
 import type { MemoryStoreV2 } from "../../memory-v2/index.js";
-import { timestampInputToIso } from "../../core/timezone.js";
+import { resolveTodoDueAt } from "../../core/todo-expiry.js";
 
 type TodoMemory = Pick<MemoryStoreV2,
     "todoList" |
@@ -12,8 +12,17 @@ type TodoMemory = Pick<MemoryStoreV2,
 export interface TodoSetInput {
     key: string;
     content: string;
+    bindingId: string;
+    dueAt?: string | number | Date | null;
+    forever?: boolean;
+}
+
+export interface TodoUpdateInput {
+    key?: string;
+    content?: string;
     bindingId?: string;
     dueAt?: string | number | Date | null;
+    forever?: boolean;
 }
 
 export interface TodoListInput {
@@ -36,10 +45,38 @@ export function createTodoApi(memory: TodoMemory) {
             );
         },
         set: async (input: TodoSetInput) => {
-            const bindingId = normalizeBindingId(input.bindingId);
+            const bindingId = requireBindingId(input.bindingId);
+            const key = requireNonEmpty(input.key, "key");
+            const content = requireNonEmpty(input.content, "content");
             return {
                 bindingId,
-                ...memory.todoUpsert(bindingId, input.key, input.content, timestampInputToIso(input.dueAt) ?? null),
+                ...memory.todoUpsert(bindingId, key, content, resolveTodoDueAt(input)),
+            };
+        },
+        update: async (key: string, input: TodoUpdateInput, bindingId: string) => {
+            const currentBindingId = requireBindingId(bindingId);
+            const currentKey = requireNonEmpty(key, "key");
+            const existing = memory.todoGet(currentBindingId, currentKey);
+            if (!existing) return null;
+
+            const nextBindingId = input.bindingId != null
+                ? requireBindingId(input.bindingId)
+                : currentBindingId;
+            const nextKey = input.key != null
+                ? requireNonEmpty(input.key, "key")
+                : currentKey;
+            const nextContent = input.content != null
+                ? requireNonEmpty(input.content, "content")
+                : existing.content;
+            const nextDueAt = resolveTodoDueAt(input);
+
+            if (nextBindingId !== currentBindingId || nextKey !== currentKey) {
+                memory.todoRemove(currentBindingId, currentKey);
+            }
+
+            return {
+                bindingId: nextBindingId,
+                ...memory.todoUpsert(nextBindingId, nextKey, nextContent, nextDueAt),
             };
         },
         delete: async (key: string, bindingId = "meta") => {
@@ -51,6 +88,22 @@ export function createTodoApi(memory: TodoMemory) {
 function normalizeBindingId(bindingId?: string): string {
     const value = bindingId?.trim();
     return value && value.length > 0 ? value : "meta";
+}
+
+function requireBindingId(bindingId?: string): string {
+    const value = bindingId?.trim();
+    if (!value) {
+        throw new Error("bindingId 不能为空：只有真正全局事项才显式使用 bindingId='meta'，群/子 agent 规则必须绑定到对应 chatId");
+    }
+    return value;
+}
+
+function requireNonEmpty(value: string, fieldName: string): string {
+    const trimmed = String(value ?? "").trim();
+    if (!trimmed) {
+        throw new Error(`${fieldName} 不能为空`);
+    }
+    return trimmed;
 }
 
 function uniqueStrings(values: string[]): string[] {

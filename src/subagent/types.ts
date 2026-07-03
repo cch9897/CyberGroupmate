@@ -299,9 +299,10 @@ export interface SubagentPostTaskFollowUpCallback {
 export interface DispatchedSubagentTaskRecord {
     taskId: string;
     chatId: string;
-    sourceType?: "meta" | "subagent";
+    sourceType?: "meta" | "subagent" | "harness";
     sourceChatId?: string;
     sourceTaskId?: string;
+    sourceRunId?: string;
     contentDirection: string;
     toneGuidance?: string;
     suggestedEmojis?: string[];
@@ -505,9 +506,34 @@ export interface MemoEntry {
     createdAt: string;
 }
 
+export type SessionDigestKind =
+    | "meta_turn"
+    | "subagent_callback"
+    | "dispatch_created"
+    | "dispatch_done"
+    | "background_notify"
+    | "harness_callback"
+    | "attention_enqueue"
+    | "consciousness_tick"
+    | "system"
+    | "legacy";
+
 export interface SessionDigestEntry {
+    id?: string;
     content: string;
     createdAt: string;
+    kind?: SessionDigestKind;
+    actorType?: "meta" | "subagent" | "harness" | "system";
+    actorId?: string;
+    sourceChatId?: string | null;
+    sourceChatTitle?: string | null;
+    targetChatId?: string | null;
+    taskId?: string | null;
+    runId?: string | null;
+    tags?: string[];
+    importance?: number;
+    visibility?: "private" | "contextual" | "public";
+    metadata?: Record<string, unknown>;
 }
 
 export interface MetaSessionHistoryEntry {

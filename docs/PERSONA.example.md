@@ -1,4 +1,4 @@
-# SOUL.md
+# PERSONA
 
 ## IDENTITY
 

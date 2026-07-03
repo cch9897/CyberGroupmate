@@ -15,6 +15,17 @@ interface CronSetInput {
     data?: unknown;
 }
 
+interface CronUpdateInput {
+    name?: string;
+    /** cron 表达式，最短间隔 1 小时。 */
+    cronExpr?: string;
+    /** 每次触发后要做什么。 */
+    callback?: string;
+    /** composite chatId 或 "meta"。 */
+    bindingId?: string;
+    data?: unknown;
+}
+
 interface CronEvent {
     id: string;
     type: "cron";
@@ -49,6 +60,9 @@ declare const cron: {
 
     /** 查询周期唤醒。 */
     get(id: string): Promise<CronEvent | null>;
+
+    /** 编辑周期唤醒，保存后下一轮调度检查立即使用新值。 */
+    update(id: string, input: CronUpdateInput): Promise<CronEvent | null>;
 
     /** 列出周期唤醒。 */
     list(options?: { bindingId?: string }): Promise<CronEvent[]>;

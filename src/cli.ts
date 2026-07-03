@@ -14,6 +14,7 @@ import { createInterface } from "node:readline";
 import { Sandbox } from "./sandbox/sandbox.js";
 import { NotificationCenter } from "./event/notification-center.js";
 import { MemoryStoreV2 } from "./memory-v2/index.js";
+import { createMemoryStore } from "./core/memory-factory.js";
 import { loadConfig, resolveComponentProfiles, resolveEmbeddingConfig } from "./core/config.js";
 import { createLogger } from "./core/logger.js";
 import { readFileSync, existsSync } from "node:fs";
@@ -183,6 +184,8 @@ async function cmdNotify(args: string[]): Promise<void> {
  * memory — 交互式 Memory 查询
  */
 async function cmdMemory(args: string[]): Promise<void> {
+    const subCmd = args[0] ?? "help";
+
     const dbPath = join(DATA_DIR, "memory.db");
     if (!existsSync(dbPath)) {
         log.error("数据库不存在", { path: dbPath });
@@ -191,11 +194,10 @@ async function cmdMemory(args: string[]): Promise<void> {
     }
 
     const cfg = loadConfig();
-    const embeddingConfig = resolveEmbeddingConfig(cfg);
-    const memory = new MemoryStoreV2(dbPath, {
-        embeddingConfig,
-    });
-    const subCmd = args[0] ?? "help";
+    // 其它命令遵循 embedding.enabled 开关（关 → undefined，走关键词召回、不打 embedding API）；
+    // backfill-embeddings 是「为日后启用做准备」的显式操作，即便当前 enabled=false 也强制用配置的 embedding。
+    const embeddingConfig = subCmd === "backfill-embeddings" ? cfg.embedding : resolveEmbeddingConfig(cfg);
+    const memory = createMemoryStore(dbPath, { config: cfg, embeddingConfig });
 
     switch (subCmd) {
         case "recall": {
@@ -305,6 +307,26 @@ async function cmdMemory(args: string[]): Promise<void> {
             break;
         }
 
+        case "backfill-embeddings": {
+            if (!embeddingConfig) {
+                log.error("embedding 未配置，无法 backfill");
+                break;
+            }
+            log.info(`开始为存量 fact/topic 补 embedding（model=${embeddingConfig.model}, dim=${embeddingConfig.dimensions}）...`);
+            if (!cfg.embedding?.enabled) {
+                log.warn("注意：embedding.enabled=false —— 补好的向量主 bot 暂不会用；需把开关打开并重启 bot 后才生效。");
+            }
+            try {
+                const r = await memory.backfillEmbeddings();
+                console.log(`\n\x1b[1m=== Backfill 完成 ===\x1b[0m`);
+                console.log(`  facts:  ${r.facts} 条已补向量`);
+                console.log(`  topics: ${r.topics} 条已补向量`);
+            } catch (err) {
+                log.error("Backfill embeddings 失败", { error: String(err) });
+            }
+            break;
+        }
+
         default:
             console.log(`
 \x1b[1mMemory V2 子命令：\x1b[0m
@@ -313,6 +335,7 @@ async function cmdMemory(args: string[]): Promise<void> {
   browse <意图描述>      浏览历史消息
   reflect --chat <id>  手动触发 Reflection
   status                查看 Memory V2 统计
+  backfill-embeddings   为存量 fact/topic 补 embedding（开启 embedding 后跑一次）
       `);
     }
 
@@ -423,7 +446,7 @@ async function cmdStatus(): Promise<void> {
         log.info("events.jsonl 不存在");
     }
 
-    // Memory stats
+    // Memory stats —— 仅读取本地 SQLite（不经检索后端），保证离线/任意 backend 配置下都可用
     const dbPath = join(DATA_DIR, "memory.db");
     if (existsSync(dbPath)) {
         const memory = new MemoryStoreV2(dbPath);

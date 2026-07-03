@@ -54,4 +54,53 @@ export function registerMemoryTools(mcp: McpServer, deps: McpServerDeps): void {
             return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
         },
     );
+
+    mcp.tool(
+        "memory_searchAgentMemory",
+        "Search permanent agent session digests / consciousness memory: Meta intentions, subagent callbacks, harness dream results, dispatches, and follow-up thoughts.",
+        {
+            query: z.string().describe("Search query"),
+            chatId: z.string().optional().describe("Scope to a source/target chat ID"),
+            actorType: z.enum(["meta", "subagent", "harness", "system"]).optional().describe("Filter by actor type"),
+            kind: z.string().optional().describe("Filter by digest kind, e.g. meta_turn, dispatch_done, harness_callback"),
+            after: z.string().optional().describe("ISO timestamp — search after this time"),
+            before: z.string().optional().describe("ISO timestamp — search before this time"),
+            limit: z.number().optional().describe("Max results"),
+        },
+        async ({ query, chatId, actorType, kind, after, before, limit }) => {
+            const result = await deps.metaApi.memory.searchAgentMemory(query, {
+                chatId,
+                actorType,
+                kind: kind as any,
+                after,
+                before,
+                limit,
+            });
+            return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+        },
+    );
+
+    mcp.tool(
+        "memory_timeline",
+        "Get a recent timeline combining permanent session digests and topic summaries. Use this to understand what recently happened and what agents intended to do.",
+        {
+            chatId: z.string().optional().describe("Scope to a chat ID"),
+            after: z.string().optional().describe("ISO timestamp — include entries after this time"),
+            before: z.string().optional().describe("ISO timestamp — include entries before this time"),
+            limit: z.number().optional().describe("Max entries"),
+            includeTopics: z.boolean().optional().describe("Include topic summaries (default true)"),
+            includeDigests: z.boolean().optional().describe("Include session digests (default true)"),
+        },
+        async ({ chatId, after, before, limit, includeTopics, includeDigests }) => {
+            const result = await deps.metaApi.memory.getTimeline({
+                chatId,
+                after,
+                before,
+                limit,
+                includeTopics,
+                includeDigests,
+            });
+            return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+        },
+    );
 }

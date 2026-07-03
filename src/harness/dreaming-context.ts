@@ -37,6 +37,19 @@ export interface DreamingContextDeps {
     maxTasks?: number;
     /** 每个群展示的活跃参与者上限。默认 12 */
     maxParticipants?: number;
+    /** 最近的全局 session digests / consciousness memory。 */
+    sessionDigests?: Array<{
+        createdAt: string;
+        content: string;
+        kind?: string;
+        actorType?: string;
+        actorId?: string;
+        sourceChatId?: string | null;
+        sourceChatTitle?: string | null;
+        targetChatId?: string | null;
+        taskId?: string | null;
+        runId?: string | null;
+    }>;
 }
 
 const DEFAULT_MAX_TASKS = 100;
@@ -58,7 +71,7 @@ export function buildDreamingDigest(deps: DreamingContextDeps): string | null {
         return Number.isFinite(created) ? created >= sinceTs : true;
     });
 
-    if (tasks.length === 0) {
+    if (tasks.length === 0 && !(deps.sessionDigests?.length)) {
         return null;
     }
 
@@ -82,6 +95,10 @@ export function buildDreamingDigest(deps: DreamingContextDeps): string | null {
 
     const sections: string[] = [];
     sections.push(buildHeader(totalInWindow, sampled, maxTasks, sinceTs));
+    const digestSection = renderSessionDigests(deps.sessionDigests ?? []);
+    if (digestSection) {
+        sections.push(digestSection);
+    }
 
     for (const [chatId, groupTasks] of orderedGroups) {
         groupTasks.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
@@ -89,6 +106,26 @@ export function buildDreamingDigest(deps: DreamingContextDeps): string | null {
     }
 
     return sections.join("\n\n---\n\n");
+}
+
+function renderSessionDigests(digests: NonNullable<DreamingContextDeps["sessionDigests"]>): string | null {
+    if (digests.length === 0) return null;
+    const lines = ["# 最近全局意识流 / Session Digests"];
+    for (const digest of digests.slice(-30)) {
+        const source = [
+            digest.actorType,
+            digest.actorId,
+            digest.sourceChatTitle || digest.sourceChatId,
+            digest.kind,
+        ].filter(Boolean).join(" / ");
+        const refs = [
+            digest.taskId ? `task=${digest.taskId}` : "",
+            digest.runId ? `run=${digest.runId}` : "",
+            digest.targetChatId ? `target=${digest.targetChatId}` : "",
+        ].filter(Boolean).join(", ");
+        lines.push(`- [${formatTsForPrompt(digest.createdAt)}]${source ? ` [${source}]` : ""}${refs ? ` (${refs})` : ""} ${digest.content}`);
+    }
+    return lines.join("\n");
 }
 
 function buildHeader(total: number, sampled: boolean, maxTasks: number, sinceTs: number | null): string {

@@ -72,9 +72,55 @@ export type DownloadFn = (fileId: string, chatId?: string, messageId?: string, u
 
 const DEFAULT_MAX_IMAGES = 3;
 const DEFAULT_MAX_IMAGE_SIZE = 1024;
+const MEDIA_DOWNLOAD_TIMEOUT_MS = 20_000;
 
 /** API 支持的图片 MIME 类型 */
 const SUPPORTED_MIME = new Set(["image/jpeg", "image/png"]);
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+        if (timer.unref) timer.unref();
+    });
+
+    return Promise.race([promise, timeout]).finally(() => {
+        if (timer) clearTimeout(timer);
+    });
+}
+
+function downloadMediaWithTimeout(downloadFn: DownloadFn, att: MediaAttachment): Promise<Buffer> {
+    const startedAt = Date.now();
+    const meta = {
+        type: att.type,
+        chatId: att.chatId,
+        messageId: att.messageId,
+        uniqueFileId: att.uniqueFileId,
+        fileSize: att.fileSize,
+        timeoutMs: MEDIA_DOWNLOAD_TIMEOUT_MS,
+    };
+    log.info("media download start", meta);
+
+    return withTimeout(
+        downloadFn(att.fileId, att.chatId, att.messageId, att.uniqueFileId),
+        MEDIA_DOWNLOAD_TIMEOUT_MS,
+        `media download timeout after ${MEDIA_DOWNLOAD_TIMEOUT_MS}ms`,
+    ).then((buffer) => {
+        log.info("media download success", {
+            ...meta,
+            bytes: buffer.length,
+            durationMs: Date.now() - startedAt,
+        });
+        return buffer;
+    }).catch((err) => {
+        log.warn("media download failed", {
+            ...meta,
+            durationMs: Date.now() - startedAt,
+            error: String(err),
+        });
+        throw err;
+    });
+}
 
 /**
  * 确保图片为 API 支持的格式（JPEG/PNG）
@@ -328,6 +374,15 @@ export async function processMediaBatch(
     const isPathA = !options?.forceTextDescriptions && llmConfig.vision === true;
     const isPathB = !isPathA && !!visionLlmConfigs?.length;
     // 如果既不是 A 也不是 B，就是 C
+    log.info("processMediaBatch: start", {
+        total: attachments.length,
+        photos: photos.length,
+        stickers: stickers.length,
+        downloadOnly: downloadOnly.length,
+        mode: isPathA ? "inline" : isPathB ? "describe" : "placeholder",
+        hasDownloadFn: !!downloadFn,
+        hasMediaDownloader: !!mediaDownloader,
+    });
 
     // ─── 处理 Sticker（并行 + dedup） ───
     // 按 uniqueFileId 去重：相同贴纸只调用一次 Vision LLM，结果复用到所有同 ID 条目
@@ -378,7 +433,7 @@ export async function processMediaBatch(
                 return { index: photo.messageIndex, description: cached };
             }
             // 缓存未命中：下载 + 转码 + LLM 描述
-            const rawBuffer = await downloadFn!(photo.fileId, photo.chatId, photo.messageId, photo.uniqueFileId);
+            const rawBuffer = await downloadMediaWithTimeout(downloadFn!, photo);
             const { buffer, mimeType } = await ensureSupportedFormat(rawBuffer, photo.mimeType ?? "image/jpeg");
             const desc = await describeImage(buffer, mimeType, visionCfgs);
             photoDescriptionCache.set(photo.uniqueFileId, desc);
@@ -389,7 +444,7 @@ export async function processMediaBatch(
 
         if (shouldInline) {
             // 路径 A: 内联 base64（不缓存，每次需要完整数据）
-            return downloadFn!(photo.fileId, photo.chatId, photo.messageId, photo.uniqueFileId)
+            return downloadMediaWithTimeout(downloadFn!, photo)
                 .then(rawBuffer => ensureSupportedFormat(rawBuffer, photo.mimeType ?? "image/jpeg"))
                 .then(({ buffer, mimeType }) => ({
                     index: photo.messageIndex,
@@ -567,7 +622,7 @@ export async function processMediaBatch(
 
             // 下载 + 保存
             try {
-                const buffer = await downloadFn(att.fileId, att.chatId, att.messageId, att.uniqueFileId);
+                const buffer = await downloadMediaWithTimeout(downloadFn, att);
                 const saved = mediaDownloader.saveMedia(buffer, {
                     chatId: att.chatId,
                     messageId: att.messageId,
@@ -616,6 +671,14 @@ export async function processMediaBatch(
             });
         }
     }
+
+    log.info("processMediaBatch: complete", {
+        total: attachments.length,
+        results: results.length,
+        photos: photos.length,
+        stickers: stickers.length,
+        downloadOnly: downloadOnly.length,
+    });
 
     return results;
 }
@@ -699,7 +762,7 @@ async function processSingleSticker(
 
     // vision_each 或 vision_cache miss: 下载+识别
     try {
-        const rawBuffer = await downloadFn(sticker.fileId, sticker.chatId, sticker.messageId, sticker.uniqueFileId);
+        const rawBuffer = await downloadMediaWithTimeout(downloadFn, sticker);
 
         // 保存贴纸原始文件到磁盘（用于后续发送）
         let savedSticker: ReturnType<MediaDownloader["saveMedia"]> | null = null;

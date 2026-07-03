@@ -187,6 +187,8 @@
     'assistant.turn_start',
     'assistant.turn_end',
     'session.background_tasks_changed',
+    'system/thinking_tokens',
+    'thinking_tokens',
   ]);
 
   const SYS_LABELS = {
@@ -271,7 +273,8 @@
 
     const ev = effectiveEvent(raw);
     const type = String(ev.type ?? wrapper.kind ?? '');
-    if (NOISE.has(type)) return [];
+    const subtype = ev.subtype == null ? '' : String(ev.subtype);
+    if (NOISE.has(type) || (subtype && (NOISE.has(subtype) || NOISE.has(`${type}/${subtype}`)))) return [];
 
     // Claude Code (stream-json)
     if (type === 'assistant') return claudeAssistant(ev);

@@ -19,6 +19,7 @@
   import MemoryPanel from './panels/MemoryPanel.svelte';
   import StickersPanel from './panels/StickersPanel.svelte';
   import SkillsPanel from './panels/SkillsPanel.svelte';
+  import SchedulerPanel from './panels/SchedulerPanel.svelte';
   import SystemPanel from './panels/SystemPanel.svelte';
   import ConfigPanel from './panels/ConfigPanel.svelte';
   import BackgroundAgentPanel from './panels/BackgroundAgentPanel.svelte';
@@ -72,6 +73,7 @@
     <div class:hidden={$activeTab !== 'memory'}><MemoryPanel /></div>
     <div class:hidden={$activeTab !== 'stickers'}><StickersPanel /></div>
     <div class:hidden={$activeTab !== 'skills'}><SkillsPanel /></div>
+    <div class:hidden={$activeTab !== 'scheduler'}><SchedulerPanel /></div>
     <div class:hidden={$activeTab !== 'system'}><SystemPanel /></div>
     <div class:hidden={$activeTab !== 'background-agent'}><BackgroundAgentPanel /></div>
     <div class:hidden={$activeTab !== 'config'}><ConfigPanel /></div>

@@ -114,7 +114,7 @@ function toReasoningEffort(value?: string): ReasoningEffort | undefined {
     return undefined;
 }
 
-async function collectResponseFromStream(stream: AsyncIterable<ResponseStreamEvent>): Promise<ResponsesResult> {
+export async function collectResponseFromStream(stream: AsyncIterable<ResponseStreamEvent>): Promise<ResponsesResult> {
     const asyncIterator = stream[Symbol.asyncIterator];
     if (!asyncIterator) {
         throw new Error("OpenAI Responses stream mode did not return an async iterable");
@@ -122,17 +122,30 @@ async function collectResponseFromStream(stream: AsyncIterable<ResponseStreamEve
 
     let outputText = "";
     let usage: ResponsesUsage | undefined;
-    for await (const event of stream) {
-        if (event.type === "response.output_text.delta") {
-            outputText += event.delta;
-        }
-        if (event.type === "response.completed") {
-            if (event.response.output_text) {
-                outputText = event.response.output_text;
+    let completed = false;
+    try {
+        for await (const event of stream) {
+            if (event.type === "response.output_text.delta") {
+                outputText += event.delta;
             }
-            usage = event.response.usage ?? usage;
+            if (event.type === "response.completed") {
+                completed = true;
+                if (event.response.output_text) {
+                    outputText = event.response.output_text;
+                }
+                usage = event.response.usage ?? usage;
+            }
         }
+    } catch (err) {
+        if (completed && isPrematureCloseError(err)) {
+            return { output_text: outputText, usage };
+        }
+        throw err;
     }
 
     return { output_text: outputText, usage };
+}
+
+function isPrematureCloseError(err: unknown): boolean {
+    return err instanceof Error && err.message.includes("Premature close");
 }

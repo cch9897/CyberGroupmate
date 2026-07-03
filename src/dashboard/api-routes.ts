@@ -34,7 +34,9 @@ import {
 import { getMetaHistoryWindowStatus } from "../main-agent/meta-history-retention.js";
 import { getPlatform } from "../core/chat-id.js";
 import { extractAnimatedStickerFrames } from "../core/vision-processor.js";
-import type { MainAgentGlobalState } from "../subagent/types.js";
+import type { MainAgentGlobalState, SchedulerEvent, SessionDigestEntry } from "../subagent/types.js";
+import { createCronApi, createReminderApi } from "../meta-sandbox/meta-api/scheduler.js";
+import { createTodoApi } from "../meta-sandbox/meta-api/todo.js";
 
 const log = createLogger("dashboard-api");
 const SKILLS_ROOT = join(process.cwd(), "workspace", "skills");
@@ -44,7 +46,7 @@ const dynamicStickerPreviewCache = new Map<string, { mtimeMs: number; buffer: Bu
 const DEFAULT_CODEACT_DEBUG_TIMEOUT_MS = 30_000;
 const MAX_CODEACT_DEBUG_TIMEOUT_MS = 120_000;
 const DEFAULT_SUBAGENT_DEBUG_MODULES = [
-    "runtime", "fs", "skills", "mcp", "cron", "todo", "memory", "dispatch", "vision", "shell",
+    "runtime", "fs", "skills", "mcp", "cron", "todo", "memory", "privacy", "dispatch", "vision", "shell",
 ];
 const BUILTIN_DEBUG_DTS: Record<string, string> = {
     runtime: "runtime/runtime.d.ts",
@@ -279,14 +281,17 @@ function previewText(value: unknown, limit = 180): string {
     return text.length > limit ? `${text.slice(0, limit)}...` : text;
 }
 
-function buildGlobalStateSummary(state: Readonly<MainAgentGlobalState>): Record<string, unknown> {
+function buildGlobalStateSummary(
+    state: Readonly<MainAgentGlobalState>,
+    sessionDigestOverride?: SessionDigestEntry[],
+): Record<string, unknown> {
     const schedulerEvents = state.schedulerEvents ?? [];
     const reminders = schedulerEvents.filter((event) => event.type === "reminder");
     const crons = schedulerEvents.filter((event) => event.type === "cron");
     const activeReminders = reminders.filter((event) => !event.triggered);
     const triggeredReminders = reminders.length - activeReminders.length;
     const memos = state.memos ?? [];
-    const sessionDigests = state.sessionDigests ?? [];
+    const sessionDigests = sessionDigestOverride ?? state.sessionDigests ?? [];
     const metaSessionHistory = state.metaSessionHistory ?? [];
     const signalPool = state.signalPool ?? [];
     const wakeConditions = state.wakeConditions ?? [];
@@ -364,6 +369,50 @@ function buildGlobalStateSummary(state: Readonly<MainAgentGlobalState>): Record<
             })),
         },
     };
+}
+
+function getSchedulerBindingId(event: SchedulerEvent): string {
+    return event.bindingId ?? (event.chatId === "__meta__" ? "meta" : event.chatId);
+}
+
+function serializeSchedulerEvent(event: SchedulerEvent): Record<string, unknown> {
+    const callback = event.callback ?? event.taskTemplate ?? event.description;
+    return {
+        id: event.id,
+        type: event.type,
+        chatId: event.chatId,
+        bindingId: getSchedulerBindingId(event),
+        name: event.name ?? event.description,
+        description: event.description,
+        callback,
+        data: event.data,
+        triggerAt: event.triggerAt,
+        triggered: !!event.triggered,
+        cronExpr: event.cronExpr,
+        taskTemplate: event.taskTemplate,
+        lastTriggeredAt: event.lastTriggeredAt,
+        createdAt: event.createdAt,
+        requestedBy: event.requestedBy,
+    };
+}
+
+function normalizeTodoBindingId(value: unknown): string {
+    const bindingId = String(value ?? "").trim();
+    return bindingId || "meta";
+}
+
+function requireTodoBindingId(value: unknown): string {
+    const bindingId = String(value ?? "").trim();
+    if (!bindingId) {
+        throw new Error("bindingId 不能为空");
+    }
+    return bindingId;
+}
+
+function requiredString(value: unknown, fieldName: string): string {
+    const text = String(value ?? "").trim();
+    if (!text) throw new Error(`${fieldName} 不能为空`);
+    return text;
 }
 
 export function createApiRouter(deps: DashboardDeps, bridge: EventBridge): Router {
@@ -806,7 +855,7 @@ export function createApiRouter(deps: DashboardDeps, bridge: EventBridge): Route
     });
 
     router.get("/global-state/summary", (_req, res) => {
-        res.json(buildGlobalStateSummary(deps.globalState.getState()));
+        res.json(buildGlobalStateSummary(deps.globalState.getState(), deps.globalState.getSessionDigests()));
     });
 
     router.get("/global-state", (_req, res) => {
@@ -819,24 +868,8 @@ export function createApiRouter(deps: DashboardDeps, bridge: EventBridge): Route
         const reminders = events.filter(e => e.type === "reminder");
         const crons = events.filter(e => e.type === "cron");
         res.json({
-            reminders: reminders.map(e => ({
-                id: e.id,
-                chatId: e.chatId,
-                description: e.description,
-                triggerAt: e.triggerAt,
-                triggered: !!e.triggered,
-                createdAt: e.createdAt,
-                requestedBy: e.requestedBy,
-            })),
-            crons: crons.map(e => ({
-                id: e.id,
-                chatId: e.chatId,
-                description: e.description,
-                cronExpr: e.cronExpr,
-                taskTemplate: e.taskTemplate,
-                lastTriggeredAt: e.lastTriggeredAt,
-                createdAt: e.createdAt,
-            })),
+            reminders: reminders.map(serializeSchedulerEvent),
+            crons: crons.map(serializeSchedulerEvent),
             summary: {
                 totalReminders: reminders.length,
                 activeReminders: reminders.filter(e => !e.triggered).length,
@@ -846,9 +879,121 @@ export function createApiRouter(deps: DashboardDeps, bridge: EventBridge): Route
         });
     });
 
+    router.put("/scheduler/:id", async (req, res) => {
+        try {
+            const event = deps.globalState.getSchedulerEvents().find((item) => item.id === req.params.id);
+            if (!event) {
+                res.status(404).json({ error: "scheduler event not found" });
+                return;
+            }
+
+            const body = req.body ?? {};
+            const schedulerPatch: { name?: string; callback?: string; bindingId?: string; data?: unknown } = {};
+            const currentBindingId = getSchedulerBindingId(event);
+            const currentCallback = event.callback ?? event.taskTemplate ?? event.description;
+            if (Object.prototype.hasOwnProperty.call(body, "name") && body.name !== (event.name ?? event.description)) {
+                schedulerPatch.name = body.name;
+            }
+            if (Object.prototype.hasOwnProperty.call(body, "callback") && body.callback !== currentCallback) {
+                schedulerPatch.callback = body.callback;
+            }
+            if (Object.prototype.hasOwnProperty.call(body, "bindingId") && body.bindingId !== currentBindingId) {
+                schedulerPatch.bindingId = body.bindingId;
+            }
+            if (Object.prototype.hasOwnProperty.call(body, "data")) schedulerPatch.data = body.data;
+
+            let updated: unknown;
+            if (event.type === "reminder") {
+                const reminderPatch: typeof schedulerPatch & { triggerAt?: string | number | Date } = { ...schedulerPatch };
+                if (Object.prototype.hasOwnProperty.call(body, "triggerAt")) reminderPatch.triggerAt = body.triggerAt;
+                updated = await createReminderApi(deps.globalState).update(event.id, reminderPatch);
+            } else {
+                const cronPatch: typeof schedulerPatch & { cronExpr?: string } = { ...schedulerPatch };
+                if (Object.prototype.hasOwnProperty.call(body, "cronExpr")) cronPatch.cronExpr = body.cronExpr;
+                updated = await createCronApi(deps.globalState).update(event.id, cronPatch);
+            }
+
+            if (!updated) {
+                res.status(404).json({ error: "scheduler event not found" });
+                return;
+            }
+
+            deps.globalState.save();
+            res.json({ ok: true, event: updated });
+        } catch (err) {
+            res.status(400).json({ error: String(err) });
+        }
+    });
+
     router.delete("/scheduler/:id", (req, res) => {
         const ok = deps.globalState.cancelSchedulerEvent(req.params.id);
+        if (ok) deps.globalState.save();
         res.json({ ok });
+    });
+
+    // ─── Todo Rules ───
+    router.get("/todos", async (req, res) => {
+        try {
+            const rawBindingId = qs(req.query.bindingId).trim();
+            const bindingId = rawBindingId ? normalizeTodoBindingId(rawBindingId) : undefined;
+            const includeExpired = qs(req.query.includeExpired) === "true";
+            const items = bindingId
+                ? deps.memory.todoList(bindingId, { includeExpired }).map((item) => ({ bindingId, ...item }))
+                : await createTodoApi(deps.memory).list({ includeExpired });
+            res.json({
+                items,
+                summary: {
+                    bindingId: bindingId ?? "all",
+                    total: items.length,
+                    expired: items.filter((item) => item.expired).length,
+                },
+            });
+        } catch (err) {
+            res.status(500).json({ error: String(err) });
+        }
+    });
+
+    router.put("/todos", async (req, res) => {
+        try {
+            const body = req.body ?? {};
+            const oldBindingId = body.oldKey ? requireTodoBindingId(body.oldBindingId ?? body.bindingId) : "";
+            const oldKey = String(body.oldKey ?? "").trim();
+            const bindingId = requireTodoBindingId(body.bindingId);
+            const key = requiredString(body.key, "key");
+            const content = requiredString(body.content, "content");
+            const api = createTodoApi(deps.memory);
+            const hasDueAt = Object.prototype.hasOwnProperty.call(body, "dueAt");
+            const dueAt = hasDueAt ? body.dueAt : undefined;
+            const todoPatch: { bindingId: string; key: string; content: string; dueAt?: string | number | Date | null; forever?: boolean } = {
+                bindingId,
+                key,
+                content,
+            };
+            if (hasDueAt) todoPatch.dueAt = dueAt;
+            if (Object.prototype.hasOwnProperty.call(body, "forever")) todoPatch.forever = body.forever === true;
+
+            const item = oldKey
+                ? await api.update(oldKey, todoPatch, oldBindingId)
+                : await api.set({ bindingId, key, content, dueAt, forever: body.forever === true });
+            if (!item) {
+                res.status(404).json({ error: "todo not found" });
+                return;
+            }
+            res.json({ ok: true, item });
+        } catch (err) {
+            res.status(400).json({ error: String(err) });
+        }
+    });
+
+    router.delete("/todos", (req, res) => {
+        try {
+            const bindingId = requireTodoBindingId(req.body?.bindingId);
+            const key = requiredString(req.body?.key, "key");
+            deps.memory.todoRemove(bindingId, key);
+            res.json({ ok: true });
+        } catch (err) {
+            res.status(400).json({ error: String(err) });
+        }
     });
 
     // ─── Memory: User / Group ───

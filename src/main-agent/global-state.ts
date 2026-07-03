@@ -48,6 +48,19 @@ const DEFAULT_CONFIG: GlobalStateConfig = {
 const MAX_SESSION_DIGESTS = 30;
 const MAX_DISPATCHED_SUBAGENT_TASKS = 500;
 
+export interface SessionDigestAdapter {
+    append(content: string, options?: Partial<Omit<SessionDigestEntry, "content" | "createdAt">> & { createdAt?: string }): SessionDigestEntry;
+    list(options?: { limit?: number }): SessionDigestEntry[];
+}
+
+/** 派发任务的终态集合：进入终态即视为不可逆，立即落盘并补全 completedAt */
+const TERMINAL_TASK_STATUSES: ReadonlySet<DispatchedSubagentTaskRecord["status"]> = new Set([
+    "COMPLETED",
+    "ERROR",
+    "SKIPPED",
+    "TIMEOUT",
+]);
+
 /**
  * GlobalState — 主 Agent 全局状态管理器
  */
@@ -56,10 +69,19 @@ export class GlobalState {
     private config: GlobalStateConfig;
     private dirty = false;
     private autoSaveTimer: ReturnType<typeof setInterval> | null = null;
+    private sessionDigestAdapter: SessionDigestAdapter | null = null;
 
     constructor(config?: Partial<GlobalStateConfig>) {
         this.config = { ...DEFAULT_CONFIG, ...config };
         this.state = this.load();
+
+        // 启动对账：上次进程退出时仍在飞行（RUNNING/PENDING）的派发任务，其执行进程
+        // 已随重启消失，不可能再自行收尾 → 标记为 TIMEOUT，避免永久泄漏为 RUNNING。
+        const reconciled = this.reconcileLeakedDispatchedTasks();
+        if (reconciled > 0) {
+            log.info("启动对账：将中断的派发任务标记为 TIMEOUT", { count: reconciled });
+            this.save();
+        }
 
         // 自动保存
         if (this.config.autoSaveInterval > 0) {
@@ -144,6 +166,27 @@ export class GlobalState {
         return true;
     }
 
+    /** 更新调度事件。用于 Dashboard / Meta API 热编辑，保持原 id 与触发历史。 */
+    updateSchedulerEvent(
+        id: string,
+        patch: Partial<Omit<SchedulerEvent, "id" | "type" | "createdAt">>,
+    ): SchedulerEvent | null {
+        const idx = this.state.schedulerEvents.findIndex(e => e.id === id);
+        if (idx === -1) return null;
+        const current = this.state.schedulerEvents[idx];
+        const updated: SchedulerEvent = {
+            ...current,
+            ...patch,
+            id: current.id,
+            type: current.type,
+            createdAt: current.createdAt,
+        };
+        this.state.schedulerEvents.splice(idx, 1, updated);
+        this.markDirty();
+        log.debug("updateSchedulerEvent", { id, type: updated.type });
+        return { ...updated };
+    }
+
     /** 获取所有调度事件（可按 chatId 过滤） */
     getSchedulerEvents(chatId?: string): SchedulerEvent[] {
         if (chatId) {
@@ -196,10 +239,26 @@ export class GlobalState {
         return removed;
     }
 
-    addSessionDigest(content: string): void {
+    setSessionDigestAdapter(adapter: SessionDigestAdapter): void {
+        this.sessionDigestAdapter = adapter;
+    }
+
+    getLegacySessionDigests(): SessionDigestEntry[] {
+        return [...this.state.sessionDigests];
+    }
+
+    addSessionDigest(
+        content: string,
+        options?: Partial<Omit<SessionDigestEntry, "content" | "createdAt">> & { createdAt?: string },
+    ): void {
+        if (this.sessionDigestAdapter) {
+            this.sessionDigestAdapter.append(content, options);
+            return;
+        }
         const entry: SessionDigestEntry = {
             content,
-            createdAt: new Date().toISOString(),
+            createdAt: options?.createdAt ?? new Date().toISOString(),
+            ...options,
         };
         this.state.sessionDigests.push(entry);
         while (this.state.sessionDigests.length > MAX_SESSION_DIGESTS) {
@@ -209,6 +268,9 @@ export class GlobalState {
     }
 
     getSessionDigests(): SessionDigestEntry[] {
+        if (this.sessionDigestAdapter) {
+            return this.sessionDigestAdapter.list({ limit: 30 }).slice().reverse();
+        }
         return [...this.state.sessionDigests];
     }
 
@@ -331,13 +393,27 @@ export class GlobalState {
         if (index === -1) {
             return null;
         }
+        const now = new Date().toISOString();
+        const isTerminal = patch.status != null && TERMINAL_TASK_STATUSES.has(patch.status);
         const updated: DispatchedSubagentTaskRecord = {
             ...this.state.dispatchedSubagentTasks[index],
             ...patch,
-            updatedAt: new Date().toISOString(),
+            updatedAt: now,
         };
+        // 进入终态时补全 completedAt（dashboard 展示 + 启动对账依赖它）
+        if (isTerminal && updated.completedAt == null) {
+            updated.completedAt = now;
+        }
         this.state.dispatchedSubagentTasks.splice(index, 1, updated);
+        // 始终先置脏：若终态的立即 save() 因 writeFileSync 失败而未清脏，
+        // 30s 自动保存 / dispose() 仍会重试落盘，不会永久丢失这次写入。
         this.markDirty();
+        // 终态立即落盘：否则 30s 自动保存窗口内若进程重启，这次 COMPLETED/ERROR 写入会丢失，
+        // 任务永远停留在 RUNNING（见 reconcileLeakedDispatchedTasks 的启动对账兜底）。
+        // 注意：这是一条有意的持久化契约（tests/s6-global-state #10 同步读校验），不可改为异步去抖。
+        if (isTerminal) {
+            this.save();
+        }
         return { ...updated };
     }
 
@@ -424,6 +500,26 @@ export class GlobalState {
 
     private markDirty(): void {
         this.dirty = true;
+    }
+
+    /**
+     * 启动对账：把残留在 RUNNING/PENDING 的派发任务标记为 TIMEOUT（中断）。
+     * 返回被对账的任务数。仅在 load() 之后调用一次。
+     */
+    private reconcileLeakedDispatchedTasks(): number {
+        const now = new Date().toISOString();
+        const note = "reconciled on startup: process exited mid-flight";
+        let count = 0;
+        for (const task of this.state.dispatchedSubagentTasks) {
+            if (task.status === "RUNNING" || task.status === "PENDING") {
+                task.status = "TIMEOUT";
+                task.completedAt = task.completedAt ?? now;
+                task.error = task.error ? `${task.error}; ${note}` : note;
+                task.updatedAt = now;
+                count++;
+            }
+        }
+        return count;
     }
 
     private load(): MainAgentGlobalState {

@@ -6,11 +6,11 @@ import { getExecutorTaskProviders } from "../src/context-engine/providers/execut
 import { loadApiTypeDefs } from "../src/subagent/code-act-executor.js";
 
 describe("executor context providers", () => {
-    it("renders the same recent Meta session digest window for subagents", () => {
+    it("renders the same recent 30 Meta session digest window for subagents", () => {
         const engine = new ContextEngine("executor-digest-test");
         engine.registerAll(getExecutorTaskProviders());
 
-        const digests = Array.from({ length: 12 }, (_, index) => ({
+        const digests = Array.from({ length: 35 }, (_, index) => ({
             createdAt: `2026-05-01T${String(index).padStart(2, "0")}:00:00.000Z`,
             content: `digest ${index + 1}`,
         }));
@@ -23,9 +23,9 @@ describe("executor context providers", () => {
         });
 
         assert.match(result.historicalContent, /# 历史 Session Digests/);
-        assert.match(result.historicalContent, /digest 3/);
-        assert.match(result.historicalContent, /digest 12/);
-        assert.doesNotMatch(result.historicalContent, /digest 2/);
+        assert.match(result.historicalContent, /digest 6/);
+        assert.match(result.historicalContent, /digest 35/);
+        assert.doesNotMatch(result.historicalContent, /digest 5/);
     });
 
     it("only persists new Meta session digests after commit", () => {

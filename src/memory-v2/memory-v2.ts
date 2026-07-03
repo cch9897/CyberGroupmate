@@ -11,10 +11,12 @@
  */
 
 import Database from "better-sqlite3";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createLogger } from "../core/logger.js";
+import { getGroupModelKey, safeGroupModelKey } from "../core/chat-id.js";
+import { buildVisibilityDeps, isPrivateChat, type VisibilityDeps } from "../core/visibility-policy.js";
 import { createRequire } from "node:module";
 import { resolveComponentTimeout, resolveComponentProfiles, type LLMConfig, type ReflectionExternalConfig, type EmbeddingConfig } from "../core/config.js";
 import {
@@ -49,6 +51,11 @@ import type {
     RecentMessageEntry,
     RecallOptions,
     RecallResult,
+    SessionDigestEntry,
+    SessionDigestSearchOptions,
+    SessionDigestKind,
+    TimelineEntry,
+    TimelineOptions,
     HistoryBrowseRequest,
     HistoryBrowseResult,
     ReflectionResult,
@@ -225,6 +232,36 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
     }
 
     /**
+     * 全局 visibility 分级所需的依赖（种子 + DM 自动判定 + GroupModel 读取）。
+     * 由 memory-factory 通过 setPrivacyClassification 注入 config.privacy；默认 DM 自动私密、空种子。
+     * 用统一的 getChatVisibility 定义，使 recall 守卫与 chokepoint 完全一致。
+     */
+    private privacyDeps: VisibilityDeps = buildVisibilityDeps({
+        getGroupModel: (key: string) => this.getGroupModel(key),
+    });
+    /** enforce=off 时关闭 memory 层隐私兜底（总开关）；warn/block 都按私密处理（内部上下文恒 fail-closed）。 */
+    private privacyEnforced = true;
+
+    /** 注入全局隐私分级（config.privacy.sensitiveChats / dmAutoPrivate / enforce）。 */
+    setPrivacyClassification(opts: { sensitiveChats?: string[]; dmAutoPrivate?: boolean; enforce?: "block" | "warn" | "off" }): void {
+        this.privacyDeps = buildVisibilityDeps({
+            getGroupModel: (key: string) => this.getGroupModel(key),
+            sensitiveChats: opts.sensitiveChats,
+            dmAutoPrivate: opts.dmAutoPrivate,
+        });
+        this.privacyEnforced = opts.enforce !== "off";
+    }
+
+    /**
+     * 会话是否私密（DM / 配置种子 sensitiveChats / 运行时 markedSensitive），与 chokepoint 同一定义。
+     * 供 recall / 可见性守卫（scrubFactsByVisibility）共用。enforce=off → 一律非私密。
+     */
+    isChatPrivate(chatId: string | null | undefined): boolean {
+        if (!chatId || !this.privacyEnforced) return false;
+        return isPrivateChat(chatId, this.privacyDeps);
+    }
+
+    /**
      * 动态加载 sqlite-vec 扩展
      * 如果不可用（未安装 / 编译失败），透明 fallback 到纯 JS。
      */
@@ -250,40 +287,48 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         const dims = this.embeddingConfig?.dimensions ?? 128;
         log.debug("initVecTables", { dims, provider: this.embeddingConfig?.provider ?? "local" });
         try {
-            // 检测已有 topics_vec 的维度是否匹配
-            let needRecreate = false;
-            try {
-                // 尝试插入一个零向量来检查维度
-                const testVec = Buffer.alloc(dims * 4); // float32 = 4 bytes each
-                this.db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS topics_vec USING vec0(
-                    topic_id TEXT PRIMARY KEY, chat_id TEXT partition key, embedding float[${dims}]
-                )`);
-                // 如果上面成功了（表不存在或维度匹配），直接继续
-            } catch {
-                // 如果失败（维度不匹配），需要重建
-                needRecreate = true;
-            }
+            // 维度变更检测：从 sqlite_master 解析已有 vec0 表的 float[N]，与目标 dims 比对。
+            // ⚠️ 不能靠「CREATE ... IF NOT EXISTS 是否报错」判断——表已存在时它直接 no-op、不校验维度，
+            //    旧维度表会被静默保留，后续按新维度插入才失败。必须显式解析维度。
+            const existingDims = (name: string): number | null => {
+                const row = this.db.prepare("SELECT sql FROM sqlite_master WHERE name = ?").get(name) as { sql?: string } | undefined;
+                const m = row?.sql?.match(/float\[(\d+)\]/);
+                return m ? Number(m[1]) : null;
+            };
+            const tDims = existingDims("topics_vec");
+            const fDims = existingDims("facts_vec");
+            const dDims = existingDims("session_digests_vec");
+            const oldDims = tDims ?? fDims ?? dDims;
+            // 仅在 embedding 启用时才因维度不符重建——关闭时不写向量，旧维度表闲置无害，不动它（避免 toggle off 误删向量）。
+            const mismatch = !!this.embeddingConfig
+                && ((tDims != null && tDims !== dims) || (fDims != null && fDims !== dims) || (dDims != null && dDims !== dims));
 
-            if (needRecreate) {
-                log.info("vec0 表维度不匹配，重建中...", { targetDims: dims });
+            if (mismatch) {
+                // 维度变了：旧 vec 表 + 旧主表向量都按旧维度存的，对新维度不可用。
+                // → DROP 旧 vec 表、清空主表 embedding 列（避免 JS 回退路径用到错维向量报错/出垃圾），按新维度重建。
+                log.warn(
+                    `⚠️ embedding 维度变化：现有 vec0 表为 ${oldDims} 维，配置为 ${dims} 维。` +
+                    `已 DROP 旧 vec 表并清空存量向量，按新维度重建——请运行一次 \`cli memory backfill-embeddings\` 重新生成向量（在此之前向量召回回退为关键词）。`,
+                    { existingTopicDims: tDims, existingFactDims: fDims, targetDims: dims },
+                );
                 this.db.exec(`DROP TABLE IF EXISTS topics_vec`);
                 this.db.exec(`DROP TABLE IF EXISTS facts_vec`);
-                this.db.exec(`
-                    CREATE VIRTUAL TABLE topics_vec USING vec0(
-                        topic_id TEXT PRIMARY KEY,
-                        chat_id TEXT partition key,
-                        embedding float[${dims}]
-                    );
-                `);
+                this.db.exec(`DROP TABLE IF EXISTS session_digests_vec`);
+                try { this.db.exec(`UPDATE core_facts SET embedding = NULL WHERE embedding IS NOT NULL`); } catch { /* 列可能不存在 */ }
+                try { this.db.exec(`UPDATE topics SET embedding = NULL WHERE embedding IS NOT NULL`); } catch { /* 列可能不存在 */ }
+                try { this.db.exec(`UPDATE session_digests SET embedding = NULL WHERE embedding IS NOT NULL`); } catch { /* 列可能不存在 */ }
             }
 
-            this.db.exec(`
-                CREATE VIRTUAL TABLE IF NOT EXISTS facts_vec USING vec0(
-                    fact_id TEXT PRIMARY KEY,
-                    embedding float[${dims}]
-                );
-            `);
-            log.debug("vec0 虚拟表就绪", { dims });
+            this.db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS topics_vec USING vec0(
+                topic_id TEXT PRIMARY KEY, chat_id TEXT partition key, embedding float[${dims}]
+            )`);
+            this.db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS facts_vec USING vec0(
+                fact_id TEXT PRIMARY KEY, embedding float[${dims}]
+            )`);
+            this.db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS session_digests_vec USING vec0(
+                digest_id TEXT PRIMARY KEY, embedding float[${dims}]
+            )`);
+            log.debug("vec0 虚拟表就绪", { dims, recreatedForDimChange: mismatch });
         } catch (err) {
             log.warn("vec0 虚拟表创建失败", { error: String(err) });
             this.sqliteVecAvailable = false;
@@ -387,6 +432,9 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                 taboo_topics TEXT DEFAULT '[]',
                 last_reflected_at TEXT,
                 is_direct_message INTEGER DEFAULT 0,
+                marked_sensitive INTEGER DEFAULT 0,
+                sensitive_reason TEXT,
+                sensitive_at TEXT,
                 updated_at TEXT NOT NULL
             );
 
@@ -442,6 +490,30 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
             );
             CREATE INDEX IF NOT EXISTS idx_msglog_chat_time ON message_log(chat_id, timestamp);
             CREATE INDEX IF NOT EXISTS idx_msglog_user ON message_log(user_id, timestamp);
+
+            -- Agent session digests / consciousness memory（永久落盘）
+            CREATE TABLE IF NOT EXISTS session_digests (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'system',
+                actor_type TEXT NOT NULL DEFAULT 'system',
+                actor_id TEXT,
+                source_chat_id TEXT,
+                source_chat_title TEXT,
+                target_chat_id TEXT,
+                task_id TEXT,
+                run_id TEXT,
+                content TEXT NOT NULL,
+                tags TEXT NOT NULL DEFAULT '[]',
+                importance REAL DEFAULT 0.5,
+                visibility TEXT DEFAULT 'contextual',
+                metadata TEXT NOT NULL DEFAULT '{}',
+                embedding BLOB
+            );
+            CREATE INDEX IF NOT EXISTS idx_session_digests_created ON session_digests(created_at);
+            CREATE INDEX IF NOT EXISTS idx_session_digests_source_chat ON session_digests(source_chat_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_session_digests_actor ON session_digests(actor_type, actor_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_session_digests_kind ON session_digests(kind, created_at);
         `);
 
         // FTS5 虚拟表（独立模式，手动同步内容）
@@ -459,6 +531,20 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
             this.db.exec(`
                 CREATE VIRTUAL TABLE IF NOT EXISTS core_facts_fts USING fts5(
                     content, subject
+                );
+            `);
+        } catch {
+            // FTS5 表已存在时忽略
+        }
+
+        try {
+            this.db.exec(`
+                CREATE VIRTUAL TABLE IF NOT EXISTS session_digests_fts USING fts5(
+                    id UNINDEXED,
+                    content,
+                    tags,
+                    actor_id,
+                    source_chat_title
                 );
             `);
         } catch {
@@ -502,6 +588,11 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
 
         // group_models 新增 is_direct_message 列（兼容旧数据库）
         try { this.db.exec(`ALTER TABLE group_models ADD COLUMN is_direct_message INTEGER DEFAULT 0`); } catch { /* 列已存在 */ }
+
+        // group_models 新增 marked_sensitive / sensitive_reason / sensitive_at 列（全局 visibility 兜底，兼容旧数据库）
+        try { this.db.exec(`ALTER TABLE group_models ADD COLUMN marked_sensitive INTEGER DEFAULT 0`); } catch { /* 列已存在 */ }
+        try { this.db.exec(`ALTER TABLE group_models ADD COLUMN sensitive_reason TEXT`); } catch { /* 列已存在 */ }
+        try { this.db.exec(`ALTER TABLE group_models ADD COLUMN sensitive_at TEXT`); } catch { /* 列已存在 */ }
 
         // person_identities 新增 username 列（兼容旧数据库）
         try { this.db.exec(`ALTER TABLE person_identities ADD COLUMN username TEXT`); } catch { /* 列已存在 */ }
@@ -590,7 +681,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
             if (data.relatedTopicIds !== undefined) builder.set("related_topic_ids", toJSON(data.relatedTopicIds));
             if (data.associatedMemories !== undefined) builder.set("associated_memories", toJSON(data.associatedMemories));
             if (data.callbackPotential !== undefined) builder.set("callback_potential", data.callbackPotential);
-            if (data.embedding !== undefined) builder.set("embedding", Buffer.from(data.embedding.buffer));
+            if (data.embedding !== undefined) builder.set("embedding", embeddingToBuffer(data.embedding));
             builder.set("updated_at", ts);
             builder.where("id", existing.id);
 
@@ -642,7 +733,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                 toJSON(data.relatedTopicIds),
                 toJSON(data.associatedMemories),
                 data.callbackPotential ?? 0,
-                data.embedding ? Buffer.from(data.embedding.buffer) : null,
+                data.embedding ? embeddingToBuffer(data.embedding) : null,
                 ts,
                 ts,
             );
@@ -684,7 +775,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         if (data.relatedTopicIds !== undefined) builder.set("related_topic_ids", toJSON(data.relatedTopicIds));
         if (data.associatedMemories !== undefined) builder.set("associated_memories", toJSON(data.associatedMemories));
         if (data.callbackPotential !== undefined) builder.set("callback_potential", data.callbackPotential);
-        if (data.embedding !== undefined) builder.set("embedding", Buffer.from(data.embedding.buffer));
+        if (data.embedding !== undefined) builder.set("embedding", embeddingToBuffer(data.embedding));
         builder.set("updated_at", ts);
         builder.where("id", id);
 
@@ -731,7 +822,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
             this.db.prepare("DELETE FROM topics_vec WHERE topic_id = ?").run(topicId);
             this.db.prepare(
                 "INSERT INTO topics_vec(topic_id, chat_id, embedding) VALUES (?, ?, ?)"
-            ).run(topicId, chatId, Buffer.from(embedding.buffer));
+            ).run(topicId, chatId, embeddingToBuffer(embedding));
             log.debug("syncTopicVec", { topicId, chatId });
         } catch (err) {
             log.warn("syncTopicVec 失败", { topicId, error: String(err) });
@@ -745,11 +836,79 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
             this.db.prepare("DELETE FROM facts_vec WHERE fact_id = ?").run(factId);
             this.db.prepare(
                 "INSERT INTO facts_vec(fact_id, embedding) VALUES (?, ?)"
-            ).run(factId, Buffer.from(embedding.buffer));
+            ).run(factId, embeddingToBuffer(embedding));
             log.debug("syncFactVec", { factId });
         } catch (err) {
             log.warn("syncFactVec 失败", { factId, error: String(err) });
         }
+    }
+
+    /**
+     * 为已存在的 fact 补写 embedding（更新 core_facts.embedding 列 + 同步 vec0）。
+     * 供「异步写入」（reflection 存完事实后台补向量）与 backfill 使用——存储与算向量解耦，不阻塞写入路径。
+     */
+    setFactEmbedding(factId: string, embedding: Float32Array): void {
+        try {
+            this.db.prepare("UPDATE core_facts SET embedding = ? WHERE id = ?").run(embeddingToBuffer(embedding), factId);
+            this.syncFactVec(factId, embedding);
+        } catch (err) {
+            log.warn("setFactEmbedding 失败", { factId, error: String(err) });
+        }
+    }
+
+    /** 为已存在的 topic 补写 embedding（更新 topics.embedding 列 + 同步 vec0）。 */
+    setTopicEmbedding(topicId: string, chatId: string, embedding: Float32Array): void {
+        try {
+            this.db.prepare("UPDATE topics SET embedding = ? WHERE id = ?").run(embeddingToBuffer(embedding), topicId);
+            this.syncTopicVec(topicId, chatId, embedding);
+        } catch (err) {
+            log.warn("setTopicEmbedding 失败", { topicId, error: String(err) });
+        }
+    }
+
+    /**
+     * 运维：为所有缺向量的 fact / topic 批量补 embedding。
+     * 开启 embedding（embedding.enabled=true）后，对存量数据跑一次（cli memory backfill-embeddings）。
+     * 未启用 embedding（无 embeddingConfig）时返回 0。分批；单批失败不致命。
+     */
+    async backfillEmbeddings(opts?: { batchSize?: number }): Promise<{ facts: number; topics: number }> {
+        const cfg = this.embeddingConfig;
+        if (!cfg) {
+            log.warn("backfillEmbeddings: 未启用 embedding（无 embeddingConfig），跳过");
+            return { facts: 0, topics: 0 };
+        }
+        const BATCH = opts?.batchSize ?? 64;
+
+        const factRows = this.db.prepare(
+            "SELECT id, subject, content FROM core_facts WHERE embedding IS NULL AND (expires_at IS NULL OR expires_at > datetime('now'))"
+        ).all() as Array<{ id: string; subject: string; content: string }>;
+        let factDone = 0;
+        for (let i = 0; i < factRows.length; i += BATCH) {
+            const chunk = factRows.slice(i, i + BATCH);
+            try {
+                const embs = await embed(chunk.map(r => `${r.subject}: ${r.content}`), cfg);
+                chunk.forEach((r, j) => { if (embs[j]) { this.setFactEmbedding(r.id, embs[j]); factDone++; } });
+            } catch (err) {
+                log.warn("backfillEmbeddings facts 批失败", { error: String(err) });
+            }
+        }
+
+        const topicRows = this.db.prepare(
+            "SELECT id, chat_id, label, summary FROM topics WHERE embedding IS NULL AND (label != '' OR summary != '')"
+        ).all() as Array<{ id: string; chat_id: string; label: string; summary: string }>;
+        let topicDone = 0;
+        for (let i = 0; i < topicRows.length; i += BATCH) {
+            const chunk = topicRows.slice(i, i + BATCH);
+            try {
+                const embs = await embed(chunk.map(r => `${r.label} ${r.summary}`.trim()), cfg);
+                chunk.forEach((r, j) => { if (embs[j]) { this.setTopicEmbedding(r.id, r.chat_id, embs[j]); topicDone++; } });
+            } catch (err) {
+                log.warn("backfillEmbeddings topics 批失败", { error: String(err) });
+            }
+        }
+
+        log.info("backfillEmbeddings 完成", { facts: factDone, topics: topicDone });
+        return { facts: factDone, topics: topicDone };
     }
 
     /**
@@ -895,6 +1054,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         }
 
         log.debug("storeFact", { id, subject, category, hasEmbedding: !!embedding });
+
         return id;
     }
 
@@ -1122,6 +1282,9 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
             if (data.tabooTopics !== undefined) builder.set("taboo_topics", toJSON(data.tabooTopics));
             if (data.lastReflectedAt !== undefined) builder.set("last_reflected_at", data.lastReflectedAt);
             if (data.isDirectMessage !== undefined) builder.set("is_direct_message", data.isDirectMessage ? 1 : 0);
+            if (data.markedSensitive !== undefined) builder.set("marked_sensitive", data.markedSensitive ? 1 : 0);
+            if (data.sensitiveReason !== undefined) builder.set("sensitive_reason", data.sensitiveReason);
+            if (data.sensitiveAt !== undefined) builder.set("sensitive_at", data.sensitiveAt);
             builder.set("updated_at", ts);
             builder.where("chat_id", chatId);
 
@@ -1134,8 +1297,8 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                     chat_id, chat_title, description, dominant_language, communication_norms,
                     active_members, avg_messages_per_day, peak_hours, agent_role,
                     engagement_level, recent_feedback, hot_topics, taboo_topics,
-                    last_reflected_at, is_direct_message, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    last_reflected_at, is_direct_message, marked_sensitive, sensitive_reason, sensitive_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `).run(
                 chatId,
                 data.chatTitle ?? "",
@@ -1152,6 +1315,9 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                 toJSON(data.tabooTopics),
                 data.lastReflectedAt ?? null,
                 data.isDirectMessage ? 1 : 0,
+                data.markedSensitive ? 1 : 0,
+                data.sensitiveReason ?? null,
+                data.sensitiveAt ?? null,
                 ts,
             );
             log.debug("upsertGroupModel: INSERT", { chatId, title: data.chatTitle ?? "" });
@@ -1169,6 +1335,9 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
             chatId: row.chat_id as string,
             chatTitle: row.chat_title as string,
             isDirectMessage: !!(row.is_direct_message as number),
+            markedSensitive: !!(row.marked_sensitive as number),
+            sensitiveReason: (row.sensitive_reason as string) ?? undefined,
+            sensitiveAt: (row.sensitive_at as string) ?? null,
             description: row.description as string,
             dominantLanguage: row.dominant_language as string,
             communicationNorms: fromJSON(row.communication_norms as string, []),
@@ -1183,6 +1352,27 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
             lastReflectedAt: (row.last_reflected_at as string) ?? null,
             updatedAt: row.updated_at as string,
         };
+    }
+
+    /**
+     * 将某会话标记为敏感/私密（append-only：只置 true、幂等、无取消路径）。
+     * 写到规范化的 GroupModel key（Discord channel→guild），使全体 GroupModel 读者（reflection /
+     * recording / getChatVisibility）都能看到，且对同 guild 的所有频道一致生效。
+     * 已标记则直接幂等返回；不会覆盖已有原因/时间。
+     */
+    markChatSensitive(chatId: string, reason?: string): GroupModel | null {
+        const key = safeGroupModelKey(chatId);
+        const existing = this.getGroupModel(key);
+        if (existing?.markedSensitive) {
+            return existing; // 幂等：已敏感则不重复写
+        }
+        this.upsertGroupModel(key, {
+            markedSensitive: true,
+            sensitiveReason: reason?.trim() || existing?.sensitiveReason || "runtime marked sensitive",
+            sensitiveAt: now(),
+        });
+        log.info("markChatSensitive", { chatId, key, reason: reason?.slice(0, 120) });
+        return this.getGroupModel(key);
     }
 
     getPersonIdentity(userId: string): PersonIdentity | null {
@@ -1273,6 +1463,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
             episode.date ?? ts,
         );
         log.debug("storeInteraction", { id, type: episode.type });
+
         return id;
     }
 
@@ -1291,7 +1482,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         if (this.sqliteVecAvailable) {
             try {
                 let sql: string;
-                const params: unknown[] = [Buffer.from(queryEmbedding.buffer), limit];
+                const params: unknown[] = [embeddingToBuffer(queryEmbedding), limit];
 
                 if (chatId) {
                     sql = `SELECT topic_id, distance FROM topics_vec WHERE embedding MATCH ? AND k = ? AND chat_id = ? ORDER BY distance`;
@@ -1368,21 +1559,21 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         queryEmbedding: Float32Array,
         limit: number = 10,
         categories?: FactCategory[],
-    ): Array<{ id: string; content: string; category: FactCategory; subject: string; confidence: number; similarity: number }> {
+    ): Array<{ id: string; content: string; category: FactCategory; subject: string; confidence: number; similarity: number; visibility?: "private" | "contextual" | "public"; sourceChatId?: string | null }> {
         // ── vec0 快路径 ──
         if (this.sqliteVecAvailable && !categories?.length) {
             // vec0 不支持 category 过滤（非 partition key），仅在无 category 过滤时使用
             try {
                 const sql = `SELECT fact_id, distance FROM facts_vec WHERE embedding MATCH ? AND k = ? ORDER BY distance`;
                 const vecRows = this.db.prepare(sql).all(
-                    Buffer.from(queryEmbedding.buffer), limit
+                    embeddingToBuffer(queryEmbedding), limit
                 ) as Array<{ fact_id: string; distance: number }>;
 
                 log.debug("vectorSearchFacts[vec0]: KNN 查询", { count: vecRows.length, limit });
 
                 if (vecRows.length === 0) return [];
 
-                const result: Array<{ id: string; content: string; category: FactCategory; subject: string; confidence: number; similarity: number }> = [];
+                const result: Array<{ id: string; content: string; category: FactCategory; subject: string; confidence: number; similarity: number; visibility?: "private" | "contextual" | "public"; sourceChatId?: string | null }> = [];
                 for (const vr of vecRows) {
                     const row = this.db.prepare(
                         "SELECT * FROM core_facts WHERE id = ? AND (expires_at IS NULL OR expires_at > datetime('now'))"
@@ -1396,6 +1587,8 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                             confidence: row.confidence as number,
                             // vec0 默认 L2 距离
                             similarity: 1 / (1 + vr.distance),
+                            visibility: (row.visibility as "private" | "contextual" | "public") ?? undefined,
+                            sourceChatId: (row.source_chat_id as string | null) ?? null,
                         });
                     }
                 }
@@ -1435,6 +1628,8 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                 subject: row.subject as string,
                 confidence: row.confidence as number,
                 similarity: simFn(queryEmbedding, emb),
+                visibility: (row.visibility as "private" | "contextual" | "public") ?? undefined,
+                sourceChatId: (row.source_chat_id as string | null) ?? null,
             };
         });
 
@@ -1449,11 +1644,219 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         return result;
     }
 
+    appendSessionDigest(entry: Omit<SessionDigestEntry, "id" | "createdAt"> & { id?: string; createdAt?: string; embedding?: Float32Array }): SessionDigestEntry {
+        const content = String(entry.content ?? "").trim();
+        if (!content) {
+            throw new Error("session digest content is required");
+        }
+        const id = entry.id?.trim() || randomUUID();
+        const createdAt = entry.createdAt ?? now();
+        const kind = normalizeSessionDigestKind(entry.kind);
+        const actorType = entry.actorType ?? entry.source?.actorType ?? "system";
+        const actorId = entry.actorId ?? entry.source?.actorId ?? null;
+        const sourceChatId = entry.sourceChatId ?? entry.source?.chatId ?? null;
+        const sourceChatTitle = entry.sourceChatTitle ?? entry.source?.chatTitle ?? null;
+        const targetChatId = entry.targetChatId ?? null;
+        const taskId = entry.taskId ?? entry.source?.taskId ?? null;
+        const runId = entry.runId ?? entry.source?.runId ?? null;
+        const tags = entry.tags ?? [];
+        const importance = boundNumber(entry.importance, 0.5, 0, 1);
+        const visibility = entry.visibility ?? "contextual";
+        const metadata = entry.metadata ?? {};
+        const embeddingBuffer = entry.embedding ? embeddingToBuffer(entry.embedding) : null;
+
+        const result = this.db.prepare(`
+            INSERT OR IGNORE INTO session_digests (
+                id, created_at, kind, actor_type, actor_id, source_chat_id, source_chat_title,
+                target_chat_id, task_id, run_id, content, tags, importance, visibility, metadata, embedding
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+            id,
+            createdAt,
+            kind,
+            actorType,
+            actorId,
+            sourceChatId,
+            sourceChatTitle,
+            targetChatId,
+            taskId,
+            runId,
+            content,
+            toJSON(tags),
+            importance,
+            visibility,
+            JSON.stringify(metadata),
+            embeddingBuffer,
+        );
+
+        if (result.changes > 0) {
+            this.upsertSessionDigestFts(id, content, tags, actorId, sourceChatTitle);
+            if (embeddingBuffer && this.sqliteVecAvailable) {
+                try {
+                    this.db.prepare(
+                        "INSERT OR REPLACE INTO session_digests_vec (digest_id, embedding) VALUES (?, ?)"
+                    ).run(id, embeddingBuffer);
+                } catch (err) {
+                    log.debug("session_digests_vec 写入失败", { id, error: String(err) });
+                }
+            }
+        }
+
+        return this.getSessionDigestById(id) ?? {
+            id,
+            content,
+            createdAt,
+            kind,
+            actorType,
+            actorId: actorId ?? undefined,
+            sourceChatId,
+            sourceChatTitle,
+            targetChatId,
+            taskId,
+            runId,
+            tags,
+            importance,
+            visibility,
+            metadata,
+        };
+    }
+
+    migrateLegacySessionDigests(entries: Array<{ createdAt: string; content: string }>): number {
+        let migrated = 0;
+        for (const entry of entries) {
+            const content = String(entry.content ?? "").trim();
+            const createdAt = String(entry.createdAt ?? "").trim();
+            if (!content || !createdAt) continue;
+            const id = legacySessionDigestId(createdAt, content);
+            const before = this.getSessionDigestById(id);
+            if (before) continue;
+            this.appendSessionDigest({
+                id,
+                createdAt,
+                content,
+                kind: "legacy",
+                actorType: "system",
+                tags: ["legacy"],
+                metadata: { migratedFrom: "global-state.sessionDigests" },
+            });
+            migrated++;
+        }
+        if (migrated > 0) log.info("legacy session digests migrated", { migrated });
+        return migrated;
+    }
+
+    listSessionDigests(options: SessionDigestSearchOptions = {}): SessionDigestEntry[] {
+        return this.querySessionDigests(options);
+    }
+
+    searchAgentMemory(query: string, options: SessionDigestSearchOptions = {}): SessionDigestEntry[] {
+        return this.querySessionDigests({ ...options, query });
+    }
+
+    getTimeline(options: TimelineOptions = {}): TimelineEntry[] {
+        const limit = Math.min(Math.max(options.limit ?? 50, 1), 200);
+        const entries: TimelineEntry[] = [];
+        const includeDigests = options.includeDigests !== false;
+        const includeTopics = options.includeTopics !== false;
+
+        if (includeDigests) {
+            for (const digest of this.listSessionDigests({
+                chatId: options.chatId,
+                after: options.after,
+                before: options.before,
+                limit,
+            })) {
+                entries.push({
+                    type: "session_digest",
+                    timestamp: digest.createdAt,
+                    chatId: digest.sourceChatId ?? digest.targetChatId,
+                    title: digest.sourceChatTitle ?? digest.kind,
+                    content: digest.content,
+                    refId: digest.id,
+                    metadata: {
+                        kind: digest.kind,
+                        actorType: digest.actorType,
+                        actorId: digest.actorId,
+                        taskId: digest.taskId,
+                        runId: digest.runId,
+                    },
+                });
+            }
+        }
+
+        if (includeTopics) {
+            const conditions: string[] = [];
+            const params: unknown[] = [];
+            if (options.chatId) {
+                conditions.push("chat_id = ?");
+                params.push(options.chatId);
+            }
+            if (options.after) {
+                conditions.push("started_at >= ?");
+                params.push(options.after);
+            }
+            if (options.before) {
+                conditions.push("started_at <= ?");
+                params.push(options.before);
+            }
+            params.push(limit);
+            const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+            const rows = this.db.prepare(`
+                SELECT id, chat_id, label, summary, started_at
+                FROM topics
+                ${where}
+                ORDER BY started_at DESC
+                LIMIT ?
+            `).all(...params) as Array<Record<string, unknown>>;
+            for (const row of rows) {
+                entries.push({
+                    type: "topic",
+                    timestamp: row.started_at as string,
+                    chatId: row.chat_id as string,
+                    title: row.label as string,
+                    content: row.summary as string,
+                    refId: row.id as string,
+                });
+            }
+        }
+
+        return entries
+            .sort((left, right) => right.timestamp.localeCompare(left.timestamp))
+            .slice(0, limit);
+    }
+
+    vectorSearchSessionDigests(
+        queryEmbedding: Float32Array,
+        limit: number = 10,
+    ): Array<SessionDigestEntry & { similarity: number }> {
+        if (this.sqliteVecAvailable) {
+            try {
+                const rows = this.db.prepare(
+                    `SELECT digest_id, distance FROM session_digests_vec WHERE embedding MATCH ? AND k = ? ORDER BY distance`
+                ).all(embeddingToBuffer(queryEmbedding), limit) as Array<{ digest_id: string; distance: number }>;
+                return rows.flatMap((row) => {
+                    const digest = this.getSessionDigestById(row.digest_id);
+                    return digest ? [{ ...digest, similarity: 1 / (1 + row.distance) }] : [];
+                });
+            } catch (err) {
+                log.warn("vectorSearchSessionDigests[vec0] 查询失败，fallback 纯 JS", { error: String(err) });
+            }
+        }
+
+        const rows = this.db.prepare("SELECT * FROM session_digests WHERE embedding IS NOT NULL").all() as Record<string, unknown>[];
+        const simFn = getSimilarityFn(this.embeddingConfig?.similarityMetric ?? "cosine");
+        return rows.map((row) => ({
+            ...this.rowToSessionDigest(row),
+            similarity: simFn(queryEmbedding, bufferToEmbedding(row.embedding as Buffer)),
+        })).sort((a, b) => b.similarity - a.similarity).slice(0, limit);
+    }
+
     // ─── 检索方法 ───
 
+    /** 本地 SQLite 语义检索（向量 + FTS5 + LIKE 三级回退）。 */
     async recall(query: string, options?: RecallOptions): Promise<RecallResult> {
         const topicMap = new Map<string, TopicNode>();
-        const factMap = new Map<string, { content: string; category: FactCategory; subject: string; confidence: number }>();
+        const factMap = new Map<string, { content: string; category: FactCategory; subject: string; confidence: number; sourceChatId?: string | null; visibility?: "private" | "contextual" | "public" }>();
 
         const maxResults = options?.maxResults ?? 10;
         const chatIdFilter = options?.chatId;
@@ -1476,6 +1879,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                         if (!factMap.has(f.id)) factMap.set(f.id, {
                             content: f.content, category: f.category,
                             subject: f.subject, confidence: f.confidence,
+                            sourceChatId: f.sourceChatId ?? null, visibility: f.visibility,
                         });
                     }
                     log.debug("recall: 向量搜索完成", { topics: vecTopics.length, facts: vecFacts.length });
@@ -1557,6 +1961,8 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                     category: row.category as FactCategory,
                     subject: row.subject as string,
                     confidence: row.confidence as number,
+                    sourceChatId: (row.source_chat_id as string | null) ?? null,
+                    visibility: (row.visibility as "private" | "contextual" | "public") ?? undefined,
                 });
             }
         } catch (err) {
@@ -1584,6 +1990,8 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                         category: row.category as FactCategory,
                         subject: row.subject as string,
                         confidence: row.confidence as number,
+                        sourceChatId: (row.source_chat_id as string | null) ?? null,
+                        visibility: (row.visibility as "private" | "contextual" | "public") ?? undefined,
                     });
                 }
             } catch { /* LIKE fallback */ }
@@ -1591,6 +1999,11 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
 
         const topics = [...topicMap.values()];
         const facts = [...factMap.values()];
+        const sessionDigests = this.searchAgentMemory(query, {
+            chatId: chatIdFilter,
+            limit: maxResults,
+            after: daysBack ? new Date(Date.now() - daysBack * 86400000).toISOString() : undefined,
+        });
 
         // ─── 关联 persons（通过 topic.participants 匹配） ───
         let persons = this.resolvePersonsFromTopics(topics);
@@ -1641,9 +2054,10 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
             topicsFound: topics.length,
             factsFound: facts.length,
             personsFound: persons.length,
+            sessionDigestsFound: sessionDigests.length,
             hasDeepSummary: !!deepSummary,
         });
-        return { topics, facts, persons, deepSummary };
+        return { topics, facts, persons, deepSummary, sessionDigests };
     }
 
     /** 从 topic 参与者解析关联的 person_group_profiles */
@@ -2851,6 +3265,9 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
             chatId: row.chat_id as string,
             chatTitle: row.chat_title as string,
             isDirectMessage: !!(row.is_direct_message as number),
+            markedSensitive: !!(row.marked_sensitive as number),
+            sensitiveReason: (row.sensitive_reason as string) ?? undefined,
+            sensitiveAt: (row.sensitive_at as string) ?? null,
             description: row.description as string,
             dominantLanguage: row.dominant_language as string,
             communicationNorms: fromJSON(row.communication_norms as string, []),
@@ -2967,10 +3384,13 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
 
     /** 按 ID 删除 core_fact（含 FTS5 + vec0 清理） */
     deleteFact(id: string): boolean {
+        // 先取 source_chat_id（用于解析远程 bank 做 tombstone）+ rowid（FTS 清理）
+        const meta = this.db.prepare("SELECT rowid, source_chat_id FROM core_facts WHERE id = ?")
+            .get(id) as { rowid: number; source_chat_id?: string | null } | undefined;
+
         // FTS5 cleanup
         try {
-            const row = this.db.prepare("SELECT rowid FROM core_facts WHERE id = ?").get(id) as { rowid: number } | undefined;
-            if (row) this.db.prepare("DELETE FROM core_facts_fts WHERE rowid = ?").run(row.rowid);
+            if (meta) this.db.prepare("DELETE FROM core_facts_fts WHERE rowid = ?").run(meta.rowid);
         } catch { /* FTS */ }
 
         // vec0 cleanup
@@ -3246,9 +3666,194 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
             keywords: fromJSON(row.keywords as string, []),
             associatedMemories: fromJSON<AssociatedMemory[]>(row.associated_memories as string, []),
             callbackPotential: Number(row.callback_potential ?? 0),
-            embedding: row.embedding ? new Float32Array((row.embedding as Buffer).buffer) : undefined,
+            embedding: row.embedding ? bufferToEmbedding(row.embedding as Buffer) : undefined,
             createdAt: row.created_at as string,
             updatedAt: row.updated_at as string,
         };
     }
+
+    private getSessionDigestById(id: string): SessionDigestEntry | null {
+        const row = this.db.prepare("SELECT * FROM session_digests WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+        return row ? this.rowToSessionDigest(row) : null;
+    }
+
+    private rowToSessionDigest(row: Record<string, unknown>): SessionDigestEntry {
+        const actorType = (row.actor_type as SessionDigestEntry["actorType"]) ?? "system";
+        const actorId = (row.actor_id as string | null) ?? undefined;
+        const sourceChatId = (row.source_chat_id as string | null) ?? null;
+        const sourceChatTitle = (row.source_chat_title as string | null) ?? null;
+        const taskId = (row.task_id as string | null) ?? null;
+        const runId = (row.run_id as string | null) ?? null;
+        return {
+            id: row.id as string,
+            createdAt: row.created_at as string,
+            kind: normalizeSessionDigestKind(row.kind as string),
+            actorType,
+            actorId,
+            sourceChatId,
+            sourceChatTitle,
+            targetChatId: (row.target_chat_id as string | null) ?? null,
+            taskId,
+            runId,
+            content: row.content as string,
+            tags: fromJSON<string[]>(row.tags as string, []),
+            importance: Number(row.importance ?? 0.5),
+            visibility: ((row.visibility as string) ?? "contextual") as SessionDigestEntry["visibility"],
+            metadata: fromJSON<Record<string, unknown>>(row.metadata as string, {}),
+            source: {
+                actorType,
+                ...(actorId ? { actorId } : {}),
+                ...(sourceChatId ? { chatId: sourceChatId } : {}),
+                ...(sourceChatTitle ? { chatTitle: sourceChatTitle } : {}),
+                ...(taskId ? { taskId } : {}),
+                ...(runId ? { runId } : {}),
+            },
+        };
+    }
+
+    private upsertSessionDigestFts(
+        id: string,
+        content: string,
+        tags: string[],
+        actorId: string | null,
+        sourceChatTitle: string | null,
+    ): void {
+        try {
+            this.db.prepare("DELETE FROM session_digests_fts WHERE id = ?").run(id);
+            this.db.prepare(`
+                INSERT INTO session_digests_fts (id, content, tags, actor_id, source_chat_title)
+                VALUES (?, ?, ?, ?, ?)
+            `).run(id, content, tags.join(" "), actorId ?? "", sourceChatTitle ?? "");
+        } catch (err) {
+            log.debug("session_digests_fts 同步失败", { id, error: String(err) });
+        }
+    }
+
+    private querySessionDigests(options: SessionDigestSearchOptions = {}): SessionDigestEntry[] {
+        const limit = Math.min(Math.max(options.limit ?? 30, 1), 200);
+        const conditions: string[] = [];
+        const params: unknown[] = [];
+        const query = options.query?.trim();
+        let from = "session_digests sd";
+
+        if (query) {
+            const ftsQuery = buildFtsOrQuery(query);
+            if (ftsQuery) {
+                from = "session_digests sd INNER JOIN session_digests_fts fts ON fts.id = sd.id";
+                conditions.push("session_digests_fts MATCH ?");
+                params.push(ftsQuery);
+            } else {
+                conditions.push("sd.content LIKE ?");
+                params.push(`%${query}%`);
+            }
+        }
+        if (options.chatId) {
+            conditions.push("(sd.source_chat_id = ? OR sd.target_chat_id = ?)");
+            params.push(options.chatId, options.chatId);
+        }
+        if (options.actorType) {
+            conditions.push("sd.actor_type = ?");
+            params.push(options.actorType);
+        }
+        if (options.kind) {
+            conditions.push("sd.kind = ?");
+            params.push(options.kind);
+        }
+        if (options.after) {
+            conditions.push("sd.created_at >= ?");
+            params.push(options.after);
+        }
+        if (options.before) {
+            conditions.push("sd.created_at <= ?");
+            params.push(options.before);
+        }
+        for (const tag of options.tags ?? []) {
+            conditions.push("sd.tags LIKE ?");
+            params.push(`%"${tag}"%`);
+        }
+
+        const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+        params.push(limit);
+        try {
+            const rows = this.db.prepare(`
+                SELECT sd.*
+                FROM ${from}
+                ${where}
+                ORDER BY sd.created_at DESC, sd.id DESC
+                LIMIT ?
+            `).all(...params) as Array<Record<string, unknown>>;
+            return rows.map((row) => this.rowToSessionDigest(row));
+        } catch (err) {
+            if (!query) throw err;
+            log.debug("session digest FTS query failed, falling back to LIKE", { error: String(err) });
+            return this.querySessionDigestsLike(options);
+        }
+    }
+
+    private querySessionDigestsLike(options: SessionDigestSearchOptions): SessionDigestEntry[] {
+        const limit = Math.min(Math.max(options.limit ?? 30, 1), 200);
+        const conditions: string[] = [];
+        const params: unknown[] = [];
+        const query = options.query?.trim();
+        if (query) {
+            const pattern = `%${query}%`;
+            conditions.push("(content LIKE ? OR tags LIKE ? OR actor_id LIKE ? OR source_chat_title LIKE ?)");
+            params.push(pattern, pattern, pattern, pattern);
+        }
+        if (options.chatId) {
+            conditions.push("(source_chat_id = ? OR target_chat_id = ?)");
+            params.push(options.chatId, options.chatId);
+        }
+        if (options.actorType) {
+            conditions.push("actor_type = ?");
+            params.push(options.actorType);
+        }
+        if (options.kind) {
+            conditions.push("kind = ?");
+            params.push(options.kind);
+        }
+        if (options.after) {
+            conditions.push("created_at >= ?");
+            params.push(options.after);
+        }
+        if (options.before) {
+            conditions.push("created_at <= ?");
+            params.push(options.before);
+        }
+        const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+        params.push(limit);
+        const rows = this.db.prepare(`
+            SELECT * FROM session_digests
+            ${where}
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+        `).all(...params) as Array<Record<string, unknown>>;
+        return rows.map((row) => this.rowToSessionDigest(row));
+    }
+}
+
+function normalizeSessionDigestKind(kind: string | undefined): SessionDigestKind {
+    const allowed = new Set<SessionDigestKind>([
+        "meta_turn",
+        "subagent_callback",
+        "dispatch_created",
+        "dispatch_done",
+        "background_notify",
+        "harness_callback",
+        "attention_enqueue",
+        "consciousness_tick",
+        "system",
+        "legacy",
+    ]);
+    return allowed.has(kind as SessionDigestKind) ? kind as SessionDigestKind : "system";
+}
+
+function boundNumber(value: unknown, fallback: number, min: number, max: number): number {
+    if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+    return Math.max(min, Math.min(max, value));
+}
+
+function legacySessionDigestId(createdAt: string, content: string): string {
+    const hash = createHash("sha256").update(`${createdAt}\n${content}`).digest("hex").slice(0, 32);
+    return `legacy:${hash}`;
 }

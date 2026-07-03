@@ -17,9 +17,11 @@ import type { ShellWakeEvent } from "./sandbox/sandbox.js";
 import { installSkillsDependencies } from "./sandbox/skill-loader.js";
 import { createSandboxHostCallHandler } from "./sandbox/host-call-handler.js";
 import { MemoryStoreV2 } from "./memory-v2/index.js";
+import { createMemoryStore } from "./core/memory-factory.js";
 import {
     loadConfig,
     resolveComponentProfiles,
+    resolveEmbeddingConfig,
     type AppConfig,
     type EnvironmentVariable,
 } from "./core/config.js";
@@ -424,7 +426,11 @@ async function main(): Promise<void> {
             log.debug("SandboxPool onAcquire: 已初始化", { chatId });
         },
     });
-    const memory = new MemoryStoreV2(join(DATA_DIR, "memory.db"));
+    // 经由工厂构建：本地 SQLite 存储 + 检索，并注入全局隐私分级。
+    // embedding 检索由 embedding.enabled 开关控制（默认关 → 走 FTS5/LIKE 关键词召回；
+    // 开启后写入异步生成向量、recall 走向量，存量需跑一次 cli memory backfill-embeddings）。
+    const embeddingConfig = resolveEmbeddingConfig(appConfig);
+    const memory = createMemoryStore(join(DATA_DIR, "memory.db"), { config: appConfig, embeddingConfig });
     const { createInterface: createRL } = await import("node:readline");
     const hostRL = createRL({ input: process.stdin, output: process.stdout });
 
@@ -497,6 +503,9 @@ async function main(): Promise<void> {
             personaName: appConfig.persona?.name ?? "赛博群友",
             personaDescription: appConfig.persona?.description ?? "赛博群友",
             memory,
+            // 开启 embedding 时，RecordingPipeline 才会为新话题增量生成向量（否则话题向量永远为空，
+            // 只能靠 cli backfill 补，召回退化为关键词）。
+            embeddingConfig,
             pipelineConfig: appConfig.recordingPipeline,
             publishTopicSignals: (signals) => {
                 const deliverableSignals = signals.filter((signal) => !postTaskWindows?.hasActiveWindow(signal.chatId));
@@ -565,6 +574,14 @@ async function main(): Promise<void> {
     const globalState = new GlobalState({
         filePath: join(DATA_DIR, "global-state.json"),
         autoSaveInterval: 30000,
+    });
+    memory.migrateLegacySessionDigests(globalState.getLegacySessionDigests());
+    globalState.setSessionDigestAdapter({
+        append: (content, options) => memory.appendSessionDigest({
+            content,
+            ...(options ?? {}),
+        }),
+        list: (options) => memory.listSessionDigests({ limit: options?.limit ?? 30 }),
     });
     accumulator = new AttentionAccumulator(globalState, {
         windowMs: appConfig.subagent?.pollInterval ?? 5000,
@@ -809,8 +826,9 @@ async function main(): Promise<void> {
             } catch { /* 非关键路径 */ }
         }
 
-        // 层 2 消息前送：如果该 chatId 的 CodeActExecutor 正在执行，推入 pending buffer
-        if (executorProcessing && executor) {
+        // 层 2 消息前送：执行中只前送 direct attention。
+        // 群聊普通消息留给 Observer / post-task follow-up，避免每句话都打断当前 task。
+        if (executorProcessing && executor && isDirectAttention) {
             executor.pushPendingMessage({
                 messageId: String(event.messageId ?? event.id ?? `msg_${Date.now()}`),
                 sender: String(event.displayName ?? event.senderName ?? event.userName ?? "?"),
@@ -1259,18 +1277,49 @@ async function main(): Promise<void> {
                 listTasks: () => globalState.listDispatchedSubagentTasks({ limit: 200 }).tasks,
                 memory,
                 sinceTs,
+                sessionDigests: memory.listSessionDigests({ limit: 30 }).slice().reverse(),
             }),
         });
         harnessManager.onSpawnFailure = (error, pendingCount) => {
-            globalState.addSessionDigest(`[Background Agent spawn failed] ${error} (${pendingCount} pending tasks)`);
+            globalState.addSessionDigest(`[Background Agent spawn failed] ${error} (${pendingCount} pending tasks)`, {
+                kind: "system",
+                actorType: "system",
+                actorId: "harness-manager",
+                sourceChatId: "__background__",
+                tags: ["harness", "failure"],
+                metadata: { pendingCount },
+            });
         };
+        mainLoop.setProactiveIdleHandler((payload) => {
+            harnessManager!.enqueue({
+                content: `consciousness_tick: ${payload.description}`,
+                source: "proactive-idle",
+                actorId: "main-loop",
+                triggerReason: "proactive_idle",
+                metadata: { idleId: payload.id },
+            });
+            globalState.addSessionDigest(`[CONSCIOUSNESS_TICK] ${payload.description}`, {
+                kind: "consciousness_tick",
+                actorType: "system",
+                actorId: "main-loop",
+                sourceChatId: "__background__",
+                targetChatId: "__background__",
+                tags: ["consciousness", "idle"],
+                metadata: { idleId: payload.id },
+            });
+            return true;
+        });
+        mainLoop.setHarnessDispatchCallbackHandler((payload) => {
+            harnessManager!.enqueue(payload);
+            return true;
+        });
         if (dashboardDeps) dashboardDeps.harnessManager = harnessManager;
         log.info("HarnessManager 已创建", { harness: bgHarness });
     }
 
     // ─── Prometheus Metrics Exporter ───
     let metricsInstance: import("./metrics/index.js").MetricsInstance | null = null;
-    const metricsEnabled = appConfig.metrics?.enabled !== false;
+    const metricsEnabled = appConfig.metrics?.enabled === true;
     if (metricsEnabled) {
         const { startMetrics } = await import("./metrics/index.js");
         metricsInstance = await startMetrics(

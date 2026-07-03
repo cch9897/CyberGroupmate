@@ -41,7 +41,55 @@ type TelegramMtcuteRef = {
     [key: string]: unknown;
 };
 
+type TelegramInputText = string | {
+    text: string;
+    entities?: Array<Record<string, unknown>>;
+};
+
+interface TelegramCommonSendParams {
+    replyTo?: number | TelegramMessage | TelegramMtcuteRef;
+    replyToTodoItem?: number;
+    replyToPollOption?: Uint8Array;
+    toMonoforumPeer?: number | string | TelegramMtcuteRef;
+    mustReply?: boolean;
+    commentTo?: number | TelegramMessage | TelegramMtcuteRef;
+    replyToStory?: number;
+    quote?: TelegramInputText;
+    quoteOffset?: number;
+    silent?: boolean;
+    schedule?: Date | number | "online";
+    clearDraft?: boolean;
+    forbidForwards?: boolean;
+    sendAs?: number | string | TelegramMtcuteRef;
+    quickReply?: number | string;
+    shouldDispatch?: true;
+    businessConnectionId?: string;
+    allowPaidFloodskip?: boolean;
+    allowPaidMessages?: string | number | Record<string, unknown>;
+    effect?: string | number | Record<string, unknown>;
+    abortSignal?: AbortSignal;
+    [key: string]: unknown;
+}
+
+type TelegramSendTextParams = TelegramCommonSendParams & {
+    randomId?: string | number | Record<string, unknown>;
+    replyMarkup?: unknown;
+    disableWebPreview?: boolean;
+    invertMedia?: boolean;
+};
+
+type TelegramSendMediaParams = TelegramCommonSendParams & {
+    randomId?: string | number | Record<string, unknown>;
+    replyMarkup?: unknown;
+    invert?: boolean;
+    caption?: TelegramInputText;
+    progressCallback?: (uploaded: number, total: number) => void;
+};
+
 declare const telegram: {
+    /** mtcute 新增 high-level method 的动态入口：telegram.methodName(...args)。会话生命周期和裸 call 等危险入口会被 host policy 拦截。 */
+    [mtcuteMethod: string]: any;
+
     // ─── 按需能力指南 ───
     /** 加载 inline bot 使用指南。用于像 Telegram 客户端输入 `@bot query` 一样查询 inline bot 并发送某个结果；调用本方法只披露指南，不会执行实际发送。 */
     useInlineBot(): Promise<string>;
@@ -66,14 +114,14 @@ declare const telegram: {
     /** 加载媒体下载指南。包含：1) 用 fs.writeFileBinary() 正确保存 base64 buffer 的方法；2) GIF/短视频抽帧分析时避免 60s 超时的策略（默认 4-6 帧、复用已有文件、先发进度）。遇到 downloadMedia 或 GIF 分析相关问题时调用。 */
     useMediaDownload(): Promise<string>;
     // ─── 发送与交互 ───
-    /** 发送普通文本消息 */
-    sendText(chatId: number | string, text: string, opts?: { replyTo?: number; silent?: boolean; }): Promise<{ id: number; text: string; date: Date; chat: { id: number; title?: string; username?: string; type: "private" | "group" | "supergroup" | "channel"; }; sender: { id: number; displayName?: string; title?: string; username?: string; }; isMention: boolean; replyToMessage?: { id: number } | null; media?: unknown; mediaInfo?: { type: "photo" | "sticker" | "video" | "document" | "animation" | "audio" | "other"; rawType?: string; fileId?: string; uniqueFileId?: string; emoji?: string; mimeType?: string; fileName?: string; width?: number; height?: number; fileSize?: number; filePath?: string; downloadStatus?: "downloaded" | "cached" | "too_large" | "failed"; downloadError?: string; }; }>;
+    /** mtcute 原生 sendText(chatId, text, params?)。text 支持 string 或 { text, entities }，params 保留 mtcute CommonSendParams 及新增字段。 */
+    sendText(chatId: number | string, text: TelegramInputText, params?: TelegramSendTextParams): Promise<{ id: number; text: string; date: Date; chat: { id: number; title?: string; username?: string; type: "private" | "group" | "supergroup" | "channel"; }; sender: { id: number; displayName?: string; title?: string; username?: string; }; isMention: boolean; replyToMessage?: { id: number } | null; media?: unknown; mediaInfo?: { type: "photo" | "sticker" | "video" | "document" | "animation" | "audio" | "other"; rawType?: string; fileId?: string; uniqueFileId?: string; emoji?: string; mimeType?: string; fileName?: string; width?: number; height?: number; fileSize?: number; filePath?: string; downloadStatus?: "downloaded" | "cached" | "too_large" | "failed"; downloadError?: string; }; }>;
     /**
      * 发送媒体消息。支持 URL 和本地文件路径（支持绝对路径或基于 cwd 工作区的相对路径）。
      * @example sendMedia(chatId, { type: 'photo', file: 'https://example.com/img.jpg', caption: '看看这个' })
      * @example sendMedia(chatId, { type: 'photo', file: 'ip_skk_moe.png' }) // 自动基于 process.cwd() 解析
      */
-    sendMedia(chatId: number | string, media: string | { type: 'photo' | 'video' | 'document' | 'audio' | 'voice' | 'auto'; file: string; caption?: string; fileName?: string }, opts?: { replyTo?: number; silent?: boolean; }): Promise<{ id: number; text: string; date: Date; chat: { id: number; title?: string; username?: string; type: "private" | "group" | "supergroup" | "channel"; }; sender: { id: number; displayName?: string; title?: string; username?: string; }; isMention: boolean; replyToMessage?: { id: number } | null; media?: unknown; mediaInfo?: { type: "photo" | "sticker" | "video" | "document" | "animation" | "audio" | "other"; rawType?: string; fileId?: string; uniqueFileId?: string; emoji?: string; mimeType?: string; fileName?: string; width?: number; height?: number; fileSize?: number; filePath?: string; downloadStatus?: "downloaded" | "cached" | "too_large" | "failed"; downloadError?: string; }; }>;
+    sendMedia(chatId: number | string, media: string | { type?: string; file?: string; media?: unknown; caption?: TelegramInputText; fileName?: string; [key: string]: unknown }, params?: TelegramSendMediaParams): Promise<{ id: number; text: string; date: Date; chat: { id: number; title?: string; username?: string; type: "private" | "group" | "supergroup" | "channel"; }; sender: { id: number; displayName?: string; title?: string; username?: string; }; isMention: boolean; replyToMessage?: { id: number } | null; media?: unknown; mediaInfo?: { type: "photo" | "sticker" | "video" | "document" | "animation" | "audio" | "other"; rawType?: string; fileId?: string; uniqueFileId?: string; emoji?: string; mimeType?: string; fileName?: string; width?: number; height?: number; fileSize?: number; filePath?: string; downloadStatus?: "downloaded" | "cached" | "too_large" | "failed"; downloadError?: string; }; }>;
     /** 发送磁盘文件到聊天。支持绝对路径或基于 cwd 的相对路径。host 侧读取文件并上传。始终作为文件/文档发送。 */
     sendFile(chatId: number | string, filePath: string, opts?: { replyTo?: number; caption?: string; fileName?: string; mimeType?: string }): Promise<{ id: number; text: string; date: Date; chat: { id: number; title?: string; username?: string; type: "private" | "group" | "supergroup" | "channel"; }; sender: { id: number; displayName?: string; title?: string; username?: string; }; isMention: boolean; replyToMessage?: { id: number } | null; media?: unknown; mediaInfo?: { type: "photo" | "sticker" | "video" | "document" | "animation" | "audio" | "other"; rawType?: string; fileId?: string; uniqueFileId?: string; emoji?: string; mimeType?: string; fileName?: string; width?: number; height?: number; fileSize?: number; filePath?: string; downloadStatus?: "downloaded" | "cached" | "too_large" | "failed"; downloadError?: string; }; }>;
     /**

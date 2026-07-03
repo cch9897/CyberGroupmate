@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve as pathResolve } from "node:path";
 import { NotificationCenter } from "../src/event/notification-center.js";
+import type { NotificationEvent } from "../src/event/notification-center.js";
 import { OneBotAdapter } from "../src/adapter/onebot-adapter.js";
 import type { OneBotConfig } from "../src/core/config.js";
 
@@ -19,7 +20,198 @@ function makeConfig(overrides: Partial<OneBotConfig> = {}): OneBotConfig {
     };
 }
 
+function captureEvents(nc: NotificationCenter): NotificationEvent[] {
+    const events: NotificationEvent[] = [];
+    nc.onPush(event => events.push(event));
+    return events;
+}
+
+async function waitForAsyncHandlers(): Promise<void> {
+    await new Promise(resolve => setTimeout(resolve, 0));
+}
+
 describe("OneBotAdapter", () => {
+    it("should normalize array at segments into readable mentions and direct attention", async () => {
+        const nc = makeNC();
+        const events = captureEvents(nc);
+        const adapter = new OneBotAdapter(makeConfig(), nc);
+
+        // @ts-expect-error - override private method for focused ingress test
+        adapter.callAction = async (action: string, params: Record<string, unknown>) => {
+            if (action === "get_group_member_info") {
+                assert.deepEqual(params, { group_id: 42, user_id: 123456789, no_cache: false });
+                return { user_id: 123456789, card: "BotName", nickname: "BotNick" };
+            }
+            if (action === "get_group_info") {
+                return { group_id: 42, group_name: "Test QQ Group" };
+            }
+            throw new Error(`unexpected action: ${action}`);
+        };
+
+        // @ts-expect-error - invoke private websocket handler for ingress normalization
+        adapter.handleWsMessage(JSON.stringify({
+            post_type: "message",
+            self_id: "123456789",
+            message_type: "group",
+            group_id: 42,
+            user_id: 777,
+            message_id: 9001,
+            time: 1770000000,
+            sender: { user_id: 777, nickname: "Alice", card: "" },
+            message: [
+                { type: "text", data: { text: "hi " } },
+                { type: "at", data: { qq: "123456789" } },
+                { type: "text", data: { text: " ping" } },
+            ],
+        }));
+        await waitForAsyncHandlers();
+
+        assert.equal(events.length, 1);
+        assert.equal(events[0].type, "nc.message");
+        assert.equal(events[0].scene, "onebot");
+        assert.equal(events[0].chatId, "onebot:group:42");
+        assert.equal(events[0].userId, "onebot:777");
+        assert.equal(events[0].displayName, "Alice");
+        assert.equal(events[0].text, "hi @BotName ping");
+        assert.equal(events[0].mentionsAgent, true);
+        assert.equal(events[0].chatTitle, "42");
+        assert.deepEqual(events[0].mentions, [{
+            userId: "onebot:123456789",
+            rawUserId: "123456789",
+            displayName: "BotName",
+            isAll: false,
+            isSelf: true,
+        }]);
+        assert.deepEqual(events[0].messageSegments, [
+            { type: "text", data: { text: "hi " } },
+            { type: "at", data: { qq: "123456789" } },
+            { type: "text", data: { text: " ping" } },
+        ]);
+        assert.deepEqual(events[0].source, {
+            scene: "onebot",
+            platform: "onebot",
+            chatId: "onebot:group:42",
+            userId: "onebot:777",
+            chatType: "group",
+            messageId: "9001",
+            replyToMessageId: undefined,
+        });
+
+        nc.dispose();
+    });
+
+    it("should parse CQ at-all strings and unescape text", async () => {
+        const nc = makeNC();
+        const events = captureEvents(nc);
+        const adapter = new OneBotAdapter(makeConfig(), nc);
+
+        // @ts-expect-error - override private method for focused ingress test
+        adapter.callAction = async (action: string) => {
+            if (action === "get_group_info") return { group_id: 42, group_name: "Test QQ Group" };
+            throw new Error(`unexpected action: ${action}`);
+        };
+
+        // @ts-expect-error - invoke private websocket handler for ingress normalization
+        adapter.handleWsMessage(JSON.stringify({
+            post_type: "message",
+            self_id: "123456789",
+            message_type: "group",
+            group_id: 42,
+            user_id: 777,
+            message_id: 9002,
+            sender: { user_id: 777, nickname: "Alice" },
+            raw_message: "look &#91;x&#93;[CQ:at,qq=all] done",
+        }));
+        await waitForAsyncHandlers();
+
+        assert.equal(events.length, 1);
+        assert.equal(events[0].text, "look [x]@全体成员 done");
+        assert.equal(events[0].mentionsAgent, true);
+        assert.deepEqual(events[0].mentions, [{
+            userId: "onebot:all",
+            rawUserId: "all",
+            displayName: "全体成员",
+            isAll: true,
+            isSelf: false,
+        }]);
+
+        nc.dispose();
+    });
+
+    it("should send at messages as OneBot segment arrays", async () => {
+        const nc = makeNC();
+        const adapter = new OneBotAdapter(makeConfig(), nc);
+        const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+
+        // @ts-expect-error - fake connected websocket for handleCall guard
+        adapter.ws = { readyState: 1 };
+        // @ts-expect-error - override private method for payload inspection
+        adapter.callAction = async (action: string, params: Record<string, unknown>) => {
+            calls.push({ action, params });
+            return { message_id: 3 };
+        };
+
+        await adapter.handleCall("onebot.sendAt", [
+            "onebot:group:42",
+            "onebot:private:778899,223344",
+            "看一下",
+            { replyTo: 9001 },
+        ]);
+
+        assert.deepEqual(calls, [{
+            action: "send_group_msg",
+            params: {
+                group_id: 42,
+                message: [
+                    { type: "reply", data: { id: "9001" } },
+                    { type: "at", data: { qq: "778899" } },
+                    { type: "text", data: { text: " " } },
+                    { type: "at", data: { qq: "223344" } },
+                    { type: "text", data: { text: " 看一下" } },
+                ],
+            },
+        }]);
+
+        nc.dispose();
+    });
+
+    it("should send structured OneBot messages and normalize mention targets", async () => {
+        const nc = makeNC();
+        const adapter = new OneBotAdapter(makeConfig(), nc);
+        const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+
+        // @ts-expect-error - fake connected websocket for handleCall guard
+        adapter.ws = { readyState: 1 };
+        // @ts-expect-error - override private method for payload inspection
+        adapter.callAction = async (action: string, params: Record<string, unknown>) => {
+            calls.push({ action, params });
+            return { message_id: 4 };
+        };
+
+        await adapter.handleCall("onebot.sendMessage", [
+            "onebot:group:42",
+            [
+                { type: "text", data: { text: "cc " } },
+                { type: "at", data: { qq: "onebot:778899" } },
+                { type: "text", data: { text: " 已处理" } },
+            ],
+        ]);
+
+        assert.deepEqual(calls, [{
+            action: "send_group_msg",
+            params: {
+                group_id: 42,
+                message: [
+                    { type: "text", data: { text: "cc " } },
+                    { type: "at", data: { qq: "778899" } },
+                    { type: "text", data: { text: " 已处理" } },
+                ],
+            },
+        }]);
+
+        nc.dispose();
+    });
+
     it("should resolve numeric download refs through get_msg image URLs", async () => {
         const nc = makeNC();
         const adapter = new OneBotAdapter(makeConfig(), nc);
@@ -206,33 +398,17 @@ describe("OneBotAdapter", () => {
         nc.dispose();
     });
 
-    it("applyHumanizedDelay waits on bunched sends but not the first", async () => {
+    it("applyHumanizedDelay is a no-op (delay moved to sandbox host-call handling)", async () => {
         const nc = makeNC();
         const adapter = new OneBotAdapter(makeConfig({
             humanizedDelay: { enabled: true, msPerChar: 50, minDelay: 200, maxDelay: 1000 },
         }), nc);
 
-        // 首次发送不应等待（无 lastSendTimes 基准）
         const t0 = Date.now();
         // @ts-expect-error - invoke private method directly
-        await adapter.applyHumanizedDelay("onebot:group:1", 0);
-        const firstElapsed = Date.now() - t0;
-        assert.ok(firstElapsed < 50, `first send should not wait (was ${firstElapsed}ms)`);
-
-        // 立刻紧跟一次，距上次发送 elapsed≈0，应补足 ~targetDelay (200ms)
-        const t1 = Date.now();
-        // @ts-expect-error - invoke private method directly
-        await adapter.applyHumanizedDelay("onebot:group:1", 0);
-        const secondElapsed = Date.now() - t1;
-        assert.ok(secondElapsed >= 180, `second send should wait ~200ms (was ${secondElapsed}ms)`);
-
-        // 等够 targetDelay 之后再发，又不应等待
-        await new Promise(r => setTimeout(r, 220));
-        const t2 = Date.now();
-        // @ts-expect-error - invoke private method directly
-        await adapter.applyHumanizedDelay("onebot:group:1", 0);
-        const thirdElapsed = Date.now() - t2;
-        assert.ok(thirdElapsed < 50, `third send (after window) should not wait (was ${thirdElapsed}ms)`);
+        await adapter.applyHumanizedDelay("onebot:group:1", 100);
+        const elapsed = Date.now() - t0;
+        assert.ok(elapsed < 50, `no-op delay should return immediately (was ${elapsed}ms)`);
 
         nc.dispose();
     });
@@ -310,44 +486,39 @@ describe("OneBotAdapter", () => {
         nc.dispose();
     });
 
-    it("extractText rewrites @self to @personaName, others use nickname cache with CQ fallback", () => {
+    it("extractText renders mentions as @rawUserId when no mentionLabels provided", () => {
         const nc = makeNC();
-        const adapter = new OneBotAdapter(makeConfig(), nc, undefined, "赛博群友");
-        // 预填一个其他用户的昵称缓存，验证缓存路径
-        // @ts-expect-error - 私有字段，测试需要
-        adapter.userNickCache.set("999", "张三");
+        const adapter = new OneBotAdapter(makeConfig(), nc);
         // @ts-expect-error - 私有方法，验证渲染逻辑
         const out = adapter["extractText"]([
-            { type: "at", data: { qq: "123456789" } },   // 自己
+            { type: "at", data: { qq: "123456789" } },
             { type: "text", data: { text: " 在吗，告诉 " } },
-            { type: "at", data: { qq: "999" } },          // 缓存命中
+            { type: "at", data: { qq: "999" } },
             { type: "text", data: { text: " 和 " } },
-            { type: "at", data: { qq: "777" } },          // 缓存未命中
+            { type: "at", data: { qq: "777" } },
             { type: "text", data: { text: " 一声" } },
         ]);
-        assert.equal(out, "@赛博群友 在吗，告诉 @张三(999) 和 [CQ:at,qq=777] 一声");
+        assert.equal(out, "@123456789 在吗，告诉 @999 和 @777 一声");
         nc.dispose();
     });
 
-    it("getMessage strips envelope only once (no double .data unwrap)", async () => {
+    it("getMessage enriches result via enrichOneBotMessageRecord", async () => {
         const nc = makeNC();
         const adapter = new OneBotAdapter(makeConfig(), nc);
 
-        // callAction 已剥过 envelope，返回的就是业务数据；getMessage 不应再去碰 .data
+        // callAction 返回 OneBot 原始响应（message 字段包含消息内容）
         // @ts-expect-error - override private method
         adapter.callAction = async () => ({
             message_id: 123,
             message: [{ type: "text", data: { text: "hello" } }],
-            // 故意带一个 .data 字段，验证 getMessage 不会错误地读它
-            data: { trapped: true },
         });
 
         // @ts-expect-error - invoke private method for focused test
         const result = await adapter.getMessage("123") as Record<string, unknown>;
+        // enrichOneBotMessageRecord 展开原始字段 + 附加 text/mentions/messageSegments 等
         assert.equal(result.message_id, 123);
-        assert.ok(Array.isArray(result.message));
-        // 验证 trapped 字段没有被错误剥离上来
-        assert.deepEqual(result.data, { trapped: true });
+        assert.equal(result.text, "hello");
+        assert.ok(Array.isArray(result.messageSegments));
 
         nc.dispose();
     });

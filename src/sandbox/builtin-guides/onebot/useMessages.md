@@ -1,6 +1,6 @@
 OneBotGuide: useMessages
 
-本指南用于 OneBot/NapCat 的消息检索、已读、转发、合并转发和消息表情点赞等成组能力。普通发送、撤回、下载媒体仍优先使用 brief 中的顶层方法：`sendText`、`sendMedia`、`sendFile`、`deleteMessages`、`downloadMedia`。
+本指南用于 OneBot/NapCat 的消息检索、已读、转发、合并转发和消息表情点赞等成组能力。普通发送、@ 人、撤回、下载媒体仍优先使用 brief 中的顶层方法：`sendText`、`sendMessage`、`sendAt`、`sendMedia`、`sendFile`、`deleteMessages`、`downloadMedia`。
 
 ## 执行入口
 

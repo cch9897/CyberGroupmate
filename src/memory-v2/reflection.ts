@@ -182,6 +182,44 @@ function resolveTierLimits(config?: ReflectionExternalConfig): Partial<TierLimit
     return Object.keys(result).length > 0 ? result : undefined;
 }
 
+// ─── 回看范围自适应收缩 ───
+
+/** 一次 reflection prompt 的体量上限（喂给 LLM 的话题块/每块消息/互动条数） */
+export interface ReflectionScope {
+    label: string;
+    maxTopicBlocks: number;
+    maxMessagesPerTopic: number;
+    maxInteractions: number;
+}
+
+/**
+ * 回看范围由大到小的梯度。首次用 full；若 LLM 超时/限流（prompt 太大跑不完或撞 TPM），
+ * 逐级缩小 prompt 重试，直到跑通——只要成功一次就推进 lastReflectedAt 水位线，
+ * 把"首次全量积压 → 永远超时 → 水位线停在 1970"的死循环打破。
+ */
+export const REFLECTION_SCOPE_LEVELS: ReflectionScope[] = [
+    { label: "full",     maxTopicBlocks: 60, maxMessagesPerTopic: 30, maxInteractions: 80 },
+    { label: "narrowed", maxTopicBlocks: 25, maxMessagesPerTopic: 15, maxInteractions: 40 },
+    { label: "minimal",  maxTopicBlocks: 10, maxMessagesPerTopic: 8,  maxInteractions: 20 },
+];
+
+/** 该错误能否通过"缩小 prompt"缓解（超时 / 限流-TPM / 上下文超长）。其它错误（鉴权/解析）收缩无益。 */
+export function isSizeReducibleError(err: unknown): boolean {
+    const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+    return (
+        msg.includes("timeout") ||
+        msg.includes("aborted due to timeout") ||
+        msg.includes("429") ||
+        msg.includes("too many requests") ||
+        msg.includes("rate limit") ||
+        msg.includes("overloaded") ||
+        msg.includes("context length") ||
+        msg.includes("maximum context") ||
+        msg.includes("context_length_exceeded") ||
+        msg.includes("too long")
+    );
+}
+
 // ─── 核心函数 ───
 
 /**
@@ -227,13 +265,12 @@ export async function runReflection(
     // ── Step 2: 量化统计 ──
     const stats = computeParticipantStats(topics, interactions);
 
-    // ── Step 3: LLM 调用 ──
+    // ── Step 3: LLM 调用（回看范围自适应收缩：超时/限流则缩小 prompt 重试） ──
     const isDirectMessage = groupModel?.isDirectMessage ?? false;
-    const prompt = buildReflectionPrompt(topics, interactions, profiles, stats, groupModel, isDirectMessage, memory);
-    const messages: ChatMessage[] = [
-        { role: "system", content: getReflectionSystemPrompt() },
-        { role: "user", content: prompt },
-    ];
+    // 会话整体是否私密（DM / 配置种子 / 运行时 markedSensitive）——用于给抽取出的 fact 打 visibility=private，
+    // 这样即便日后 source_chat_id 丢失（合并/全局化），fact 级标记仍能让跨会话 scrub 兜底拦截。
+    const chatIsPrivate = memory.isChatPrivate(chatId);
+    const reflectionTimeout = resolveComponentTimeout("reflection");
 
     let llmOutput: ReflectionLLMOutput = {
         personUpdates: [],
@@ -242,24 +279,56 @@ export async function runReflection(
         topicsSummary: [],
         insights: "",
     };
-    try {
-        const response = await callLLMWithFallback(messages, llmConfigs, {
-            caller: "reflection",
-            timeoutMs: resolveComponentTimeout("reflection"),
-        });
-        const parsed = parseReflectionJSON(response.content);
-        if (parsed) {
-            llmOutput = parsed;
-            log.info("Reflection LLM 返回解析成功", {
-                personUpdates: llmOutput.personUpdates.length,
-                factUpdates: llmOutput.factUpdates.length,
+    let llmSucceeded = false;
+    let lastError: unknown = null;
+
+    for (let level = 0; level < REFLECTION_SCOPE_LEVELS.length; level++) {
+        const scope = REFLECTION_SCOPE_LEVELS[level];
+        const prompt = buildReflectionPrompt(topics, interactions, profiles, stats, groupModel, isDirectMessage, memory, scope);
+        const messages: ChatMessage[] = [
+            { role: "system", content: getReflectionSystemPrompt() },
+            { role: "user", content: prompt },
+        ];
+        try {
+            const response = await callLLMWithFallback(messages, llmConfigs, {
+                caller: "reflection",
+                timeoutMs: reflectionTimeout,
+                // 不在单 profile 内重试同一超大 prompt（纯浪费 timeout）；
+                // 收缩回看范围 + profile fallback 才是真正的重试策略。
+                maxRetries: 0,
             });
-        } else {
-            log.warn("Reflection LLM 返回无法解析，使用空默认值");
+            const parsed = parseReflectionJSON(response.content);
+            if (parsed) {
+                llmOutput = parsed;
+                log.info("Reflection LLM 返回解析成功", {
+                    scope: scope.label,
+                    personUpdates: llmOutput.personUpdates.length,
+                    factUpdates: llmOutput.factUpdates.length,
+                });
+            } else {
+                log.warn("Reflection LLM 返回无法解析，使用空默认值", { scope: scope.label });
+            }
+            llmSucceeded = true;
+            break;
+        } catch (err) {
+            lastError = err;
+            const nextScope = REFLECTION_SCOPE_LEVELS[level + 1];
+            if (nextScope && isSizeReducibleError(err)) {
+                log.warn("Reflection LLM 超时/限流，缩小回看范围重试", {
+                    from: scope.label,
+                    to: nextScope.label,
+                    error: String(err).slice(0, 120),
+                });
+                continue;
+            }
+            // 无法靠收缩缓解的错误，或已到最小范围仍失败 → 放弃本轮
+            break;
         }
-    } catch (err) {
-        log.error("Reflection LLM 调用或解析失败", { error: String(err) });
-        // 优雅降级：不崩溃，返回空结果
+    }
+
+    if (!llmSucceeded) {
+        log.error("Reflection LLM 调用或解析失败（已尝试收缩回看范围）", { error: String(lastError) });
+        // 优雅降级：不崩溃，返回空结果（注意：不推进 lastReflectedAt，下轮重试）
         return {
             reflectedPeriod: { from: since, to: startTime },
             topicsSummary: topics.map(t => ({
@@ -272,7 +341,7 @@ export async function runReflection(
             groupUpdates: "",
             newCoreFacts: [],
             mergedEpisodes: 0,
-            insights: `Reflection LLM 调用失败: ${String(err)}`,
+            insights: `Reflection LLM 调用失败: ${String(lastError)}`,
         };
     }
 
@@ -409,7 +478,7 @@ export async function runReflection(
             memory.updateFact(fact.id, {
                 content: fact.content,
                 category: fact.category,
-                ...buildFactProvenance(fact, topics, interactions, chatId, groupModel, isDirectMessage, startTime),
+                ...buildFactProvenance(fact, topics, interactions, chatId, groupModel, isDirectMessage, chatIsPrivate, startTime),
             });
             newCoreFacts.push(`[updated] ${fact.content}`);
             log.debug("Reflection 4b: 更新事实", { id: fact.id, subject: fact.subject });
@@ -421,32 +490,36 @@ export async function runReflection(
             newFactsForEmbedding.push({ index: i, text: `${resolvedSubject}: ${fact.content}` });
         }
     }
-    // 为新增 facts 生成 embedding
-    let factEmbeddings: Float32Array[] = [];
+    // 新增 facts：先落盘（不带 embedding），向量异步后台补齐——不阻塞 reflection。
     const embCfg = memory.getEmbeddingConfig();
-    if (embCfg && newFactsForEmbedding.length > 0) {
-        try {
-            const { embed } = await import("./embedding.js");
-            factEmbeddings = await embed(newFactsForEmbedding.map(f => f.text), embCfg);
-            log.debug("Reflection 4b: 事实 embedding 生成完成", { count: factEmbeddings.length });
-        } catch (err) {
-            log.warn("Reflection 4b: 事实 embedding 生成失败", { error: String(err) });
-        }
-    }
+    const storedForEmbed: Array<{ id: string; text: string }> = [];
     for (let ei = 0; ei < newFactsForEmbedding.length; ei++) {
         const fact = llmOutput.factUpdates[newFactsForEmbedding[ei].index];
-        memory.storeFact(
+        const fid = memory.storeFact(
             fact.subject, fact.content, fact.category, `reflection:${chatId}`,
             undefined,
-            factEmbeddings[ei] ?? undefined,
+            undefined, // embedding 异步补（见下）
             undefined,
-            buildFactProvenance(fact, topics, interactions, chatId, groupModel, isDirectMessage, startTime),
+            buildFactProvenance(fact, topics, interactions, chatId, groupModel, isDirectMessage, chatIsPrivate, startTime),
         );
+        if (embCfg) storedForEmbed.push({ id: fid, text: newFactsForEmbedding[ei].text });
         newCoreFacts.push(fact.content);
-        log.debug("Reflection 4b: 新增事实", {
-            subject: fact.subject, category: fact.category,
-            hasEmbedding: !!factEmbeddings[ei],
-        });
+        log.debug("Reflection 4b: 新增事实", { subject: fact.subject, category: fact.category });
+    }
+    // 异步补 embedding（fire-and-forget；事实已落盘，向量后台补齐）
+    if (embCfg && storedForEmbed.length > 0) {
+        void (async () => {
+            try {
+                const { embed } = await import("./embedding.js");
+                const embs = await embed(storedForEmbed.map(f => f.text), embCfg);
+                for (let i = 0; i < storedForEmbed.length; i++) {
+                    if (embs[i]) memory.setFactEmbedding(storedForEmbed[i].id, embs[i]);
+                }
+                log.debug("Reflection 4b: 事实 embedding 异步补齐完成", { count: storedForEmbed.length });
+            } catch (err) {
+                log.warn("Reflection 4b: 事实 embedding 生成失败", { error: String(err) });
+            }
+        })();
     }
 
     // 4b′. 回写话题情感到 topics 表
@@ -959,10 +1032,12 @@ function buildReflectionPrompt(
     groupModel: GroupModel | null,
     isDirectMessage: boolean = false,
     memory?: MemoryStoreV2,
+    scope?: ReflectionScope,
 ): string {
     const sections: string[] = [];
-    const MAX_TOPIC_BLOCKS = 60;
-    const MAX_MESSAGES_PER_TOPIC = 30;
+    const MAX_TOPIC_BLOCKS = scope?.maxTopicBlocks ?? 60;
+    const MAX_MESSAGES_PER_TOPIC = scope?.maxMessagesPerTopic ?? 30;
+    const MAX_INTERACTIONS = scope?.maxInteractions ?? 80;
 
     // 基本信息（私聊 vs 群聊）
     if (groupModel) {
@@ -1045,10 +1120,10 @@ function buildReflectionPrompt(
     // 近期直接互动：这些是 recentEpisodes 和关系记忆的主要原料
     if (interactions.length > 0) {
         const interactionLines = interactions
-            .slice(-80)
+            .slice(-MAX_INTERACTIONS)
             .map(intr => formatInteractionForPrompt(intr, topics, memory))
             .join("\n");
-        sections.push(`## 近期直接互动 (${interactions.length} 条，最多显示 80 条)\n\n${interactionLines}`);
+        sections.push(`## 近期直接互动 (${interactions.length} 条，最多显示 ${MAX_INTERACTIONS} 条)\n\n${interactionLines}`);
     }
 
     // 参与者量化数据
@@ -1201,6 +1276,7 @@ function buildFactProvenance(
     chatId: string,
     groupModel: GroupModel | null,
     isDirectMessage: boolean,
+    chatIsPrivate: boolean,
     reflectedAt: string,
 ): CoreFactProvenance {
     const topic = (fact.sourceTopicId
@@ -1225,7 +1301,8 @@ function buildFactProvenance(
         sourceMessageIds: messageIds,
         sourceInteractionIds: interactionIds,
         observedAt: fact.observedAt ?? topic?.startedAt ?? reflectedAt,
-        visibility: fact.visibility ?? (isDirectMessage ? "private" : "contextual"),
+        // 来自私密会话（DM / 种子 / markedSensitive）的 fact 默认私密：source 丢失也能被跨会话 scrub 拦截。
+        visibility: fact.visibility ?? ((chatIsPrivate || isDirectMessage) ? "private" : "contextual"),
         sensitivity: fact.sensitivity ?? "low",
     };
 }

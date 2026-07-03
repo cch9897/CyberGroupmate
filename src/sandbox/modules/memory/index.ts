@@ -83,6 +83,32 @@ export const memoryModule = {
         return result as Record<string, unknown>;
     },
 
+    searchAgentMemory: async (query: string, options?: {
+        chatId?: string;
+        actorType?: "meta" | "subagent" | "harness" | "system";
+        kind?: string;
+        after?: string;
+        before?: string;
+        limit?: number;
+    }) => {
+        if (!_callbacks) throw new Error("Memory module not initialized");
+        const result = await _callbacks.callHost("memory.searchAgentMemory", [query, options]);
+        return result as Record<string, unknown>;
+    },
+
+    getTimeline: async (options?: {
+        chatId?: string;
+        after?: string;
+        before?: string;
+        limit?: number;
+        includeTopics?: boolean;
+        includeDigests?: boolean;
+    }) => {
+        if (!_callbacks) throw new Error("Memory module not initialized");
+        const result = await _callbacks.callHost("memory.getTimeline", [options]);
+        return result as Record<string, unknown>;
+    },
+
     semanticSearch: async (query: string, options?: {
         scope?: "facts" | "topics" | "all";
         limit?: number;

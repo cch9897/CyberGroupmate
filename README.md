@@ -83,6 +83,8 @@ Delta 计算发生在类型化的结构数据层，从各个数据源获取的�
 
 也可以[直接阅读我们的 Prompts](system-prompts)，它们的更新频率高于架构文档，能反映最新的设计意图。建议结合架构文档和 Prompts 一起阅读。
 
+另外，也请参考 [作者在用的 PERSONA（人格设置文件）](docs/PERSONA.example.md) 来设置你的赛博群友
+
 ## 🖥️ 本机原生运行
 
 原生运行不依赖 Docker，适合直接在 Linux 主机上常驻服务。运行时数据默认写入项目根目录下的 `workspace/`。

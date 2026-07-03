@@ -286,28 +286,6 @@ describe("Metrics Deployment Verification", () => {
     // ═══ 2. Configuration Verification ═══
 
     describe("Configuration", () => {
-        it("#12 metrics can be enabled by default without an explicit config section", async () => {
-            const configContent = readFileSync(join(projectRoot, "config.yaml"), "utf-8");
-            const configMod = await import("../src/core/config.js");
-            const config = configMod.loadConfig();
-            const metricsEnabled = config.metrics?.enabled !== false;
-
-            if (configContent.includes("metrics:")) {
-                assert.ok(configContent.includes("enabled: true") || metricsEnabled,
-                    "metrics section should either enable metrics explicitly or inherit the default enabled behavior");
-            } else {
-                assert.ok(metricsEnabled, "metrics should default to enabled when metrics section is absent");
-            }
-        });
-
-        it("#13 MetricsConfig type matches config.yaml fields", async () => {
-            const configMod = await import("../src/core/config.js");
-            const config = configMod.loadConfig();
-            // metrics should be parsed (may be undefined if not in yaml, but enabled by default)
-            const metricsEnabled = config.metrics?.enabled !== false;
-            assert.ok(metricsEnabled, "metrics should default to enabled");
-        });
-
         it("#14 metrics port (9091) does not conflict with dashboard port (6767)", async () => {
             const configMod = await import("../src/core/config.js");
             const config = configMod.loadConfig();

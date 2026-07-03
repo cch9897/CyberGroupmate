@@ -17,6 +17,19 @@ interface ReminderSetInput {
     data?: unknown;
 }
 
+interface ReminderUpdateInput {
+    name?: string;
+    /** 被唤醒后要做什么。 */
+    callback?: string;
+    /** composite chatId 或 "meta"。 */
+    bindingId?: string;
+    /** Unix epoch milliseconds；与 delayMinutes 二选一。 */
+    triggerAt?: number;
+    /** 延迟分钟数；与 triggerAt 二选一。 */
+    delayMinutes?: number;
+    data?: unknown;
+}
+
 interface SchedulerListInput {
     bindingId?: string;
     includeTriggered?: boolean;
@@ -57,6 +70,9 @@ declare const remind: {
 
     /** 查询一次性唤醒。 */
     get(id: string): Promise<ReminderEvent | null>;
+
+    /** 编辑一次性唤醒，保存后下一轮调度检查立即使用新值。 */
+    update(id: string, input: ReminderUpdateInput): Promise<ReminderEvent | null>;
 
     /** 列出一次性唤醒。 */
     list(options?: SchedulerListInput): Promise<ReminderEvent[]>;

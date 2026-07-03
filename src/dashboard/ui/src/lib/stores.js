@@ -4,6 +4,7 @@
 
 import { writable, get } from 'svelte/store';
 import { api } from './api.js';
+import { sortGroupsByLastMessage } from './chat-order.js';
 
 // ─── Connection ───
 export const wsStatus = writable('disconnected');
@@ -39,14 +40,23 @@ export const appState = writable({
 export const messages = writable([]);
 const MAX_MESSAGES = 500;
 
+function isNewerTimestamp(next, current) {
+  const nextTs = new Date(next || 0).getTime();
+  const currentTs = new Date(current || 0).getTime();
+  if (!Number.isFinite(nextTs)) return false;
+  if (!Number.isFinite(currentTs)) return true;
+  return nextTs > currentTs;
+}
+
 export function addMessage(data, timestamp) {
+  const messageTimestamp = data.timestamp || timestamp || new Date().toISOString();
   messages.update(msgs => {
-    msgs.push({ ...data, timestamp });
+    msgs.push({ ...data, timestamp: messageTimestamp });
     if (msgs.length > MAX_MESSAGES) msgs.shift();
     return msgs;
   });
 
-  // Update group list if new chat, and sync chatTitle/isDirectMessage
+  // Update group list if new chat, sync metadata, and keep recent conversations first.
   appState.update(s => {
     const existing = s.groups.find(g => g.chatId === data.chatId);
     if (!existing) {
@@ -55,6 +65,7 @@ export function addMessage(data, timestamp) {
         topicCount: 0, stickiness: 'STRANGER', attendCount: 0,
         chatTitle: data.chatTitle || '',
         isDirectMessage: !!data.isDirectMessage,
+        lastMessageAt: messageTimestamp,
       });
     } else {
       // 如果收到的 chatTitle 比现有更完整，更新它
@@ -64,7 +75,11 @@ export function addMessage(data, timestamp) {
       if (typeof data.isDirectMessage === 'boolean') {
         existing.isDirectMessage = data.isDirectMessage;
       }
+      if (isNewerTimestamp(messageTimestamp, existing.lastMessageAt)) {
+        existing.lastMessageAt = messageTimestamp;
+      }
     }
+    s.groups = sortGroupsByLastMessage(s.groups);
     return s;
   });
 }

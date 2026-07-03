@@ -1,6 +1,6 @@
 OneBotGuide: useFiles
 
-本指南用于 OneBot/NapCat 的图片、语音、文件 URL、群文件系统、私聊文件和群文件目录等成组能力。普通发图、发文件和下载消息媒体优先使用顶层 `sendMedia`、`sendFile`、`downloadMedia`。
+本指南用于 OneBot/NapCat 的图片、语音、文件 URL、群文件系统、私聊文件和群文件目录等成组能力。普通发图、混合消息、@ 人、发文件和下载消息媒体优先使用顶层 `sendMedia`、`sendMessage`、`sendAt`、`sendFile`、`downloadMedia`。
 
 ## 执行入口
 

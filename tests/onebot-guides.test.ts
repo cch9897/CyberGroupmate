@@ -25,10 +25,13 @@ function makeConfig(overrides: Partial<OneBotConfig> = {}): OneBotConfig {
 }
 
 describe("OneBot NapCat builtin guides", () => {
-    it("keeps one-step APIs visible and exposes guide activators for NapCat domains", () => {
+    it("keeps native APIs visible and exposes guide activators for NapCat domains", () => {
         refreshModuleRegistryCache();
         const brief = loadApiTypeDefs("onebot");
 
+        assert.ok(brief.includes("callApi"));
+        assert.ok(brief.includes("send_group_msg"));
+        assert.ok(brief.includes("send_private_msg"));
         assert.ok(brief.includes("sendText"));
         assert.ok(brief.includes("sendMedia"));
         assert.ok(brief.includes("downloadMedia"));
@@ -39,7 +42,6 @@ describe("OneBot NapCat builtin guides", () => {
         assert.ok(brief.includes("useUsersAndProfile"));
         assert.ok(brief.includes("useSystemUtilities"));
 
-        assert.equal(brief.includes("callApi"), false);
         assert.equal(brief.includes("set_group_ban"), false);
         assert.equal(brief.includes("get_credentials"), false);
         assert.equal(brief.includes("send_packet"), false);
@@ -58,7 +60,7 @@ describe("OneBot NapCat builtin guides", () => {
         assert.equal(docs.includes("#### onebot 相关类型定义"), false);
     });
 
-    it("prints guide content and supports hidden callApi proxy calls", async () => {
+    it("prints guide content and supports native callApi proxy calls", async () => {
         const outputs: string[] = [];
         const hostCalls: Array<{ method: string; args: unknown[] }> = [];
         const env: CapabilityRegistryEnv = {
@@ -79,21 +81,87 @@ describe("OneBot NapCat builtin guides", () => {
         const client = createOneBotClientProxy(env, new Map(), false) as {
             useFiles(): Promise<string>;
             callApi(action: string, params?: Record<string, unknown>): Promise<unknown>;
+            send_group_msg(params: Record<string, unknown>): Promise<unknown>;
         };
 
         const guide = await client.useFiles();
         const result = await client.callApi("/get_group_file_url", { group_id: 1, file_id: "f" });
+        const sent = await client.send_group_msg({ group_id: 1, message: "hello native" });
 
         assert.ok(guide.includes("OneBotGuide: useFiles"));
         assert.ok(outputs.some(line => line.includes("get_group_file_url")));
         assert.deepEqual(result, { ok: true });
-        assert.deepEqual(hostCalls, [{
-            method: "onebot.callApi",
-            args: ["get_group_file_url", { group_id: 1, file_id: "f" }],
-        }]);
+        assert.deepEqual(sent, { ok: true });
+        assert.deepEqual(hostCalls, [
+            {
+                method: "onebot.callApi",
+                args: ["get_group_file_url", { group_id: 1, file_id: "f" }],
+            },
+            {
+                method: "onebot.send_group_msg",
+                args: [{ group_id: 1, message: "hello native" }],
+            },
+        ]);
     });
 
-    it("allows only curated NapCat actions through adapter passthrough", async () => {
+    it("supports OneBot message segments and @ helpers in the sandbox proxy", async () => {
+        const outputs: string[] = [];
+        const notifications: Array<Record<string, unknown>> = [];
+        const hostCalls: Array<{ method: string; args: unknown[] }> = [];
+        const env: CapabilityRegistryEnv = {
+            ctx: {},
+            emitOutput: (line) => outputs.push(line),
+            notifyHost: (event) => notifications.push(event),
+            requestInput: async () => "",
+            printToHost: (message) => outputs.push(message),
+            spawnTask: () => {},
+            killTask: () => {},
+            listTasks: () => [],
+            callHost: async (method, args = []) => {
+                hostCalls.push({ method, args });
+                return { message_id: 100 };
+            },
+        };
+
+        const client = createOneBotClientProxy(env, new Map(), false) as {
+            mention(userId: string | number): { type: string; data?: Record<string, unknown> };
+            sendMessage(chatId: string, message: unknown, opts?: Record<string, unknown>): Promise<unknown>;
+            sendAt(chatId: string, userId: string | number | Array<string | number>, text?: string, opts?: Record<string, unknown>): Promise<unknown>;
+        };
+
+        const mention = client.mention("onebot:private:778899");
+        assert.deepEqual(mention, { type: "at", data: { qq: "778899" } });
+
+        await client.sendMessage("onebot:group:42", [
+            mention,
+            { type: "text", data: { text: " hello" } },
+        ], { replyTo: 9 });
+        await client.sendAt("onebot:group:42", "onebot:778899,223344", "看下", { replyTo: 10 });
+
+        assert.deepEqual(hostCalls, [
+            {
+                method: "onebot.sendMessage",
+                args: [
+                    "onebot:group:42",
+                    [
+                        { type: "at", data: { qq: "778899" } },
+                        { type: "text", data: { text: " hello" } },
+                    ],
+                    { replyTo: 9 },
+                ],
+            },
+            {
+                method: "onebot.sendAt",
+                args: ["onebot:group:42", ["778899", "223344"], "看下", { replyTo: 10 }],
+            },
+        ]);
+        assert.ok(outputs.some(line => line.includes("[QQ] sendMessage ok")));
+        assert.ok(outputs.some(line => line.includes("[QQ] sendAt ok")));
+        assert.ok(notifications.some(event => event.type === "system.agent_message_sent" && event.text === "@778899 hello"));
+        assert.ok(notifications.some(event => event.type === "system.agent_message_sent" && event.text === "@778899 @223344 看下"));
+    });
+
+    it("blocks excluded NapCat actions through adapter passthrough", async () => {
         const nc = makeNC();
         const adapter = new OneBotAdapter(makeConfig(), nc);
         const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
@@ -118,17 +186,26 @@ describe("OneBot NapCat builtin guides", () => {
                 params: { group_id: 931351956 },
             }]);
 
+            await adapter.handleCall("onebot.send_group_msg", [{
+                group_id: 931351956,
+                message: "native send",
+            }]);
+            assert.deepEqual(calls[1], {
+                action: "send_group_msg",
+                params: { group_id: 931351956, message: "native send" },
+            });
+
             await assert.rejects(
                 () => adapter.handleCall("onebot.callApi", ["get_credentials", {}]),
-                /not exposed through built-in guides/,
+                /blocked by sandbox policy/,
             );
             await assert.rejects(
                 () => adapter.handleCall("onebot.callApi", ["send_packet", {}]),
-                /not exposed through built-in guides/,
+                /blocked by sandbox policy/,
             );
             await assert.rejects(
                 () => adapter.handleCall("onebot.callApi", ["set_group_leave", { group_id: 1 }]),
-                /not exposed through built-in guides/,
+                /blocked by sandbox policy/,
             );
         } finally {
             nc.dispose();

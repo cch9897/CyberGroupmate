@@ -283,6 +283,15 @@ export interface GroupModel {
     chatTitle: string;
     /** 是否为私聊（由 adapter 层提供） */
     isDirectMessage?: boolean;
+    /**
+     * 是否被标记为敏感/私密会话（append-only，只进不出）。
+     * 由人工配置种子或 LLM 运行时 privacy.markSensitive() 设置，用于全局 visibility 兜底。
+     */
+    markedSensitive?: boolean;
+    /** 标记为敏感的原因（markedSensitive 为 true 时记录）。 */
+    sensitiveReason?: string;
+    /** 标记为敏感的时间 (ISO 8601)。 */
+    sensitiveAt?: string | null;
     /** 群组描述/定位 */
     description: string;
     /** 主要语言 */
@@ -377,17 +386,21 @@ export interface RecallOptions {
 export interface RecallResult {
     /** 匹配的话题节点 */
     topics: TopicNode[];
-    /** 匹配的核心事实 */
+    /** 匹配的核心事实（携带 sourceChatId/visibility，供 chokepoint 兜底 scrub 跨会话私密内容） */
     facts: Array<{
         content: string;
         category: FactCategory;
         subject: string;
         confidence: number;
+        sourceChatId?: string | null;
+        visibility?: "private" | "contextual" | "public";
     }>;
     /** 匹配的个体画像 */
     persons: PersonGroupProfile[];
     /** 如果触发了深度总结，包含 cheap model 综合摘要 */
     deepSummary?: string;
+    /** 匹配的 agent session digests / consciousness memory */
+    sessionDigests?: SessionDigestEntry[];
 }
 
 export interface FactSearchResult {
@@ -470,6 +483,80 @@ export interface CoreFactProvenance {
     observedAt?: string | null;
     visibility?: "private" | "contextual" | "public";
     sensitivity?: "low" | "medium" | "high";
+}
+
+// ─── Agent Session Digests / Consciousness Memory ───
+
+export type SessionDigestKind =
+    | "meta_turn"
+    | "subagent_callback"
+    | "dispatch_created"
+    | "dispatch_done"
+    | "background_notify"
+    | "harness_callback"
+    | "attention_enqueue"
+    | "consciousness_tick"
+    | "system"
+    | "legacy";
+
+export type SessionDigestActorType = "meta" | "subagent" | "harness" | "system";
+
+export interface SessionDigestSource {
+    actorType: SessionDigestActorType;
+    actorId?: string;
+    chatId?: string;
+    chatTitle?: string;
+    taskId?: string;
+    runId?: string;
+}
+
+export interface SessionDigestEntry {
+    id?: string;
+    content: string;
+    createdAt: string;
+    kind?: SessionDigestKind;
+    actorType?: SessionDigestActorType;
+    actorId?: string;
+    sourceChatId?: string | null;
+    sourceChatTitle?: string | null;
+    targetChatId?: string | null;
+    taskId?: string | null;
+    runId?: string | null;
+    tags?: string[];
+    importance?: number;
+    visibility?: "private" | "contextual" | "public";
+    metadata?: Record<string, unknown>;
+    source?: SessionDigestSource;
+}
+
+export interface SessionDigestSearchOptions {
+    query?: string;
+    chatId?: string;
+    actorType?: SessionDigestActorType;
+    kind?: SessionDigestKind;
+    tags?: string[];
+    after?: string;
+    before?: string;
+    limit?: number;
+}
+
+export interface TimelineOptions {
+    chatId?: string;
+    after?: string;
+    before?: string;
+    limit?: number;
+    includeTopics?: boolean;
+    includeDigests?: boolean;
+}
+
+export interface TimelineEntry {
+    type: "session_digest" | "topic";
+    timestamp: string;
+    chatId?: string | null;
+    title?: string;
+    content: string;
+    refId?: string;
+    metadata?: Record<string, unknown>;
 }
 
 // ─── browseHistory() 消息档案接口 ───
@@ -631,6 +718,12 @@ export interface IMemoryStoreV2 {
     /** 获取群组画像 */
     getGroupModel(chatId: string): GroupModel | null;
 
+    /**
+     * 将某会话标记为敏感/私密（append-only：只置 true、幂等、无取消路径）。
+     * 用于全局 visibility 兜底；标记后该会话按 private 处理。
+     */
+    markChatSensitive(chatId: string, reason?: string): GroupModel | null;
+
     /** 获取全局个体身份 */
     getPersonIdentity(userId: string): PersonIdentity | null;
 
@@ -649,8 +742,14 @@ export interface IMemoryStoreV2 {
     /** 向量搜索 topics（纯 JS 余弦相似度） */
     vectorSearchTopics(queryEmbedding: Float32Array, limit?: number, chatId?: string): Array<TopicNode & { similarity: number }>;
 
-    /** 向量搜索 core_facts（纯 JS 余弦相似度） */
-    vectorSearchFacts(queryEmbedding: Float32Array, limit?: number, categories?: FactCategory[]): Array<{ id: string; content: string; category: FactCategory; subject: string; confidence: number; similarity: number }>;
+    /** 向量搜索 core_facts（纯 JS 余弦相似度）。返回 visibility/sourceChatId 供 chokepoint scrub。 */
+    vectorSearchFacts(queryEmbedding: Float32Array, limit?: number, categories?: FactCategory[]): Array<{ id: string; content: string; category: FactCategory; subject: string; confidence: number; similarity: number; visibility?: "private" | "contextual" | "public"; sourceChatId?: string | null }>;
+
+    /** 写入一条永久 session digest / agent consciousness memory */
+    appendSessionDigest(entry: Omit<SessionDigestEntry, "id" | "createdAt"> & { id?: string; createdAt?: string; embedding?: Float32Array }): SessionDigestEntry;
+
+    /** 从 legacy global-state.json 迁移 session digests，必须幂等 */
+    migrateLegacySessionDigests(entries: Array<{ createdAt: string; content: string }>): number;
 
     // ─── 检索方法 ───
 
@@ -659,6 +758,15 @@ export interface IMemoryStoreV2 {
      * M1: FTS5 关键词搜索；M4 升级为向量 + FTS5 混合检索
      */
     recall(query: string, options?: RecallOptions): Promise<RecallResult>;
+
+    /** 获取最近 session digests，默认 30 条 */
+    listSessionDigests(options?: SessionDigestSearchOptions): SessionDigestEntry[];
+
+    /** 搜索 agent intentions / dispatches / dream results / consciousness memory */
+    searchAgentMemory(query: string, options?: SessionDigestSearchOptions): SessionDigestEntry[];
+
+    /** 获取跨 topics 和 session digests 的时间线 */
+    getTimeline(options?: TimelineOptions): TimelineEntry[];
 
     /**
      * 消息档案检索

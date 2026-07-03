@@ -22,9 +22,36 @@ export function selectPendingNotifications(pending: HarnessNotify[]): HarnessNot
 /** 渲染 pending 通知文件内容（写入 PENDING_FILE） */
 export function renderPendingFile(pending: HarnessNotify[]): string {
     const items = pending
-        .map((n, i) => `${i + 1}. ${n.source ? `[来自 ${n.source}] ` : ""}${n.content}`)
+        .map((n, i) => formatPendingNotification(n, i))
         .join("\n");
     return `# 有人找你\n\n这些是启动前积攒的通知：\n\n${items}\n`;
+}
+
+function formatPendingNotification(notify: HarnessNotify, index: number): string {
+    const lines = [`${index + 1}. ${notify.source ? `[来自 ${notify.source}] ` : ""}${notify.content}`];
+    const context = [
+        notify.actorId ? `actorId=${notify.actorId}` : "",
+        notify.runId ? `runId=${notify.runId}` : "",
+        notify.triggerReason ? `triggerReason=${notify.triggerReason}` : "",
+        notify.sourceChatId ? `sourceChatId=${notify.sourceChatId}` : "",
+        notify.sourceChatTitle ? `sourceChatTitle=${notify.sourceChatTitle}` : "",
+        notify.taskId ? `taskId=${notify.taskId}` : "",
+    ].filter(Boolean);
+    if (context.length > 0) {
+        lines.push(`   context: ${context.join("；")}`);
+    }
+    if (notify.metadata && Object.keys(notify.metadata).length > 0) {
+        lines.push(`   metadata: ${safeStringify(notify.metadata)}`);
+    }
+    return lines.join("\n");
+}
+
+function safeStringify(value: unknown): string {
+    try {
+        return JSON.stringify(value);
+    } catch {
+        return String(value);
+    }
 }
 
 export function buildSystemPrompt(
@@ -46,7 +73,7 @@ export function buildSystemPrompt(
 }
 
 /**
- * 任务 prompt（命令行 -p 参数）只放本次做梦的目标，保持简短。
+ * 任务 prompt（命令行 -p 参数）只放本次意识流巡视的目标，保持简短。
  * 可能很长的内容（本周期回顾、积攒的通知）都已由 manager 写入文件，
  * 这里只指引 agent 自己去读，避免撑爆命令行参数（spawn E2BIG）。
  */
@@ -57,25 +84,25 @@ export function buildTaskPrompt(
     const hasDreaming = fileHasContent(join(workDir, DREAMING_FILE));
     const hasPending = selectPendingNotifications(pending).length > 0;
 
-    const lines: string[] = ["# 本次任务", "", "进行一次后台做梦。"];
+    const lines: string[] = ["# 本次任务", "", "进行一次后台意识流巡视。"];
     const pointers: string[] = [];
 
     if (hasDreaming) {
         pointers.push(
             `- 先读 \`${DREAMING_FILE}\`：本周期（上次做梦以来）你通过 subagent 实际做过的事，以及各个聊天的关系画像。` +
-            "把它当作回忆今天、决定今晚想做什么的起点。",
+            "把它当作全局意识的补充背景，不要把它当成固定任务清单。",
         );
     }
     if (hasPending) {
         pointers.push(
-            `- \`${PENDING_FILE}\` 里是启动前有人专门找你或交代的事，先认真处理完，再回到你自己想做的事。`,
+            `- \`${PENDING_FILE}\` 里是启动前有人专门找你或交代的事，先认真处理，再决定是否 callback / enqueue 给 Meta 或派发给 subagent。`,
         );
     }
 
     if (pointers.length > 0) {
         lines.push("", ...pointers);
     } else {
-        lines.push("", "回顾最近可用的上下文，寻找值得整理、研究、维护或交给其他 agent 的方向。");
+        lines.push("", "回顾最近可用的 session digest、timeline、todo 和聊天上下文，寻找值得跟进、记录、派发或明确暂不行动的方向。");
     }
 
     return lines.join("\n");

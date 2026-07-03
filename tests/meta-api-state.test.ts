@@ -23,10 +23,28 @@ describe("createTodoApi", () => {
 
         const item = await api.set({ bindingId: "chat-1", key: "follow", content: "检查回复" });
         assert.equal(item.bindingId, "chat-1");
+        assert.equal(typeof item.dueAt, "string");
         assert.equal((await api.get("follow", "chat-1"))?.content, "检查回复");
         assert.equal((await api.list({ bindingId: "chat-1" })).length, 1);
-        await api.delete("follow", "chat-1");
+        const dated = await api.set({ bindingId: "chat-1", key: "dated", content: "有时限", dueAt: "2026-01-01T00:00:00.000Z" });
+        const refreshed = await api.update("dated", { content: "改内容" }, "chat-1");
+        assert.notEqual(refreshed?.dueAt, dated.dueAt);
+        assert.equal((await api.set({ bindingId: "chat-1", key: "forever", content: "永久规则", forever: true })).dueAt, null);
+        await assert.rejects(() => api.set({ key: "bad", content: "缺 binding" } as any), /bindingId/);
+        await assert.rejects(() => api.update("follow", { bindingId: "" }, "chat-1"), /bindingId/);
+        const updated = await api.update("follow", {
+            bindingId: "meta",
+            key: "global-rule",
+            content: "全局规则",
+            dueAt: null,
+        }, "chat-1");
+        assert.equal(updated?.bindingId, "meta");
+        assert.equal(updated?.key, "global-rule");
         assert.equal(await api.get("follow", "chat-1"), null);
+        assert.equal((await api.get("global-rule"))?.content, "全局规则");
+        await api.delete("follow", "chat-1");
+        await api.delete("global-rule");
+        assert.equal(await api.get("global-rule"), null);
     });
 });
 
@@ -42,6 +60,12 @@ describe("scheduler APIs", () => {
             addCron: () => { throw new Error("unused"); },
             getSchedulerEvents: () => events,
             cancelSchedulerEvent: (id: string) => id === "rem-1",
+            updateSchedulerEvent: (id: string, patch: any) => {
+                const idx = events.findIndex((event) => event.id === id);
+                if (idx < 0) return null;
+                events[idx] = { ...events[idx], ...patch };
+                return events[idx];
+            },
         } as any);
 
         const event = await api.set({
@@ -56,6 +80,16 @@ describe("scheduler APIs", () => {
         assert.equal(event.bindingId, "telegram:1");
         assert.equal(event.callback, "检查后续回复");
         assert.deepEqual(event.data, { taskId: "t1" });
+        const updated = await api.update("rem-1", {
+            name: "改期回看",
+            triggerAt: Date.now() + 10 * 60_000,
+            callback: "检查改期后的后续回复",
+        });
+        assert.equal(updated?.name, "改期回看");
+        assert.equal(updated?.callback, "检查改期后的后续回复");
+        assert.equal(updated?.triggered, false);
+        const callbackOnly = await api.update("rem-1", { callback: "只改唤醒正文" });
+        assert.equal(callbackOnly?.callback, "只改唤醒正文");
         await assert.rejects(() => api.set({ name: "bad", delayMinutes: 1, callback: "" }), /callback/);
     });
 
@@ -70,6 +104,12 @@ describe("scheduler APIs", () => {
             },
             getSchedulerEvents: () => events,
             cancelSchedulerEvent: (id: string) => id === "cron-1",
+            updateSchedulerEvent: (id: string, patch: any) => {
+                const idx = events.findIndex((event) => event.id === id);
+                if (idx < 0) return null;
+                events[idx] = { ...events[idx], ...patch };
+                return events[idx];
+            },
         } as any);
 
         const event = await api.set({
@@ -82,6 +122,15 @@ describe("scheduler APIs", () => {
         assert.equal(event.id, "cron-1");
         assert.equal(event.bindingId, "meta");
         assert.equal(event.callback, "整理昨日 digest");
+
+        const updated = await api.update("cron-1", {
+            name: "周报",
+            cronExpr: "0 10 * * 1",
+            callback: "整理上周 digest",
+        });
+        assert.equal(updated?.name, "周报");
+        assert.equal(updated?.cronExpr, "0 10 * * 1");
+        assert.equal(updated?.callback, "整理上周 digest");
     });
 });
 
@@ -103,7 +152,10 @@ describe("buildMetaApiContext", () => {
         assert.equal(typeof context.agents.listStatus, "function");
         assert.equal(typeof context.dispatch.taskToGroup, "function");
         assert.equal(typeof context.todo.set, "function");
+        assert.equal(typeof context.todo.update, "function");
         assert.equal(typeof context.remind.set, "function");
+        assert.equal(typeof context.remind.update, "function");
         assert.equal(typeof context.cron.set, "function");
+        assert.equal(typeof context.cron.update, "function");
     });
 });

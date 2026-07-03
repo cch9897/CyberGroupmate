@@ -451,6 +451,7 @@
           {@const r = entry.response}
           {@const callerBadge = CALLER_COLORS[entry.caller] || "badge-ghost"}
           {@const time = new Date(entry.timestamp).toLocaleTimeString()}
+          {@const fullTime = new Date(entry.timestamp).toLocaleString()}
           {@const msgCount = entry.messageSummaries?.length ?? 0}
           {@const usageDisplay = getUsageDisplay(r?.usage, entry.provider)}
           {@const hasImages = entry.messageSummaries?.some(
@@ -473,7 +474,7 @@
                 <i class="fa-solid fa-spinner fa-pulse"></i>
               {/if}
             </span>
-            <span class="llm-row-time">{time}</span>
+            <span class="llm-row-time" title="{fullTime}">{time}</span>
             <span class="badge badge-xs {callerBadge}">{entry.caller}</span>
             <span class="llm-row-model" title="{entry.model}">{entry.profileName ?? entry.model}</span>
             <span class="llm-row-meta"

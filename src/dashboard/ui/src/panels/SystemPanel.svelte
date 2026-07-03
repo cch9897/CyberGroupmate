@@ -5,7 +5,6 @@
 
   const LIST_LIMIT = 100;
   const GROUP_OVERVIEW_LIMIT = 200;
-  const EMPTY_SCHEDULER = { reminders: [], crons: [], summary: {} };
 
   let globalStateSummary = { sections: [], recent: {} };
   let rawGlobalStateText = '';
@@ -18,15 +17,8 @@
   let pool = {};
   let trackingWindows = [];
   let callbacks = [];
-  let scheduler = EMPTY_SCHEDULER;
-  let showTriggeredReminders = false;
 
   $: groups = $appState.groups;
-  $: activeReminders = (scheduler.reminders || []).filter(r => !r.triggered);
-  $: triggeredReminders = (scheduler.reminders || []).filter(r => r.triggered);
-  $: visibleActiveReminders = activeReminders.slice(0, LIST_LIMIT);
-  $: visibleTriggeredReminders = triggeredReminders.slice(0, LIST_LIMIT);
-  $: visibleCrons = (scheduler.crons || []).slice(0, LIST_LIMIT);
   $: poolInstances = (pool.instances || []).slice(0, LIST_LIMIT);
   $: visibleGroups = groups.slice(0, GROUP_OVERVIEW_LIMIT);
   $: if ($activeTab === 'system') refreshSystem();
@@ -36,12 +28,11 @@
     systemLoading = true;
     systemError = '';
     try {
-      const [summary, poolStats, tracking, callbackItems, schedulerState] = await Promise.all([
+      const [summary, poolStats, tracking, callbackItems] = await Promise.all([
         api('/global-state/summary'),
         api('/sandbox/pool'),
         api('/dispatch-tracking'),
         api('/callbacks'),
-        api('/scheduler'),
       ]);
       if (seq !== refreshSeq) return;
 
@@ -49,7 +40,6 @@
       pool = poolStats || {};
       trackingWindows = tracking?.activeWindows || [];
       callbacks = callbackItems || [];
-      scheduler = schedulerState || EMPTY_SCHEDULER;
     } catch (err) {
       if (seq === refreshSeq) systemError = String(err);
     } finally {
@@ -77,18 +67,6 @@
     }
   }
 
-  function timeUntil(isoDate) {
-    if (!isoDate) return '-';
-    const diff = new Date(isoDate).getTime() - Date.now();
-    if (diff <= 0) return '已到期';
-    const mins = Math.floor(diff / 60000);
-    if (mins < 60) return `${mins}分钟后`;
-    const hours = Math.floor(mins / 60);
-    if (hours < 24) return `${hours}小时${mins % 60}分后`;
-    const days = Math.floor(hours / 24);
-    return `${days}天后`;
-  }
-
   function timeAgo(isoDate) {
     if (!isoDate) return '-';
     const diff = Date.now() - new Date(isoDate).getTime();
@@ -98,12 +76,6 @@
     const hours = Math.floor(mins / 60);
     if (hours < 24) return `${hours}小时前`;
     return `${Math.floor(hours / 24)}天前`;
-  }
-
-  async function cancelEvent(id) {
-    if (!confirm('确认取消此调度？')) return;
-    await api(`/scheduler/${id}`, { method: 'DELETE' });
-    await refreshSystem();
   }
 </script>
 
@@ -215,115 +187,6 @@
         {/each}
       {:else}
         <div class="text-xs opacity-60">无待跟进窗口</div>
-      {/if}
-    </div>
-  </div>
-
-  <!-- Scheduler -->
-  <div class="card bg-base-100">
-    <div class="card-body p-4">
-      <h3 class="card-title text-sm">
-        <i class="fa-solid fa-clock opacity-50 mr-1"></i>定时调度
-        <span class="badge badge-sm badge-ghost ml-auto">
-          {(scheduler.summary || {}).activeReminders || 0} 提醒 / {(scheduler.summary || {}).totalCrons || 0} 周期
-        </span>
-      </h3>
-
-      <!-- Reminders -->
-      {#if (scheduler.reminders || []).length}
-        <div class="text-xs font-bold mt-2 mb-1 opacity-70">
-          <i class="fa-solid fa-bell mr-1"></i>Reminders
-        </div>
-        <div class="space-y-1">
-          {#each visibleActiveReminders as r}
-            <div class="flex items-start gap-2 text-xs px-2 py-1.5 bg-base-200 rounded">
-              <div class="flex-1 min-w-0">
-                <div class="flex items-center gap-1">
-                  <span class="badge badge-xs badge-success">⏳</span>
-                  {#if getPlatform(r.chatId)}<span class="platform-badge platform-{getPlatform(r.chatId)}">{platformLabel(getPlatform(r.chatId))}</span>{/if}
-                  <span class="font-mono">{shortId(r.chatId)}</span>
-                  <span class="opacity-50 ml-auto whitespace-nowrap">{timeUntil(r.triggerAt)}</span>
-                </div>
-                <div class="mt-0.5 truncate" title={r.description}>{r.description}</div>
-              </div>
-              <button class="btn btn-xs btn-ghost text-error flex-shrink-0" title="取消" on:click={() => cancelEvent(r.id)}>
-                <i class="fa-solid fa-xmark"></i>
-              </button>
-            </div>
-          {/each}
-          {#if activeReminders.length > visibleActiveReminders.length}
-            <div class="text-[10px] opacity-50 px-2">仅显示前 {LIST_LIMIT} 个未触发提醒，共 {activeReminders.length} 个</div>
-          {/if}
-        </div>
-        {#if triggeredReminders.length > 0}
-          <!-- svelte-ignore a11y_click_events_have_key_events -->
-          <!-- svelte-ignore a11y_no_static_element_interactions -->
-          <div
-            class="flex items-center gap-1 text-xs opacity-50 mt-2 cursor-pointer select-none hover:opacity-80"
-            on:click={() => showTriggeredReminders = !showTriggeredReminders}
-          >
-            <i class="fa-solid fa-chevron-right text-[10px] transition-transform" style:transform={showTriggeredReminders ? "rotate(90deg)" : ""}></i>
-            <span>已触发 ({triggeredReminders.length})</span>
-          </div>
-          {#if showTriggeredReminders}
-            <div class="space-y-1 mt-1">
-              {#each visibleTriggeredReminders as r}
-                <div class="flex items-start gap-2 text-xs px-2 py-1.5 bg-base-200 rounded opacity-40">
-                  <div class="flex-1 min-w-0">
-                    <div class="flex items-center gap-1">
-                      <span class="badge badge-xs badge-ghost">✓</span>
-                      {#if getPlatform(r.chatId)}<span class="platform-badge platform-{getPlatform(r.chatId)}">{platformLabel(getPlatform(r.chatId))}</span>{/if}
-                      <span class="font-mono">{shortId(r.chatId)}</span>
-                      <span class="opacity-50 ml-auto whitespace-nowrap">已触发</span>
-                    </div>
-                    <div class="mt-0.5 truncate" title={r.description}>{r.description}</div>
-                  </div>
-                </div>
-              {/each}
-              {#if triggeredReminders.length > visibleTriggeredReminders.length}
-                <div class="text-[10px] opacity-50 px-2">仅显示前 {LIST_LIMIT} 个已触发提醒，共 {triggeredReminders.length} 个</div>
-              {/if}
-            </div>
-          {/if}
-        {/if}
-      {/if}
-
-      <!-- Crons -->
-      {#if (scheduler.crons || []).length}
-        <div class="text-xs font-bold mt-3 mb-1 opacity-70">
-          <i class="fa-solid fa-repeat mr-1"></i>Crons
-        </div>
-        <div class="space-y-1">
-          {#each visibleCrons as c}
-            <div class="flex items-start gap-2 text-xs px-2 py-1.5 bg-base-200 rounded">
-              <div class="flex-1 min-w-0">
-                <div class="flex items-center gap-1">
-                  <span class="badge badge-xs badge-info">⟳</span>
-                  {#if getPlatform(c.chatId)}<span class="platform-badge platform-{getPlatform(c.chatId)}">{platformLabel(getPlatform(c.chatId))}</span>{/if}
-                  <span class="font-mono">{shortId(c.chatId)}</span>
-                  <code class="text-[10px] opacity-60 ml-1">{c.cronExpr}</code>
-                  <span class="opacity-50 ml-auto whitespace-nowrap">
-                    {c.lastTriggeredAt ? timeAgo(c.lastTriggeredAt) : '未触发'}
-                  </span>
-                </div>
-                <div class="mt-0.5 font-semibold">{c.description}</div>
-                {#if c.taskTemplate && c.taskTemplate !== c.description}
-                  <div class="mt-0.5 truncate opacity-60" title={c.taskTemplate}>{c.taskTemplate}</div>
-                {/if}
-              </div>
-              <button class="btn btn-xs btn-ghost text-error flex-shrink-0" title="取消" on:click={() => cancelEvent(c.id)}>
-                <i class="fa-solid fa-xmark"></i>
-              </button>
-            </div>
-          {/each}
-          {#if (scheduler.crons || []).length > visibleCrons.length}
-            <div class="text-[10px] opacity-50 px-2">仅显示前 {LIST_LIMIT} 个周期任务，共 {(scheduler.crons || []).length} 个</div>
-          {/if}
-        </div>
-      {/if}
-
-      {#if !(scheduler.reminders || []).length && !(scheduler.crons || []).length}
-        <div class="text-xs opacity-60 mt-2">无调度事件</div>
       {/if}
     </div>
   </div>

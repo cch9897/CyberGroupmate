@@ -68,7 +68,7 @@ export const todoModule = {
     /**
      * 新增或更新 todo
      */
-    upsert: async (key: string, content: string, options?: { dueAt?: number | null }): Promise<{
+    upsert: async (key: string, content: string, options?: { dueAt?: number | null; forever?: boolean }): Promise<{
         key: string;
         content: string;
         dueAt: number | null;

@@ -21,6 +21,16 @@ interface BackgroundStatus {
     lastError?: string | null;
 }
 
+interface BackgroundEnqueueOptions {
+    actorId?: string;
+    runId?: string;
+    triggerReason?: string;
+    sourceChatId?: string;
+    sourceChatTitle?: string;
+    taskId?: string;
+    metadata?: Record<string, unknown>;
+}
+
 declare const background: {
     /**
      * 向 Background Agent 派发一个任务。任务会进入队列，
@@ -28,13 +38,14 @@ declare const background: {
      *
      * @param content 任务描述。写清楚需要做什么。
      * @param source 来源标识，默认 "meta"。
+     * @param options 结构化上下文，会写入 harness pending 文件，供启动后的意识流读取。
      * @returns queued=true 表示已入队；queued=false 表示 Background Agent 未配置。
      * @example
      * await background.enqueue("学到了新的搜索技巧，整理成 skill");
      * @example
      * await background.enqueue("帮露露深入查一下 Reaclisna 世界观的资料", "proactive-idle");
      */
-    enqueue(content: string, source?: string): Promise<BackgroundEnqueueResult>;
+    enqueue(content: string, source?: string, options?: BackgroundEnqueueOptions): Promise<BackgroundEnqueueResult>;
 
     /**
      * 查询 Background Agent 当前状态。
