@@ -11,6 +11,11 @@ import type { PlatformAdapter } from "./platform-adapter.js";
 import type { MediaDownloader } from "../core/media-downloader.js";
 import { ensureSupportedFormat } from "../core/vision-processor.js";
 import { composeChatId, ensureCompositeId, parseChatId } from "../core/chat-id.js";
+import {
+    normalizeMentionTarget as normalizeMentionTargetUtil,
+    normalizeMentionTargets as normalizeMentionTargetsUtil,
+    summarizeOneBotMessage,
+} from "./onebot-message-utils.js";
 import { createLogger } from "../core/logger.js";
 import {
     getOneBotNapCatGuideGroupForAction,
@@ -126,6 +131,8 @@ export class OneBotAdapter implements PlatformAdapter {
     private reconnectAttempts = 0;
     private static readonly RECONNECT_BASE_MS = 1000;
     private static readonly RECONNECT_MAX_MS = 30_000;
+    /** 重连次数上限：达到后停止重连，避免 NapCat 永久下线时无限刷日志 */
+    private static readonly RECONNECT_MAX_ATTEMPTS = 50;
     private readonly pending = new Map<string, { resolve: (v: unknown) => void; reject: (err: Error) => void; timer: NodeJS.Timeout }>();
     private readonly mutedChats = new Map<string, number>();
     /** 缓存群名：groupId → group_name
@@ -227,11 +234,21 @@ export class OneBotAdapter implements PlatformAdapter {
     private scheduleReconnect(): void {
         if (this.stopRequested || this.reconnectTimer) return;
         this.reconnectAttempts++;
-        const delay = Math.min(
+        if (this.reconnectAttempts > OneBotAdapter.RECONNECT_MAX_ATTEMPTS) {
+            log.error(
+                `OneBotAdapter 重连次数超过上限 ${OneBotAdapter.RECONNECT_MAX_ATTEMPTS}，停止重连`,
+            );
+            return;
+        }
+        const base = Math.min(
             OneBotAdapter.RECONNECT_BASE_MS * Math.pow(2, this.reconnectAttempts - 1),
             OneBotAdapter.RECONNECT_MAX_MS,
         );
-        log.info(`OneBotAdapter 将在 ${delay}ms 后重连 (第 ${this.reconnectAttempts} 次)`);
+        // ±20% jitter：避免多个 bot 同时断网后同步重连（thundering herd）
+        const delay = Math.round(base * (0.8 + Math.random() * 0.4));
+        log.info(
+            `OneBotAdapter 将在 ${delay}ms 后重连 (第 ${this.reconnectAttempts}/${OneBotAdapter.RECONNECT_MAX_ATTEMPTS} 次)`,
+        );
         this.reconnectTimer = setTimeout(async () => {
             this.reconnectTimer = null;
             if (this.stopRequested) return;
@@ -340,7 +357,7 @@ export class OneBotAdapter implements PlatformAdapter {
     }
 
     formatMention(rawUserId: string, _username?: string): string | undefined {
-        const userId = this.normalizeMentionTarget(rawUserId);
+        const userId = normalizeMentionTargetUtil(rawUserId);
         return userId ? `[CQ:at,qq=${userId}]` : undefined;
     }
 
@@ -430,13 +447,13 @@ export class OneBotAdapter implements PlatformAdapter {
                 const chatId = ensureCompositeId("onebot", String(args[0] ?? ""));
                 const message = this.normalizeOutgoingMessageArg(args[1]);
                 const opts = (args[2] ?? {}) as Record<string, unknown>;
-                await this.applyHumanizedDelay(chatId, this.outgoingMessageText(message).length);
+                await this.applyHumanizedDelay(chatId, summarizeOneBotMessage(message).length);
                 return this.sendMessage(chatId, message, opts);
             }
             case "onebot.sendAt":
             case "qq.sendAt": {
                 const chatId = ensureCompositeId("onebot", String(args[0] ?? ""));
-                const userIds = this.normalizeMentionTargets(args[1]);
+                const userIds = normalizeMentionTargetsUtil(args[1]);
                 if (userIds.length === 0) throw new Error("onebot.sendAt: userId is required");
                 const text = typeof args[2] === "string" ? args[2] : "";
                 const opts = (args[3] ?? {}) as Record<string, unknown>;
@@ -773,7 +790,7 @@ export class OneBotAdapter implements PlatformAdapter {
     }
 
     private async sendAt(chatId: string, rawUserIds: unknown, text: string, opts: Record<string, unknown>): Promise<unknown> {
-        const userIds = this.normalizeMentionTargets(rawUserIds);
+        const userIds = normalizeMentionTargetsUtil(rawUserIds);
         if (userIds.length === 0) throw new Error("sendAt: userId 为空");
         const suffix = text
             ? (text.startsWith(" ") || text.startsWith("\n") || text.startsWith("\t") ? text : ` ${text}`)
@@ -1200,7 +1217,7 @@ export class OneBotAdapter implements PlatformAdapter {
     }
 
     private async prepareOutgoingMessage(message: OneBotOutgoingMessage, opts: Record<string, unknown>): Promise<OneBotOutgoingMessage> {
-        const mentionSegments = this.outgoingMentionTargets(opts.mentions)
+        const mentionSegments = normalizeMentionTargetsUtil(opts.mentions)
             .map(qq => ({ type: "at", data: { qq } }));
 
         if (typeof message === "string") {
@@ -1232,7 +1249,7 @@ export class OneBotAdapter implements PlatformAdapter {
         const data = { ...(segment.data ?? {}) };
 
         if (type === "at") {
-            const qq = this.normalizeMentionTarget(data.qq ?? data.user_id ?? data.id);
+            const qq = normalizeMentionTargetUtil(data.qq ?? data.user_id ?? data.id);
             return { type, data: { ...data, qq: qq || "" } };
         }
 
@@ -1286,11 +1303,6 @@ export class OneBotAdapter implements PlatformAdapter {
             || value.startsWith("file://")
             || value.startsWith("data:");
     }
-
-    private outgoingMentionTargets(value: unknown): string[] {
-        return this.normalizeMentionTargets(value);
-    }
-
     private sanitizeOutgoingMediaOptions(chatId: string, media: Record<string, unknown>, opts: Record<string, unknown>): Record<string, unknown> {
         const mediaType = String(media.type ?? "");
         if ((mediaType !== "audio" && mediaType !== "voice") || opts.replyTo == null) {
@@ -1652,7 +1664,7 @@ export class OneBotAdapter implements PlatformAdapter {
         const seen = new Set<string>();
         for (const seg of message) {
             if (seg.type !== "at") continue;
-            const rawUserId = this.normalizeMentionTarget(seg.data?.qq ?? seg.data?.user_id ?? seg.data?.id);
+            const rawUserId = normalizeMentionTargetUtil(seg.data?.qq ?? seg.data?.user_id ?? seg.data?.id);
             if (!rawUserId) continue;
             const key = rawUserId.toLowerCase();
             if (seen.has(key)) continue;
@@ -1704,7 +1716,7 @@ export class OneBotAdapter implements PlatformAdapter {
         return message.map(seg => {
             if (seg.type === "text") return String(seg.data?.text ?? "");
             if (seg.type === "at") {
-                const rawUserId = this.normalizeMentionTarget(seg.data?.qq ?? seg.data?.user_id ?? seg.data?.id);
+                const rawUserId = normalizeMentionTargetUtil(seg.data?.qq ?? seg.data?.user_id ?? seg.data?.id);
                 if (!rawUserId) return "@";
                 const label = rawUserId.toLowerCase() === "all"
                     ? "全体成员"
@@ -1831,91 +1843,6 @@ export class OneBotAdapter implements PlatformAdapter {
         }
     }
 
-    private normalizeMentionTarget(value: unknown): string {
-        const raw = String(value ?? "").trim();
-        if (!raw) return "";
-        if (raw.toLowerCase() === "all") return "all";
-
-        let candidate = raw;
-        const cqMatch = /^\[CQ:at,qq=([^,\]]+)/i.exec(candidate);
-        if (cqMatch) candidate = cqMatch[1];
-        if (candidate.startsWith("@")) candidate = candidate.slice(1);
-        if (candidate.startsWith("qq:")) candidate = candidate.slice("qq:".length);
-
-        if (candidate.startsWith("onebot:")) {
-            const parsed = parseChatId(candidate);
-            if (parsed.rawId.startsWith("private:")) {
-                candidate = parsed.rawId.slice("private:".length);
-            } else if (parsed.rawId.startsWith("group:")) {
-                candidate = parsed.rawId.slice("group:".length);
-            } else {
-                candidate = parsed.rawId;
-            }
-        }
-
-        return candidate.trim();
-    }
-
-    private normalizeMentionTargets(value: unknown): string[] {
-        const result: string[] = [];
-        const seen = new Set<string>();
-        const add = (target: string) => {
-            if (!target) return;
-            const key = target.toLowerCase();
-            if (seen.has(key)) return;
-            seen.add(key);
-            result.push(target);
-        };
-        const visit = (item: unknown): void => {
-            if (item == null) return;
-            if (Array.isArray(item)) {
-                for (const child of item) visit(child);
-                return;
-            }
-            const raw = String(item).trim();
-            if (!raw) return;
-            const cqMatches = [...raw.matchAll(/\[CQ:at,qq=([^,\]]+)/ig)];
-            if (cqMatches.length > 0) {
-                for (const match of cqMatches) add(this.normalizeMentionTarget(match[1]));
-                return;
-            }
-            if (/[,，、;；\s]/.test(raw)) {
-                for (const part of raw.split(/[,，、;；\s]+/)) {
-                    add(this.normalizeMentionTarget(part));
-                }
-                return;
-            }
-            add(this.normalizeMentionTarget(raw));
-        };
-        visit(value);
-        return result;
-    }
-
-    private outgoingMessageText(message: OneBotOutgoingMessage): string {
-        if (typeof message === "string") return message;
-        return message.map(segment => {
-            const data = segment.data ?? {};
-            switch (segment.type) {
-                case "text":
-                    return String(data.text ?? "");
-                case "at": {
-                    const qq = this.normalizeMentionTarget(data.qq ?? data.user_id ?? data.id);
-                    return qq ? `@${qq}` : "@";
-                }
-                case "face":
-                    return `[face:${String(data.id ?? "")}]`;
-                case "reply":
-                    return `[reply:${String(data.id ?? data.message_id ?? "")}]`;
-                case "image":
-                case "record":
-                case "video":
-                case "file":
-                    return `[${segment.type}:${String(data.file ?? "")}]`;
-                default:
-                    return `[${segment.type}]`;
-            }
-        }).join("");
-    }
 
     private isWhitelisted(messageType: "private" | "group" | undefined, groupId: string, userId: string): boolean {
         const wl = this.config.whitelist;

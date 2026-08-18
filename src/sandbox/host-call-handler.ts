@@ -21,6 +21,11 @@ import {
 import { validateCronMinInterval } from "../core/cron-matcher.js";
 import { createLogger } from "../core/logger.js";
 import { describeImage, ensureSupportedFormat } from "../core/vision-processor.js";
+import {
+    normalizeMentionTarget as normalizeOneBotMentionTarget,
+    normalizeMentionTargets as normalizeOneBotMentionTargets,
+    summarizeOneBotMessage,
+} from "../adapter/onebot-message-utils.js";
 import { MemoryStoreV2 } from "../memory-v2/index.js";
 import { embed } from "../memory-v2/embedding.js";
 import { GlobalState } from "../main-agent/global-state.js";
@@ -220,83 +225,6 @@ function getOneBotNativeParams(method: string, args: unknown[]): { action: strin
 function getOneBotNativeMessageText(params: unknown): string {
     const rec = params && typeof params === "object" ? params as Record<string, unknown> : {};
     return summarizeOneBotMessage(rec.message);
-}
-
-function normalizeOneBotMentionTarget(value: unknown): string {
-    const raw = String(value ?? "").trim();
-    if (!raw) return "";
-    if (raw.toLowerCase() === "all") return "all";
-    if (raw.startsWith("onebot:private:")) return raw.slice("onebot:private:".length);
-    if (raw.startsWith("onebot:")) return raw.slice("onebot:".length);
-    if (raw.startsWith("@")) return raw.slice(1);
-    return raw;
-}
-
-function normalizeOneBotMentionTargets(value: unknown): string[] {
-    const result: string[] = [];
-    const seen = new Set<string>();
-    const add = (target: string) => {
-        if (!target) return;
-        const key = target.toLowerCase();
-        if (seen.has(key)) return;
-        seen.add(key);
-        result.push(target);
-    };
-    const visit = (item: unknown): void => {
-        if (item == null) return;
-        if (Array.isArray(item)) {
-            for (const child of item) visit(child);
-            return;
-        }
-        const raw = String(item).trim();
-        if (!raw) return;
-        const cqMatches = [...raw.matchAll(/\[CQ:at,qq=([^,\]]+)/ig)];
-        if (cqMatches.length > 0) {
-            for (const match of cqMatches) add(normalizeOneBotMentionTarget(match[1]));
-            return;
-        }
-        if (/[,，、;；\s]/.test(raw)) {
-            for (const part of raw.split(/[,，、;；\s]+/)) {
-                add(normalizeOneBotMentionTarget(part));
-            }
-            return;
-        }
-        add(normalizeOneBotMentionTarget(raw));
-    };
-    visit(value);
-    return result;
-}
-
-function summarizeOneBotMessage(value: unknown): string {
-    if (typeof value === "string") return value;
-    if (!Array.isArray(value)) return String(value ?? "");
-    return value.map((segment) => {
-        if (!segment || typeof segment !== "object") return "";
-        const record = segment as Record<string, unknown>;
-        const type = String(record.type ?? "");
-        const data = record.data && typeof record.data === "object"
-            ? record.data as Record<string, unknown>
-            : {};
-        switch (type) {
-            case "text":
-                return String(data.text ?? "");
-            case "at": {
-                const qq = normalizeOneBotMentionTarget(data.qq ?? data.user_id ?? data.id);
-                return qq ? `@${qq}` : "@";
-            }
-            case "reply":
-                return `[reply:${String(data.id ?? data.message_id ?? "")}]`;
-            case "face":
-                return `[face:${String(data.id ?? "")}]`;
-            case "image":
-            case "record":
-            case "video":
-            case "file":
-                return `[${type}:${String(data.file ?? "")}]`;
-            default:
-                return type ? `[${type}]` : "";
-        }
-    }).join("");
 }
 
 function getSendIntent(platform: string, method: string, args: unknown[]): (InterruptedSendPayload & { textLength: number }) | null {
