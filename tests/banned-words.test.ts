@@ -10,28 +10,30 @@ import { createTelegramClientProxy } from "../src/sandbox/modules/telegram/index
 import { createOneBotClientProxy } from "../src/sandbox/modules/onebot/index.js";
 import { createDiscordClientProxy } from "../src/sandbox/modules/discord/index.js";
 
-// ─── findBannedWords ───
 
+// 词表已迁移到配置管理（DEFAULT_BANNED_WORDS 为空），检测类测试用显式词表验证匹配逻辑。
+const TEST_BANNED_WORDS = ["确实", "笑死", "说得对"];
+// ─── findBannedWords ───
 describe("findBannedWords", () => {
     it("returns empty array when no banned words found", () => {
-        const result = findBannedWords("这是一句正常的话", DEFAULT_BANNED_WORDS);
+        const result = findBannedWords("这是一句正常的话", TEST_BANNED_WORDS);
         assert.deepEqual(result, []);
     });
 
     it("detects single banned word", () => {
-        const result = findBannedWords("确实有点那个味道", DEFAULT_BANNED_WORDS);
+        const result = findBannedWords("确实有点那个味道", TEST_BANNED_WORDS);
         assert.deepEqual(result, ["确实"]);
     });
 
     it("detects multiple banned words", () => {
-        const result = findBannedWords("确实笑死我了", DEFAULT_BANNED_WORDS);
+        const result = findBannedWords("确实笑死我了", TEST_BANNED_WORDS);
         assert.ok(result.includes("确实"));
         assert.ok(result.includes("笑死"));
         assert.equal(result.length, 2);
     });
 
     it("deduplicates repeated occurrences", () => {
-        const result = findBannedWords("确实确实确实", DEFAULT_BANNED_WORDS);
+        const result = findBannedWords("确实确实确实", TEST_BANNED_WORDS);
         assert.deepEqual(result, ["确实"]);
     });
 
@@ -41,12 +43,12 @@ describe("findBannedWords", () => {
     });
 
     it("does not trigger on non-matching text", () => {
-        const result = findBannedWords("谢谢你对我真的很好哦", DEFAULT_BANNED_WORDS);
+        const result = findBannedWords("谢谢你对我真的很好哦", TEST_BANNED_WORDS);
         assert.deepEqual(result, []);
     });
 
     it("detects 说得对 in context", () => {
-        const result = findBannedWords("你说得对，这个方向是对的", DEFAULT_BANNED_WORDS);
+        const result = findBannedWords("你说得对，这个方向是对的", TEST_BANNED_WORDS);
         assert.ok(result.includes("说得对"));
     });
 });
