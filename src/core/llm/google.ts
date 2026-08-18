@@ -136,7 +136,7 @@ export async function callGoogle(
         model,
         contents,
         config: {
-            temperature,
+            ...(config.omit_temperature ? {} : { temperature }),
             maxOutputTokens: maxTokens,
             ...(systemInstruction ? { systemInstruction } : {}),
             ...(stop && stop.length > 0 ? { stopSequences: stop } : {}),

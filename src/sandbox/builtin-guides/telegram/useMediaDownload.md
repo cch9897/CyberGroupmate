@@ -74,6 +74,18 @@ const data = await telegram.downloadMedia(...);
 // ...
 ```
 
+### 用自定义 prompt 分析（特定视角）
+
+抽帧后默认是"描述内容"。需要特定分析时（动作识别、文字提取、状态判断）传 `{ prompt }`，结果保留原始换行格式：
+
+```typescript
+// 判断 GIF 里角色的动作（结合多帧）
+const actionDesc = await vision.see(
+    { prompt: "结合多帧，简要描述这个角色在做什么动作" },
+    ...framePaths,
+);
+```
+
 ### 帧数选取原则
 
 | 文件类型 | 建议帧数 | 说明 |

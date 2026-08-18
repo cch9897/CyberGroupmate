@@ -34,6 +34,8 @@ export interface DashboardDeps {
     imageCatalog?: ImageCatalog;
     /** 平台 adapter 引用（用于 mute 等控制操作） */
     adapters?: PlatformAdapter[];
+    /** 离线补抓协调器（用于 dashboard 手动触发补抓） */
+    backfillCoordinator?: import("../adapter/backfill.js").BackfillCoordinator;
     /** Meta-CodeAct sandbox（用于 Dashboard debug 执行） */
     metaSandbox?: MetaSandbox;
     /** Dashboard 保存配置后的回调（用于热应用） */

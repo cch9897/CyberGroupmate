@@ -13,15 +13,16 @@
 export { type LLMConfig } from "./config.js";
 
 // 从 llm/types.ts 重新导出类型，保持向后兼容
-export { type ImagePart, type ChatMessage, type LLMResponse } from "./llm/types.js";
+export { type ImagePart, type LLMReasoning, type ChatMessage, type LLMResponse } from "./llm/types.js";
 
 import type { LLMConfig } from "./config.js";
-import type { ChatMessage, LLMResponse } from "./llm/types.js";
+import type { ChatMessage, LLMReasoning, LLMResponse } from "./llm/types.js";
 import type { ContextManifest } from "../context-engine/types.js";
 import { getOrCreatePool } from "./llm-pool.js";
 import { rateLimiter } from "./llm-rate-limiter.js";
 import { loadConfig } from "./config.js";
 import { createLogger } from "./logger.js";
+import { createHash } from "node:crypto";
 import { sanitizePromptText } from "./text-safety.js";
 import { EventEmitter } from "node:events";
 
@@ -84,12 +85,23 @@ export interface LLMResponseEvent {
     contentLength: number;
     /** token 用量 */
     usage?: LLMResponse["usage"];
+    /** Dashboard 可安全展示的推理信息；不包含密文、签名或续链 ID。 */
+    reasoning?: LLMReasoningLog;
     /** 耗时 ms */
     durationMs: number;
     /** 是否出错 */
     error?: string;
     /** 时间戳 */
     timestamp: string;
+}
+
+/** Dashboard 日志中的脱敏推理信息。 */
+export interface LLMReasoningLog {
+    provider?: LLMReasoning["provider"];
+    tokenCount?: number;
+    visibility: "plain" | "encrypted" | "unavailable";
+    /** Chat reasoning_content、Anthropic thinking 或 Responses summary。 */
+    content?: string;
 }
 
 /** LLM 重试事件数据 */
@@ -120,7 +132,7 @@ export interface LLMCallOptions {
     maxTokens?: number;
     /** 覆盖默认 model */
     model?: string;
-    /** Gemini thinking level: "none" | "low" | "medium" | "high" */
+    /** Provider reasoning effort: "none" | "low" | "medium" | "high" | "xhigh" | "max" */
     thinkingLevel?: string;
     /** 调用方模块标识（用于 Dashboard 日志显示） */
     caller?: string;
@@ -153,6 +165,14 @@ export interface LLMCallOptions {
     contextManifest?: ContextManifest;
     /** 外部取消信号。用于上层在新消息到达时中断本次推理并重建 prompt。 */
     abortSignal?: AbortSignal;
+    /**
+     * 禁用「fallback 到不支持 vision 的 profile 时把图片降级为文字」。
+     *
+     * 视觉描述本身（describeImage）必须设为 true：它的整个目的就是看图，
+     * 把图片剥掉只会得到一段凭空编造的描述；同时这也是防止
+     * 降级 → describeImage → 再降级 的递归护栏。
+     */
+    noVisionDegrade?: boolean;
 }
 
 export const LLM_PENDING_MESSAGE_ABORT = "pending_message";
@@ -204,6 +224,73 @@ function summarizeMessages(messages: ChatMessage[]): LLMCallEvent["messageSummar
             imageUrls: imageUrls.length > 0 ? imageUrls : undefined,
         };
     });
+}
+
+/**
+ * 从 provider 原生推理状态生成 Dashboard 展示数据。
+ * 这里只挑选明确的明文字段，禁止透传 encrypted_content、signature、data 和续链 ID。
+ */
+export function toReasoningLog(
+    reasoning: LLMReasoning | undefined,
+    usageReasoningTokens?: number,
+): LLMReasoningLog | undefined {
+    const tokenCount = usageReasoningTokens ?? reasoning?.tokenCount;
+    if (!reasoning) {
+        return tokenCount != null && tokenCount > 0
+            ? { tokenCount, visibility: "unavailable" }
+            : undefined;
+    }
+
+    if (reasoning.provider === "openai_chat") {
+        return {
+            provider: reasoning.provider,
+            ...(tokenCount != null ? { tokenCount } : {}),
+            visibility: "plain",
+            ...(reasoning.content ? { content: reasoning.content } : {}),
+        };
+    }
+
+    if (reasoning.provider === "anthropic") {
+        const content = reasoning.blocks
+            .filter(block => block.type === "thinking" && typeof block.thinking === "string")
+            .map(block => String(block.thinking))
+            .filter(Boolean)
+            .join("\n\n");
+        const encrypted = reasoning.blocks.some(block => block.type === "redacted_thinking");
+        return {
+            provider: reasoning.provider,
+            ...(tokenCount != null ? { tokenCount } : {}),
+            visibility: encrypted ? "encrypted" : "plain",
+            ...(!encrypted && content ? { content } : {}),
+        };
+    }
+
+    // WebSocket continuation can carry only response/session anchors without a reasoning item.
+    // Do not turn that transport state into a visible "0 reasoning tokens" badge.
+    if (reasoning.items.length === 0 && !(tokenCount != null && tokenCount > 0)) {
+        return undefined;
+    }
+
+    const summaries: string[] = [];
+    let encrypted = false;
+    for (const item of reasoning.items) {
+        if (typeof item.encrypted_content === "string" && item.encrypted_content.length > 0) {
+            encrypted = true;
+        }
+        if (!Array.isArray(item.summary)) continue;
+        for (const summary of item.summary) {
+            if (!summary || typeof summary !== "object") continue;
+            const text = (summary as Record<string, unknown>).text;
+            if (typeof text === "string" && text) summaries.push(text);
+        }
+    }
+    const content = summaries.join("\n\n");
+    return {
+        provider: reasoning.provider,
+        ...(tokenCount != null ? { tokenCount } : {}),
+        visibility: encrypted ? "encrypted" : "plain",
+        ...(!encrypted && content ? { content } : {}),
+    };
 }
 
 function detectErrorContentPattern(content: string, patterns?: string[]): string | null {
@@ -450,10 +537,15 @@ async function _callLLMSingleKeyInner(
 
         try {
             // ── 解析 prefill（仅当 config 支持时应用） ──
-            const prefill = (options?.prefill && config.supportsPrefill !== false)
-                ? options.prefill
-                : undefined;
-            const stop = options?.stop;
+            const thinkingEnabled = Boolean(thinkingLevel && thinkingLevel !== "none");
+            const prefill = (
+                options?.prefill
+                && config.supportsPrefill !== false
+                && !(config.provider === "anthropic" && thinkingEnabled)
+            ) ? options.prefill : undefined;
+            // 某些模型或兼容网关不接受 stop 参数；由 profile 统一屏蔽，
+            // 这样 fallback chain 中每个 profile 都能按自身能力决定是否发送。
+            const stop = config.omit_stop_sequence ? undefined : options?.stop;
 
             // 创建本次 fetch 的 AbortSignal：合并超时 + 用户取消
             const timeoutSignal = AbortSignal.timeout(timeoutMs);
@@ -492,6 +584,7 @@ async function _callLLMSingleKeyInner(
                     contentPreview: result.content,
                     contentLength: result.content.length,
                     usage: result.usage,
+                    reasoning: toReasoningLog(result.reasoning, result.usage?.reasoningTokens),
                     durationMs: Date.now() - startTime,
                     timestamp: new Date().toISOString(),
                 };
@@ -632,6 +725,181 @@ async function _callLLMSingleKeyInner(
     }
 }
 
+/** 统计消息里的图片数量 */
+function countImageParts(messages: ChatMessage[]): number {
+    return messages.reduce((sum, m) => sum + (m.imageParts?.length ?? 0), 0);
+}
+
+/**
+ * 去掉多模态图片，改为文字占位，供不支持 vision 的 profile 使用。
+ *
+ * 这是二级兜底：视觉转述不可用（没配 vision 路由 / 描述全部失败）时才用。
+ * 图片内容确实丢失了，但明确告诉模型"这里原本有图"，
+ * 比让它对着不存在的图硬答、或者整条请求 400 失败要好。
+ */
+export function stripImagePartsForNonVisionModel(messages: ChatMessage[]): ChatMessage[] {
+    return messages.map((message) => {
+        const count = message.imageParts?.length ?? 0;
+        if (count === 0) return message;
+
+        const { imageParts: _dropped, ...rest } = message;
+        const note = `[图片 ×${count}：当前模型不支持图片输入，图片已省略。不要凭猜测描述图片内容]`;
+        return {
+            ...rest,
+            content: message.content ? `${message.content}\n\n${note}` : note,
+        };
+    });
+}
+
+// ─── 多模态降级：视觉转述 ───
+
+/** 降级转述的描述缓存（key = 图片 url 的 sha256） */
+const DEGRADE_DESCRIPTION_CACHE_MAX = 128;
+const _degradeDescriptionCache = new Map<string, string>();
+/** 抓取远程图片的超时 */
+const DEGRADE_IMAGE_FETCH_TIMEOUT_MS = 15_000;
+
+/**
+ * 覆盖「降级转述」所用的 vision profiles。
+ * 默认取 llm_routing.vision；测试（或宿主想用别的模型转述）可注入。
+ */
+let _visionDegradeConfigProvider: (() => LLMConfig[]) | null = null;
+
+export function setVisionDegradeConfigProvider(provider: (() => LLMConfig[]) | null): void {
+    _visionDegradeConfigProvider = provider;
+}
+
+/** 清空降级转述缓存（测试用） */
+export function clearVisionDegradeCache(): void {
+    _degradeDescriptionCache.clear();
+}
+
+function imageCacheKey(url: string): string {
+    return createHash("sha256").update(url).digest("hex");
+}
+
+function cacheDescription(url: string, description: string): void {
+    const key = imageCacheKey(url);
+    if (_degradeDescriptionCache.size >= DEGRADE_DESCRIPTION_CACHE_MAX) {
+        const oldest = _degradeDescriptionCache.keys().next();
+        if (!oldest.done) _degradeDescriptionCache.delete(oldest.value);
+    }
+    _degradeDescriptionCache.set(key, description);
+}
+
+/** 把 ImagePart.url（data URI 或 http URL）解析成 buffer + mime */
+async function loadImagePart(url: string): Promise<{ buffer: Buffer; mimeType: string } | null> {
+    const dataUriMatch = url.match(/^data:([^;,]+);base64,(.*)$/s);
+    if (dataUriMatch) {
+        try {
+            return {
+                buffer: Buffer.from(dataUriMatch[2], "base64"),
+                mimeType: dataUriMatch[1] || "image/jpeg",
+            };
+        } catch {
+            return null;
+        }
+    }
+
+    if (!/^https?:\/\//i.test(url)) return null;
+    try {
+        const response = await fetch(url, { signal: AbortSignal.timeout(DEGRADE_IMAGE_FETCH_TIMEOUT_MS) });
+        if (!response.ok) return null;
+        const buffer = Buffer.from(await response.arrayBuffer());
+        const mimeType = response.headers.get("content-type")?.split(";")[0]?.trim() || "image/jpeg";
+        return { buffer, mimeType };
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * 用 vision 路由的模型把图片转成文字描述。
+ *
+ * 返回 url → 描述；无法描述的 url 不出现在结果里。
+ * 动态 import vision-processor 以避免与本模块形成静态循环依赖
+ * （vision-processor 本身 import 了 llm.ts）。
+ */
+async function describeImagesForFallback(urls: string[]): Promise<Map<string, string>> {
+    const result = new Map<string, string>();
+    if (urls.length === 0) return result;
+
+    const pending: string[] = [];
+    for (const url of urls) {
+        const cached = _degradeDescriptionCache.get(imageCacheKey(url));
+        if (cached) result.set(url, cached);
+        else pending.push(url);
+    }
+    if (pending.length === 0) return result;
+
+    let visionConfigs: LLMConfig[];
+    let describeImage: typeof import("./vision-processor.js")["describeImage"];
+    try {
+        if (_visionDegradeConfigProvider) {
+            visionConfigs = _visionDegradeConfigProvider();
+        } else {
+            const { resolveComponentProfiles } = await import("./config.js");
+            visionConfigs = resolveComponentProfiles("vision");
+        }
+        if (visionConfigs.length === 0) {
+            log.warn("多模态降级：没有可用的 vision profile，退回文字占位");
+            return result;
+        }
+        ({ describeImage } = await import("./vision-processor.js"));
+    } catch (err) {
+        log.warn("多模态降级：加载视觉描述模块失败，退回文字占位", { error: String(err) });
+        return result;
+    }
+
+    await Promise.all(pending.map(async (url) => {
+        try {
+            const loaded = await loadImagePart(url);
+            if (!loaded) {
+                log.warn("多模态降级：无法读取图片内容", { url: url.slice(0, 80) });
+                return;
+            }
+            const description = (await describeImage(loaded.buffer, loaded.mimeType, visionConfigs)).trim();
+            if (!description) return;
+            cacheDescription(url, description);
+            result.set(url, description);
+        } catch (err) {
+            log.warn("多模态降级：图片描述失败", { url: url.slice(0, 80), error: String(err).slice(0, 120) });
+        }
+    }));
+
+    return result;
+}
+
+/**
+ * 一级降级：把图片换成 vision 模型的文字转述。
+ * 一张都转不出来时退回 stripImagePartsForNonVisionModel 的纯占位。
+ */
+async function degradeMessagesForNonVisionModel(messages: ChatMessage[]): Promise<ChatMessage[]> {
+    const urls = [...new Set(messages.flatMap((m) => (m.imageParts ?? []).map((part) => part.url)))];
+    const descriptions = await describeImagesForFallback(urls);
+    if (descriptions.size === 0) {
+        return stripImagePartsForNonVisionModel(messages);
+    }
+
+    return messages.map((message) => {
+        const parts = message.imageParts ?? [];
+        if (parts.length === 0) return message;
+
+        const { imageParts: _dropped, ...rest } = message;
+        const lines = parts.map((part, index) => {
+            const description = descriptions.get(part.url);
+            return description
+                ? `${index + 1}. ${description}`
+                : `${index + 1}. [该图描述失败，内容未知，不要猜测]`;
+        });
+        const note = `[图片 ×${parts.length}：当前模型不支持图片输入，以下是视觉模型对原图的转述]\n${lines.join("\n")}`;
+        return {
+            ...rest,
+            content: message.content ? `${message.content}\n\n${note}` : note,
+        };
+    });
+}
+
 /**
  * 带 Profile Fallback 的 LLM 调用。
  *
@@ -641,6 +909,20 @@ async function _callLLMSingleKeyInner(
  * - 最后一个 config 失败 → 抛出原始错误
  *
  * 每个 config 内部仍走 callLLM 的 3 次指数退避重试。
+ *
+ * ─── 多模态降级 ───
+ * 调用方（如 message-enricher 的 Path A）是按 configs[0] 决定要不要塞图片的，
+ * 但 fallback 之后的 profile 可能根本不支持 vision —— 带着 imageParts 打过去
+ * 必然继续失败，fallback 形同虚设。所以这里对声明了 vision !== true 的 profile
+ * 自动把图片降级成文字占位。
+ *
+ * 降级条件是「前面已经有 profile 声明过 vision: true」——也就是确实发生了
+ * "为 vision 模型准备的载荷落到了声明不支持 vision 的模型上"。
+ *
+ * 为什么不能用"整条 chain 里有人声明过"来判断：vision 路由的实际配置里
+ * 第一个 describer 常常是没写 vision: true 的通用模型（如 claude-opus，
+ * 它其实完全支持图片），后面才跟着一串写了标记的。按 chain 级判断会把
+ * 主 describer 的图片剥掉，直接废掉图片描述功能。
  */
 export async function callLLMWithFallback(
     messages: ChatMessage[],
@@ -650,14 +932,48 @@ export async function callLLMWithFallback(
     if (configs.length === 0) {
         throw new Error("callLLMWithFallback: no LLM configs provided");
     }
+
+    const imageCount = countImageParts(messages);
+    const degradeAllowed = imageCount > 0 && !options?.noVisionDegrade;
+    let degradedMessages: ChatMessage[] | null = null;
+
+    /**
+     * 第 index 个 profile 该收到什么载荷。
+     * 只有「它自己声明不支持 vision」且「它之前存在声明支持 vision 的 profile」时才降级。
+     */
+    const payloadFor = async (index: number): Promise<ChatMessage[]> => {
+        if (!degradeAllowed) return messages;
+        const config = configs[index];
+        if (config.vision === true) return messages;
+        const precededByVisionProfile = configs.slice(0, index).some((earlier) => earlier.vision === true);
+        if (!precededByVisionProfile) return messages;
+
+        if (!degradedMessages) {
+            degradedMessages = await degradeMessagesForNonVisionModel(messages);
+        }
+        return degradedMessages;
+    };
+
     if (configs.length === 1) {
         return callLLM(messages, configs[0], options);
     }
 
     let lastError: Error | null = null;
     for (let i = 0; i < configs.length; i++) {
+        const config = configs[i];
+        const payload = await payloadFor(i);
+        if (payload !== messages) {
+            log.warn("callLLMWithFallback: 目标 profile 不支持 vision，图片已降级为文字", {
+                model: config.model,
+                attempt: i + 1,
+                total: configs.length,
+                imageCount,
+                // 转述成功时 content 里带"视觉模型对原图的转述"，否则是纯占位
+                mode: payload.some((m) => m.content.includes("视觉模型对原图的转述")) ? "described" : "placeholder",
+            });
+        }
         try {
-            return await callLLM(messages, configs[i], options);
+            return await callLLM(payload, config, options);
         } catch (err) {
             if (isLLMInterruptedByPendingMessage(err)) {
                 throw err;

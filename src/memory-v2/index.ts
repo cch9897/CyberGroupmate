@@ -18,11 +18,16 @@ export {
     classifyMessages,
     identifyProtectedMessages,
     compact,
+    forceTrim,
     mergeContextBudget,
     DEFAULT_CONTEXT_BUDGET,
+    COMPACT_TRIGGER_RATIO,
+    FORCE_TRIM_MARKER,
     type ContextBudget,
     type ClassifiedMessages,
     type ProtectionResult,
+    type ForceTrimOptions,
+    type ForceTrimResult,
 } from "./context-manager.js";
 
 // Embedding (M4)

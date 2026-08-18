@@ -68,6 +68,13 @@ function handleEvent(event) {
       });
       break;
     }
+    case 'adapters:connection': {
+      appState.update(s => {
+        s.adapters = event.data.adapters;
+        return s;
+      });
+      break;
+    }
     case 'llm:call':
       handleLLMCall(event.data);
       break;

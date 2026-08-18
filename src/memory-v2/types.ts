@@ -292,6 +292,12 @@ export interface GroupModel {
     sensitiveReason?: string;
     /** 标记为敏感的时间 (ISO 8601)。 */
     sensitiveAt?: string | null;
+    /**
+     * 静默模式（mention-only）。为 true 时：普通群消息仍即时落盘到本地 message_log，
+     * 但不进入 recording pipeline、不触发任何 LLM 处理；只有被直接提及
+     * （触发词 / 回复 / @ / DM）时才唤醒并获取最近上下文。
+     */
+    quietMode?: boolean;
     /** 群组描述/定位 */
     description: string;
     /** 主要语言 */
@@ -792,6 +798,12 @@ export interface IMemoryStoreV2 {
 
     /** 获取指定 chatId 最近的原始消息 */
     getRecentMessages(chatId: string, limit?: number): RecentMessageEntry[];
+
+    /** 补抓水位线：该会话本地已知的最新消息 */
+    getBackfillWatermark(chatId: string, ordering?: "numeric-id" | "timestamp"): { messageId: string; timestamp: string } | null;
+
+    /** message_log 中出现过的会话（可按平台前缀过滤） */
+    listKnownChatIds(platformPrefix?: string): string[];
 
     /** 获取已缓存的 sticker 描述（只读，用于上下文富化） */
     getStickerDescription(uniqueFileId: string, contentHash?: string): { description: string; emoji?: string; emojis?: string[] } | null;

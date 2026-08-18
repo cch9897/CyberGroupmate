@@ -399,7 +399,7 @@ export async function processMediaBatch(
             representative,
             config,
             isPathA || isPathB,
-            isPathA ? [llmConfig] : visionLlmConfigs,
+            isPathA ? dedupConfigs([llmConfig, ...(visionLlmConfigs ?? [])]) : visionLlmConfigs,
             downloadFn,
             stickerCache,
             mediaDownloader,
@@ -454,7 +454,7 @@ export async function processMediaBatch(
                 .catch(err => {
                     log.warn("路径 A 下载/转码失败，降级为描述", { fileId: photo.fileId, error: String(err) });
                     if (canDescribe) {
-                        const visionCfgs = isPathA ? [llmConfig] : visionLlmConfigs!;
+                        const visionCfgs = isPathA ? dedupConfigs([llmConfig, ...(visionLlmConfigs ?? [])]) : visionLlmConfigs!;
                         return describeWithCache(visionCfgs).catch(err2 => {
                             log.warn("降级描述也失败", { fileId: photo.fileId, error: String(err2) });
                             return { index: photo.messageIndex, description: "[📷 图片（加载失败）]" } as ProcessedMedia;
@@ -466,7 +466,7 @@ export async function processMediaBatch(
 
         if (canDescribe) {
             // 路径 A 溢出 或 路径 B: 调用 vision LLM 描述（带缓存）
-            const visionCfgs = isPathA ? [llmConfig] : visionLlmConfigs!;
+            const visionCfgs = isPathA ? dedupConfigs([llmConfig, ...(visionLlmConfigs ?? [])]) : visionLlmConfigs!;
             return describeWithCache(visionCfgs).catch(err => {
                 log.warn("Vision 描述失败，使用占位符", { fileId: photo.fileId, error: String(err) });
                 return { index: photo.messageIndex, description: "[📷 图片（加载失败）]" } as ProcessedMedia;
@@ -829,26 +829,55 @@ async function processSingleSticker(
 }
 
 /**
+ * 按 model@baseUrl 去重，保留首次出现的顺序。
+ * 用于把主模型拼到 vision 链前面时，避免同一个 profile 被重试两遍。
+ */
+function dedupConfigs(configs: LLMConfig[]): LLMConfig[] {
+    const seen = new Set<string>();
+    const out: LLMConfig[] = [];
+    for (const c of configs) {
+        const id = `${c.model}@${c.baseUrl}`;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        out.push(c);
+    }
+    return out;
+}
+
+/**
  * 调用 Vision LLM 描述图片
  */
 export async function describeImage(
     imageBuffer: Buffer,
     mimeType: string,
     visionConfigs: LLMConfig[],
+    customPrompt?: string,
 ): Promise<string> {
     const b64 = imageBuffer.toString("base64");
     const dataUri = `data:${mimeType};base64,${b64}`;
 
+    const trimmedPrompt = customPrompt?.trim();
+    const userContent = trimmedPrompt
+        ? trimmedPrompt
+        : "请具体而详细地描述这张图片的内容。如图中有文字/代码，尽你所能给出完整内容。";
+
     const messages: ChatMessage[] = [
         {
             role: "user",
-            content: "请具体而详细地描述这张图片的内容。如图中有文字/代码，尽你所能给出完整内容。",
+            content: userContent,
             imageParts: [{ url: dataUri }],
         },
     ];
 
-    const response = await callLLMWithFallback(messages, visionConfigs, { caller: "vision", timeoutMs: resolveComponentTimeout("vision") });
-    return normalizeVisionDescription(response.content);
+    // noVisionDegrade：视觉描述的整个目的就是看图。剥掉图片只会得到一段
+    // 凭空编造的描述；同时这也是「降级 → describeImage → 再降级」的递归护栏。
+    const response = await callLLMWithFallback(messages, visionConfigs, {
+        caller: "vision",
+        timeoutMs: resolveComponentTimeout("vision"),
+        noVisionDegrade: true,
+    });
+    const collapseNewlines = !trimmedPrompt;
+    return normalizeVisionDescription(response.content, collapseNewlines);
 }
 
 /**
@@ -886,7 +915,10 @@ async function describeSticker(
         },
     ];
 
-    const response = await callLLMWithFallback(messages, visionConfigs, { caller: "vision" });
+    const response = await callLLMWithFallback(messages, visionConfigs, {
+        caller: "vision",
+        noVisionDegrade: true,
+    });
     const raw = response.content.trim();
 
     // 尝试解析 JSON（先直接解析，失败再从文本中抽取 {...} 片段救一把）
@@ -951,9 +983,9 @@ function formatEmojiTag(value?: string | string[]): string {
 /**
  * 规范化 vision LLM 的输出：去除 markdown 代码围栏，将换行折叠为空格
  */
-function normalizeVisionDescription(raw: string): string {
+function normalizeVisionDescription(raw: string, collapseNewlines = true): string {
     const trimmed = raw.trim();
     const fenceMatch = trimmed.match(/^```(?:[a-zA-Z0-9_-]+)?\s*\n?([\s\S]*?)\n?```$/);
     const unfenced = fenceMatch?.[1] ?? trimmed;
-    return unfenced.replace(/\s*\n+\s*/g, " ").trim();
+    return collapseNewlines ? unfenced.replace(/\s*\n+\s*/g, " ").trim() : unfenced.trim();
 }

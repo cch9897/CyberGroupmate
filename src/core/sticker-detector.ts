@@ -99,6 +99,9 @@ export class StickerDetector {
 
         const response = await callLLMWithFallback(messages, this.deps.visionConfigs, {
             caller: "sticker-detector",
+            // 与 describeImage 同理：这次调用的目的就是看图判断，
+            // 图片被降级掉只会得到一份凭空编造的 JSON。
+            noVisionDegrade: true,
         });
 
         const raw = response.content.trim();

@@ -8,7 +8,9 @@
 
 import type { NotificationCenter } from "../event/notification-center.js";
 import type { DiscordConfig } from "../core/config.js";
-import type { PlatformAdapter } from "./platform-adapter.js";
+import type { AdapterConnectionStatus, BackfillOptions, BackfillResult, PlatformAdapter } from "./platform-adapter.js";
+import { ConnectionTracker } from "./connection-tracker.js";
+import { isNewerThanWatermark, summarizeBackfillNotes } from "./backfill.js";
 import type { IMemoryStoreV2 } from "../memory-v2/types.js";
 import { composeChatId } from "../core/chat-id.js";
 import { createLogger } from "../core/logger.js";
@@ -47,6 +49,67 @@ type PreparedDiscordAttachment = {
 
 type DiscordClientFactory = () => Promise<any>;
 
+/** 标准化后的 Discord 入站消息 */
+interface NormalizedDiscordMessage {
+    messageId: string;
+    chatId: string;
+    userId: string;
+    displayName: string;
+    username?: string;
+    text: string;
+    timestamp: string;
+    replyToMessageId?: string;
+    chatTitle: string;
+    chatType: string;
+    isDirectMessage: boolean;
+    mentionsAgent: boolean;
+    mediaInfo?: DiscordMediaInfo;
+}
+
+/** 构造与实时入站完全一致的 NC 消息载荷（补抓路径复用，避免两套字段漂移） */
+function buildDiscordNcMessage(normalized: NormalizedDiscordMessage): Record<string, unknown> {
+    const source = {
+        scene: "discord",
+        platform: "discord",
+        chatId: normalized.chatId,
+        userId: normalized.userId,
+        chatType: normalized.chatType,
+        messageId: normalized.messageId,
+        replyToMessageId: normalized.replyToMessageId,
+    };
+    const core = {
+        chatId: normalized.chatId,
+        userId: normalized.userId,
+        displayName: normalized.displayName,
+        username: normalized.username,
+        text: normalized.text,
+        timestamp: normalized.timestamp,
+        messageId: normalized.messageId,
+        replyToMessageId: normalized.replyToMessageId,
+        chatTitle: normalized.chatTitle,
+        chatType: normalized.chatType,
+        isDirectMessage: normalized.isDirectMessage,
+        mentionsAgent: normalized.mentionsAgent,
+        mediaInfo: normalized.mediaInfo,
+    };
+
+    return {
+        type: "nc.message",
+        scene: "discord",
+        source,
+        ...core,
+        payload: {
+            scene: "discord",
+            ...core,
+            source,
+            platformData: {
+                originalType: "discord.message",
+            },
+        },
+        _urgent: normalized.isDirectMessage || normalized.mentionsAgent || normalized.replyToMessageId ? true : false,
+    };
+}
+
 /** 结构化媒体元数据 */
 export interface DiscordMediaInfo {
     type: "photo" | "video" | "document" | "other";
@@ -72,6 +135,7 @@ export class DiscordAdapter implements PlatformAdapter {
     private reconnectTimer: NodeJS.Timeout | null = null;
     private gatewayRecoveryTimer: NodeJS.Timeout | null = null;
     private reconnectAttempts = 0;
+    private readonly connection = new ConnectionTracker("discord");
 
     constructor(
         private config: DiscordConfig,
@@ -102,7 +166,33 @@ export class DiscordAdapter implements PlatformAdapter {
         const client = this.client;
         this.client = null;
         this.selfUserId = null;
+        this.connection.markStopped();
         if (client) await this.destroyClient(client, "stop");
+    }
+
+    getConnectionStatus(): AdapterConnectionStatus {
+        return this.connection.snapshot();
+    }
+
+    /** 手动重连：销毁当前 client 并立即重建，重置退避计数 */
+    async reconnect(): Promise<void> {
+        log.info("DiscordAdapter 手动重连");
+        this.stopRequested = false;
+        this.clearReconnectTimer();
+        this.clearGatewayRecoveryWatchdog();
+        this.reconnectAttempts = 0;
+        this.connection.resetAttempts();
+
+        const oldClient = this.client;
+        this.client = null;
+        this.selfUserId = null;
+        if (oldClient) await this.destroyClient(oldClient, "manual reconnect");
+
+        // 等待可能在途的 connect 结束，避免两个 client 同时登录
+        if (this.connecting) {
+            await this.connecting.catch(() => undefined);
+        }
+        await this.connect(true);
     }
 
     private connect(isReconnect: boolean): Promise<void> {
@@ -115,6 +205,7 @@ export class DiscordAdapter implements PlatformAdapter {
     }
 
     private async createAndLoginClient(isReconnect: boolean): Promise<void> {
+        this.connection.markConnecting();
         const client = await this.createClient();
         this.attachClientLifecycle(client);
         this.attachMessageListener(client);
@@ -123,17 +214,22 @@ export class DiscordAdapter implements PlatformAdapter {
             await this.loginAndWaitForReady(client);
         } catch (err) {
             await this.destroyClient(client, "failed login");
+            this.connection.markDisconnected(String(err));
             throw err;
         }
 
         if (this.stopRequested) {
             await this.destroyClient(client, "stopped before ready");
+            this.connection.markStopped();
             return;
         }
 
         this.client = client;
         this.selfUserId = client.user?.id ?? null;
         this.reconnectAttempts = 0;
+        this.connection.markConnected(
+            `${client.user?.username ?? "?"} (${this.selfUserId ?? "?"}), guilds ${client.guilds?.cache?.size ?? 0}`,
+        );
         log.info(isReconnect ? "DiscordAdapter 重连成功" : "Discord client ready", {
             username: client.user?.username,
             id: this.selfUserId,
@@ -172,20 +268,24 @@ export class DiscordAdapter implements PlatformAdapter {
     private attachClientLifecycle(client: any): void {
         client.on("shardReconnecting", (shardId: number) => {
             log.warn("Discord shard 正在重连", { shardId });
+            if (this.client === client) this.connection.markConnecting();
             this.armGatewayRecoveryWatchdog(client, shardId);
         });
         client.on("shardResume", (shardId: number, replayedEvents: number) => {
             this.clearGatewayRecoveryWatchdog();
+            if (this.client === client) this.connection.markConnected();
             log.info("Discord shard 已恢复", { shardId, replayedEvents });
         });
         client.on("shardReady", (shardId: number) => {
             this.clearGatewayRecoveryWatchdog();
+            if (this.client === client) this.connection.markConnected();
             log.info("Discord shard ready", { shardId });
         });
         client.on("shardError", (err: Error, shardId: number) => {
             log.warn("Discord shard error", { shardId, error: String(err) });
         });
         client.on("error", (err: Error) => {
+            if (this.client === client) this.connection.noteError(String(err));
             log.warn("Discord client error", { error: String(err) });
         });
         client.on("invalidated", () => {
@@ -233,61 +333,87 @@ export class DiscordAdapter implements PlatformAdapter {
             textPreview: normalized.text.slice(0, 80),
         });
 
-        this.nc.push({
-            type: "nc.message",
-            scene: "discord",
-            source: {
-                scene: "discord",
-                platform: "discord",
-                chatId: normalized.chatId,
-                userId: normalized.userId,
-                chatType: normalized.chatType,
-                messageId: normalized.messageId,
-                replyToMessageId: normalized.replyToMessageId,
-            },
-            chatId: normalized.chatId,
-            userId: normalized.userId,
-            displayName: normalized.displayName,
-            username: normalized.username,
-            text: normalized.text,
-            timestamp: normalized.timestamp,
-            messageId: normalized.messageId,
-            replyToMessageId: normalized.replyToMessageId,
-            chatTitle: normalized.chatTitle,
-            chatType: normalized.chatType,
-            isDirectMessage: normalized.isDirectMessage,
-            mentionsAgent: normalized.mentionsAgent,
-            mediaInfo: normalized.mediaInfo,
-            payload: {
-                scene: "discord",
-                chatId: normalized.chatId,
-                userId: normalized.userId,
-                displayName: normalized.displayName,
-                username: normalized.username,
-                text: normalized.text,
-                timestamp: normalized.timestamp,
-                messageId: normalized.messageId,
-                replyToMessageId: normalized.replyToMessageId,
-                chatTitle: normalized.chatTitle,
-                chatType: normalized.chatType,
-                isDirectMessage: normalized.isDirectMessage,
-                mentionsAgent: normalized.mentionsAgent,
-                mediaInfo: normalized.mediaInfo,
-                source: {
-                    scene: "discord",
-                    platform: "discord",
-                    chatId: normalized.chatId,
-                    userId: normalized.userId,
-                    chatType: normalized.chatType,
-                    messageId: normalized.messageId,
-                    replyToMessageId: normalized.replyToMessageId,
-                },
-                platformData: {
-                    originalType: "discord.message",
-                },
-            },
-            _urgent: normalized.isDirectMessage || normalized.mentionsAgent || normalized.replyToMessageId ? true : false,
-        });
+        this.nc.push(buildDiscordNcMessage(normalized) as never);
+    }
+
+    /**
+     * 补抓离线期间漏掉的消息。
+     *
+     * Discord gateway 的 RESUME 只在很短窗口内 replay，重新 IDENTIFY 后漏掉的消息
+     * 不会补发，所以只能自己按 snowflake 分页拉：`messages.fetch({ after, limit })`。
+     * snowflake 单调递增，配合本地水位线可以做到精确补齐（不多不少）。
+     *
+     * 频道来源只用本地 message_log 里出现过的会话 —— 不主动扫全部 guild 频道，
+     * 避免把 agent 从没参与过的频道也拉进来。
+     */
+    async fetchMissedMessages(options: BackfillOptions): Promise<BackfillResult> {
+        const client = this.client;
+        if (!client) {
+            return { chats: 0, messages: 0, notes: ["discord adapter 未连接"] };
+        }
+
+        const notes: string[] = [];
+        let chatsTouched = 0;
+        let delivered = 0;
+        const chatIds = options.knownChatIds.slice(0, options.maxChats);
+
+        for (const chatId of chatIds) {
+            const watermark = options.getWatermark(chatId);
+            // 没有水位线说明本地没有该频道的历史，无从判断"漏了什么"，跳过以免拉全量
+            if (!watermark) continue;
+
+            // chatId 可能是 discord:<guild>:<channel> 或 discord:<dmChannel>，
+            // 复用 parseTarget 取出真正的 channelId
+            const channelId = this.parseTarget(chatId).channelId;
+            if (!channelId) continue;
+            let chatDelivered = 0;
+
+            try {
+                const channel = await client.channels?.fetch?.(channelId);
+                if (!channel?.messages?.fetch) continue;
+
+                // after=水位线 → 返回比它更新的消息（最多 100 条/次）
+                const fetched = await channel.messages.fetch({
+                    after: watermark.messageId,
+                    limit: Math.min(options.maxMessagesPerChat, 100),
+                });
+                const messages: any[] = typeof fetched?.values === "function"
+                    ? [...fetched.values()]
+                    : Array.isArray(fetched) ? fetched : [];
+                if (messages.length === 0) continue;
+
+                // fetch 返回新→旧，反转成时间正序
+                messages.sort((left, right) => Number(left.createdTimestamp ?? 0) - Number(right.createdTimestamp ?? 0));
+
+                for (const message of messages) {
+                    if (message.author?.id === this.selfUserId) continue;
+                    if (message.system) continue;
+                    const normalized = this.normalizeIncomingMessage(message);
+                    if (!normalized) continue;
+                    if (!isNewerThanWatermark(
+                        { messageId: normalized.messageId, timestamp: normalized.timestamp },
+                        watermark,
+                        "numeric-id",
+                        options.since,
+                    )) continue;
+
+                    options.deliver(buildDiscordNcMessage(normalized));
+                    chatDelivered++;
+                    if (chatDelivered >= options.maxMessagesPerChat) break;
+                }
+            } catch (err) {
+                notes.push(`${chatId} fetch 失败: ${String(err).slice(0, 120)}`);
+                continue;
+            }
+
+            if (chatDelivered > 0) {
+                chatsTouched++;
+                delivered += chatDelivered;
+                log.info("Discord 补抓频道", { chatId, delivered: chatDelivered });
+            }
+        }
+
+        return { chats: chatsTouched, messages: delivered, notes: summarizeBackfillNotes(notes) };
     }
 
     private scheduleReconnect(reason: string, details: Record<string, unknown> = {}, sourceClient?: any): void {
@@ -302,6 +428,7 @@ export class DiscordAdapter implements PlatformAdapter {
 
         this.reconnectAttempts++;
         const delay = this.getReconnectDelayMs(this.reconnectAttempts);
+        this.connection.markRetryScheduled(this.reconnectAttempts, delay);
         log.info(`DiscordAdapter 将在 ${delay}ms 后重连 (第 ${this.reconnectAttempts} 次)`, {
             reason,
             ...details,
@@ -316,6 +443,7 @@ export class DiscordAdapter implements PlatformAdapter {
                 this.scheduleReconnect("connectFailed", { error: String(err) });
             }
         }, delay);
+        if (this.reconnectTimer.unref) this.reconnectTimer.unref();
     }
 
     private getReconnectDelayMs(attempt: number): number {
@@ -1104,21 +1232,7 @@ export class DiscordAdapter implements PlatformAdapter {
     /**
      * Normalize a discord.js Message into our standard NC event format.
      */
-    private normalizeIncomingMessage(message: any): {
-        messageId: string;
-        chatId: string;
-        userId: string;
-        displayName: string;
-        username?: string;
-        text: string;
-        timestamp: string;
-        replyToMessageId?: string;
-        chatTitle: string;
-        chatType: string;
-        isDirectMessage: boolean;
-        mentionsAgent: boolean;
-        mediaInfo?: DiscordMediaInfo;
-    } | null {
+    private normalizeIncomingMessage(message: any): NormalizedDiscordMessage | null {
         const isDM = message.channel?.isDMBased?.() ?? false;
         const guildId = message.guild?.id;
         const channelId = message.channel?.id;

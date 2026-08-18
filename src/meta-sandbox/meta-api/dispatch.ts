@@ -1,4 +1,5 @@
 import type { GroundingConfig } from "../../core/config.js";
+import { loadConfig } from "../../core/config.js";
 import { shortUuid } from "../../core/ids.js";
 import { runParallelGrounding } from "../../main-agent/grounding-util.js";
 import type { AttentionAccumulator } from "../../accumulator/attention-accumulator.js";
@@ -259,7 +260,12 @@ async function ensureExecutor(
 ): Promise<ExecutorLike> {
     let executor = subagent.codeActExecutor as ExecutorLike | null | undefined;
     if (!executor) {
-        executor = deps.executorFactory?.(chatId) ?? new CodeActExecutor(chatId);
+        const codeActCfg = loadConfig().subagent?.codeAct;
+        executor = deps.executorFactory?.(chatId) ?? new CodeActExecutor(chatId, codeActCfg ? {
+            maxExecutionTimeMs: codeActCfg.maxExecutionTimeMs,
+            maxSessionMessages: codeActCfg.maxSessionMessages,
+            maxTurns: codeActCfg.maxTurns,
+        } : undefined);
         subagent.codeActExecutor = executor;
     }
 

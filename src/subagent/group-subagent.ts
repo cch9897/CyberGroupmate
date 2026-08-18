@@ -29,6 +29,7 @@ import type { MemoryStoreV2 } from "../memory-v2/index.js";
 import type { EmbeddingConfig, RecordingPipelineConfig } from "../core/config.js";
 import type { Message } from "../pipeline/types.js";
 import { createLogger } from "../core/logger.js";
+import { resolveEventTimestamp } from "../core/message-enricher.js";
 import type { TopicSignalEntry } from "../pipeline/topic-signal.js";
 
 const log = createLogger("group-subagent");
@@ -133,13 +134,17 @@ export class GroupSubagent extends EventEmitter {
      * 接收消息：同时分发给 Observer 和 RecordingPipeline
      *
      * 替代 main.ts 中单独调用 observer.onMessage() + recordingPipeline.onMessage()
+     *
+     * @param opts.skipRecording 静默模式（quietMode）下为 true：仅走 Observer（纯内存，
+     *   不触发 LLM），跳过 RecordingPipeline（话题聚类 / 记忆沉淀 / 信号），使群消息
+     *   默认不会被发送到任何 LLM API。
      */
-    onMessage(event: NotificationEvent): void {
+    onMessage(event: NotificationEvent, opts?: { skipRecording?: boolean }): void {
         // 1. Observer: engagement 计算 + buffer
         this.observer.onMessage(event);
 
         // 2. RecordingPipeline: 话题聚类 + 记忆沉淀
-        if (this.recordingPipeline) {
+        if (this.recordingPipeline && !opts?.skipRecording) {
             const msg: Message = {
                 id: String(event.messageId ?? event.id ?? `msg_${Date.now()}`),
                 chatId: this.chatId,
@@ -147,7 +152,8 @@ export class GroupSubagent extends EventEmitter {
                 senderName: String(event.displayName ?? event.senderName ?? event.userName ?? ""),
                 senderUsername: (event.username as string) ?? undefined,
                 text: String(event.text ?? event.message ?? ""),
-                timestamp: Date.now(),
+                // 用消息原始时间而非入库时间，backfill 的历史消息才能保持正确时序
+                timestamp: Date.parse(resolveEventTimestamp(event)),
                 replyToMessageId: event.replyToMessageId ? String(event.replyToMessageId) : undefined,
                 mediaType: (event as any).mediaInfo?.type ?? undefined,
                 mediaInfo: (event as any).mediaInfo ? JSON.stringify((event as any).mediaInfo) : undefined,

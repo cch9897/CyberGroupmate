@@ -44,7 +44,7 @@ llm_profiles:
     temperature: 1
     max_tokens: 8192
     # max_context_tokens: 500000
-    thinking_level: medium  # none | low | medium | high（Gemini 特有）
+    thinking_level: medium  # none | low | medium | high | xhigh | max（按 provider/model 支持情况透传）
     # pricing:
     #   input: 1.25
     #   output: 10.00
@@ -57,6 +57,7 @@ llm_profiles:
   #   api_key: ""
   #   model: claude-sonnet-4-20250514
   #   temperature: 0.7
+  #   thinking_level: high  # 启用 adaptive thinking；启用后框架会自动禁用 assistant prefill
   #   max_context_tokens: 180000  # Claude 200K 窗口，预留输出空间
   #   max_tokens: 4096
   #   pricing:
@@ -78,6 +79,18 @@ llm_profiles:
   #     input: 2.50
   #     output: 10.00
   #     cached_input: 1.25
+
+  # 示例：OpenAI Responses WebSocket（长链路增量续传）
+  # openai-responses-ws:
+  #   provider: openai_responses
+  #   base_url: https://api.openai.com/v1
+  #   api_key: ""
+  #   model: gpt-5.6
+  #   temperature: 1
+  #   max_tokens: 8192
+  #   thinking_level: medium
+  #   responses_request_mode: websocket
+  #   # omit_max_output_tokens: true  # 仅兼容不接受该字段的第三方网关时开启
 
   # 示例：Moonshot (OpenAI 兼容)
   # moonshot:
@@ -168,6 +181,49 @@ notification:
     - "赛博群友"
     - "@赛博群友"
 
+# ─── 离线补抓 ───
+# 重启 / 掉线重连后，补载离线期间错过的消息。
+# 不配置时使用下面这些默认值（默认开启）。
+#
+# 各平台能力差异：
+#   telegram userbot: mtcute catchUp(updates.getDifference) 精确补齐，
+#                     gap 过大（differenceTooLong）时用 dialogs 未读数 + getHistory 兜底
+#   telegram bot:     Telegram 禁止 bot 读历史，只能依赖 catchUp，gap 太大即丢失
+#   discord:          按 snowflake after 分页精确补齐（需 Read Message History 权限）
+#   onebot/QQ:        只能拉最近 N 条近似补齐（message_id 不保证有序）
+#
+# 补抓的消息只落盘 + 参与话题聚类，不会逐条唤醒 agent；
+# 若离线期间有 DM / @ 提及，该会话会收到一次合并唤醒（reason=offline-backfill）。
+backfill:
+  enabled: true
+  # 单个会话最多补抓多少条
+  max_messages_per_chat: 50
+  # 单次最多处理多少个会话
+  max_chats: 20
+  # 只补抓最近多少分钟内的消息（默认 12 小时，避免第一次启动拉进远古历史）
+  max_age_minutes: 720
+  # 连接恢复后延迟多久开始补抓（毫秒），等平台侧状态稳定
+  delay_ms: 3000
+  # 补抓的消息是否下载媒体。默认 false —— 一次补几百张图会打爆 vision 和磁盘，
+  # 需要时 agent 可以事后单独调平台 API 取。
+  download_media: false
+
+# ─── 全平台入站访问控制 ───
+# 黑/白名单统一在消息进入协调器时执行，修改后热重载，无需重启。
+# chat_filter:
+#   enabled: false
+#   # blacklist: 丢弃命中项；whitelist: 仅处理命中项
+#   mode: blacklist
+#   # 会话 filter：支持 composite ID、raw ID 和 * 通配符
+#   chat_ids:
+#     - "telegram:-1001234567890"
+#     - "onebot:group:123456789"
+#     - "discord:*"
+#   # 发送者 filter：匹配用户在私聊或群聊中发出的消息
+#   user_ids:
+#     - "telegram:123456789"
+#     - "onebot:987654321"
+
 # ─── Telegram 设置 ───
 # 可选。telegram 和 discord 至少配置一个。
 telegram:
@@ -181,13 +237,6 @@ telegram:
   api_hash: ""
   # 手机号 (userbot 模式下使用；首次登录时会在终端提示输入 OTP / 2FA)
   phone: ""
-  # 入站白名单（可选）：enabled 为 true 时仅处理下列群组或私聊
-  # whitelist:
-  #   enabled: false
-  #   # 群组 / 超级群 / 频道 chat ID，每行一个（如 -1001234567890）
-  #   groups: []
-  #   # 私聊：对方用户 ID，每行一个
-  #   users: []
   # 拟人化发送延迟（多条消息连续发送时模拟打字速度）
   # humanized_delay:
   #   enabled: true
@@ -217,11 +266,6 @@ telegram:
 #   # 是否将本地文件编码为 data URL 后发送（跨机器部署建议开启）
 #   # 开启后，发送图片时会使用 data:image/png;base64,... 这类 payload，避免 file:// 路径不可达
 #   send_file_as_data_url: true
-#   # 入站白名单（可选）
-#   # whitelist:
-#   #   enabled: true
-#   #   groups: ["123456789"]
-#   #   users: []
 #   # 拟人化发送延迟（可选）
 #   # humanized_delay:
 #   #   enabled: true
@@ -491,8 +535,9 @@ metrics:
 #   enabled: true               # 是否启用 MCP Server（默认 true）
 #   mcp_port: 3100              # MCP Server 监听端口（默认 3100，仅本机 127.0.0.1）
 #   mcp_token: "your-token"     # 认证 token（不设则每次启动随机生成）
-#   harness: "claude-code"      # harness 类型："claude-code" 或 "copilot"
+#   harness: "claude-code"      # harness 类型："claude-code"、"codex" 或 "copilot"
 #   claude_code_path: "claude"  # Claude CLI 路径（harness=claude-code 时，默认 PATH 中的 claude）
+#   codex_path: "codex"         # Codex CLI 路径（harness=codex 时，默认 PATH 中的 codex）
 #   copilot_path: "copilot"     # Copilot CLI 路径（harness=copilot 时，默认 PATH 中的 copilot）
 #   harness_model: "sonnet"     # harness 使用的模型名称
 #   max_budget_usd: 5           # 单次做梦的最大花费（美元，仅 Claude Code 支持）

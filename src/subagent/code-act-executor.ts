@@ -49,7 +49,7 @@ import { EventEmitter } from "node:events";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { shouldCompact, compact as contextManagerCompact } from "../memory-v2/context-manager.js";
+import { shouldCompact, compact as contextManagerCompact, forceTrim as contextManagerForceTrim } from "../memory-v2/context-manager.js";
 import { DEFAULT_BANNED_WORDS } from "../core/banned-words.js";
 import { registerPendingMessageSignal, type PendingMessageSignal } from "../sandbox/send-interrupt.js";
 
@@ -359,6 +359,8 @@ export interface SessionMessage {
     role: "system" | "user" | "assistant";
     content: string;
     timestamp: string;
+    /** 与 assistant turn 一起持久化的 provider 原生推理状态。 */
+    reasoning?: ChatMessage["reasoning"];
 }
 
 /** 每次 session 执行中发出的消息记录（用于 compact 时保留） */
@@ -505,7 +507,7 @@ export class CodeActExecutor {
     /** Vision 配置 */
     private visionConfig: VisionConfig | undefined;
     /** Vision tier LLM 配置（独立 vision 模型，Path B 描述用） */
-    private visionLlmConfig: LLMConfig | undefined;
+    private visionLlmConfig: LLMConfig[] | undefined;
     /** 媒体下载函数（委托给 adapter） */
     private downloadFn: ((fileId: string) => Promise<Buffer>) | undefined;
     /** 平台无关的 typing 状态发送函数（由宿主注入，如 Telegram sendTyping） */
@@ -524,7 +526,7 @@ export class CodeActExecutor {
         visionConfig?: VisionConfig,
         downloadFn?: (fileId: string) => Promise<Buffer>,
         sendTyping?: (chatId: string) => Promise<void>,
-        visionLlmConfig?: LLMConfig,
+        visionLlmConfig?: LLMConfig[],
         mediaDownloader?: MediaDownloader,
         formatMention?: (rawUserId: string, username?: string) => string | undefined,
         globalState?: Pick<GlobalState, "getSessionDigests" | "updateDispatchedSubagentTask">,
@@ -575,6 +577,7 @@ export class CodeActExecutor {
                     ? collapseExecutorTaskPrompt(msg.content)
                     : msg.content,
             ),
+            ...(msg.reasoning ? { reasoning: msg.reasoning } : {}),
             ...(index === this.session.length - 1 ? { cacheBreakpoint: true } : {}),
         }));
     }
@@ -665,10 +668,82 @@ export class CodeActExecutor {
     }
 
     private async finalizeExecutionArtifacts(): Promise<void> {
-        if (this.session.length > this.config.maxSessionMessages) {
-            await this.compactSession();
+        if (this.needsCompaction()) {
+            // compact 失败绝不能连带炸掉整次 execute()——否则 callback 丢失且 session 越滚越大。
+            try {
+                await this.compactSession();
+            } catch (err) {
+                log.error("finalizeExecutionArtifacts: compactSession 失败，改为强制裁剪", {
+                    chatId: this.chatId,
+                    error: String(err),
+                });
+                this.forceTrimSession("compactSession 异常");
+            }
         }
         this.saveSession();
+    }
+
+    /**
+     * 是否需要压缩：消息条数超限，或 token 总量已超出 session 模型窗口。
+     * 后者用于兜住"消息不多但每条极大"的情况。
+     */
+    private needsCompaction(): boolean {
+        if (this.session.length > this.config.maxSessionMessages) return true;
+        if (this.session.length === 0) return false;
+        try {
+            const chatMessages: ChatMessage[] = this.session.map(m => ({
+                role: m.role,
+                content: m.content,
+                ...(m.reasoning ? { reasoning: m.reasoning } : {}),
+            }));
+            return shouldCompact(chatMessages, undefined, resolveComponentProfiles("session")[0]);
+        } catch (err) {
+            log.debug("needsCompaction: token 预算检查失败", { chatId: this.chatId, error: String(err) });
+            return false;
+        }
+    }
+
+    /**
+     * 无 LLM 的强制裁剪兜底：只留本来就要保留的尾部，
+     * 本来要被 compact 掉的部分直接丢弃。
+     */
+    private forceTrimSession(reason: string): void {
+        const targetSessionConfig = resolveComponentProfiles("session")[0];
+        const chatMessages: ChatMessage[] = this.session.map(m => ({
+            role: m.role,
+            content: m.content,
+            ...(m.reasoning ? { reasoning: m.reasoning } : {}),
+        }));
+        const trimmed = contextManagerForceTrim(chatMessages, undefined, {
+            targetLlmConfig: targetSessionConfig,
+            reason,
+        });
+
+        if (trimmed.dropped === 0 && !trimmed.truncated) {
+            // 已经在预算内（或只剩不可裁剪的部分），至少保证消息条数回到上限内
+            const keep = Math.max(4, Math.floor(this.config.maxSessionMessages * 0.4));
+            if (this.session.length > keep) {
+                this.session = this.session.slice(-keep);
+                this.contextEngine.ledger.reset();
+            }
+            return;
+        }
+
+        const timestamp = new Date().toISOString();
+        this.session = trimmed.messages.map(m => ({
+            role: m.role as SessionMessage["role"],
+            content: m.content,
+            timestamp,
+        }));
+        this.lastCompactedAt = timestamp;
+        this.contextEngine.ledger.reset();
+        log.warn("forceTrimSession 完成", {
+            chatId: this.chatId,
+            reason,
+            afterMessages: this.session.length,
+            dropped: trimmed.dropped,
+            truncated: trimmed.truncated,
+        });
     }
 
     /**
@@ -699,6 +774,7 @@ export class CodeActExecutor {
         const allowedSkills = new Set<string>([
             ...baseSkills,
             "dispatch",
+            "emergency",  // 安全兜底：紧急拉黑始终可用，不受 baseSkills 配置影响
             platform,
             ...(task.useSkills ?? []),
         ]);
@@ -933,6 +1009,7 @@ export class CodeActExecutor {
             this.session.push({
                 role: msg.role as "system" | "user" | "assistant",
                 content: sanitizePromptTimestamps(msg.content),
+                ...(msg.reasoning ? { reasoning: msg.reasoning } : {}),
                 timestamp: new Date().toISOString(),
             });
         }
@@ -1644,7 +1721,16 @@ export class CodeActExecutor {
 
     private async compactSession(): Promise<void> {
         const keep = Math.max(4, Math.floor(this.config.maxSessionMessages * 0.4));
-        if (this.session.length <= keep) return;
+        // 条数不够时跳过 Layer 1，但仍要走 Layer 2 的 token 预算检查
+        // （少量超大消息同样会撑爆窗口）。
+        if (this.session.length > keep) {
+            this.compactSessionLayer1(keep);
+        }
+        await this.compactSessionLayer2();
+    }
+
+    /** Layer 1: 结构化快速 compact（无 LLM） */
+    private compactSessionLayer1(keep: number): void {
         const compactedMessages = this.session.slice(0, -keep);
         const recentMessages = this.session.slice(-keep);
 
@@ -1721,54 +1807,70 @@ export class CodeActExecutor {
             executionRecords: this.executionRecords.length,
             compactChars: compactContent.length,
         });
+    }
 
-        // ═══ Layer 2: token-budget LLM compact (context-manager) ═══
+    /**
+     * Layer 2: token-budget LLM compact (context-manager)
+     *
+     * compact 路由缺失或摘要模型不可用时不能就此放弃：否则 session 永久超窗，
+     * 之后每次 LLM 调用都会因为 context 过长而失败。此时退化为强制裁剪。
+     */
+    private async compactSessionLayer2(): Promise<void> {
         const sessionConfigs = resolveComponentProfiles("session");
         const compactConfigs = resolveComponentProfiles("compact");
         const targetSessionConfig = sessionConfigs[0];
-        if (targetSessionConfig && compactConfigs.length > 0) {
-            const chatMessages: ChatMessage[] = this.session.map(m => ({
-                role: m.role,
+        const chatMessages: ChatMessage[] = this.session.map(m => ({
+            role: m.role,
+            content: m.content,
+            ...(m.reasoning ? { reasoning: m.reasoning } : {}),
+        }));
+        if (!shouldCompact(chatMessages, undefined, targetSessionConfig)) {
+            return;
+        }
+
+        log.info("compactSession Layer 2: token 仍超预算", {
+            chatId: this.chatId,
+            messageCount: chatMessages.length,
+            hasCompactProfile: compactConfigs.length > 0,
+        });
+
+        if (compactConfigs.length === 0) {
+            this.forceTrimSession("未配置 compact 模型路由");
+            return;
+        }
+
+        try {
+            const compacted = await contextManagerCompact(chatMessages, compactConfigs, undefined, {
+                targetLlmConfig: targetSessionConfig,
+            });
+            this.session = compacted.map(m => ({
+                role: m.role as SessionMessage["role"],
                 content: m.content,
+                ...(m.reasoning ? { reasoning: m.reasoning } : {}),
+                timestamp: new Date().toISOString(),
             }));
-            if (shouldCompact(chatMessages, undefined, targetSessionConfig)) {
-                log.info("compactSession Layer 2: token 仍超预算，调用 context-manager compact", {
-                    chatId: this.chatId,
-                    messageCount: chatMessages.length,
-                });
-                try {
-                    const compacted = await contextManagerCompact(chatMessages, compactConfigs, undefined, {
-                        targetLlmConfig: targetSessionConfig,
-                    });
-                    this.session = compacted.map(m => ({
-                        role: m.role as SessionMessage["role"],
-                        content: m.content,
-                        timestamp: new Date().toISOString(),
-                    }));
-                    log.info("compactSession Layer 2 完成", {
-                        chatId: this.chatId,
-                        afterMessages: this.session.length,
-                    });
-                } catch (err) {
-                    log.warn("compactSession Layer 2 失败，执行 emergency truncation", {
-                        chatId: this.chatId,
-                        error: String(err),
-                    });
-                    // ═══ Layer 3: Emergency truncation ═══
-                    // Layer 2 也失败说明内容本身超过 LLM 上下文窗口，强制截断
-                    const emergencyKeep = Math.max(4, Math.floor(keep * 0.5));
-                    const minimalCompact: SessionMessage = {
-                        role: "user",
-                        content: `[SESSION_HISTORY_COMPACT]\n== 之前执行了 ${this.executionCount} 次任务（因 overflow 已强制截断） ==`,
-                        timestamp: new Date().toISOString(),
-                    };
-                    this.session = [minimalCompact, ...this.session.slice(-emergencyKeep)];
-                    log.warn("compactSession Layer 3: emergency truncation applied", {
-                        chatId: this.chatId,
-                        afterMessages: this.session.length,
-                    });
-                }
-            }
+            log.info("compactSession Layer 2 完成", {
+                chatId: this.chatId,
+                afterMessages: this.session.length,
+            });
+        } catch (err) {
+            log.warn("compactSession Layer 2 失败，执行 emergency truncation", {
+                chatId: this.chatId,
+                error: String(err),
+            });
+            // ═══ Layer 3: Emergency truncation ═══
+            // Layer 2 也失败说明内容本身超过 LLM 上下文窗口，强制截断
+            const emergencyKeep = Math.max(4, Math.floor(this.config.maxSessionMessages * 0.4));
+            const minimalCompact: SessionMessage = {
+                role: "user",
+                content: `[SESSION_HISTORY_COMPACT]\n== 之前执行了 ${this.executionCount} 次任务（因 overflow 已强制截断） ==`,
+                timestamp: new Date().toISOString(),
+            };
+            this.session = [minimalCompact, ...this.session.slice(-emergencyKeep)];
+            log.warn("compactSession Layer 3: emergency truncation applied", {
+                chatId: this.chatId,
+                afterMessages: this.session.length,
+            });
         }
     }
 }

@@ -12,6 +12,8 @@
 
 import { NotificationCenter, type NotificationEvent } from "./event/notification-center.js";
 import { ensureCompositeId, getRawId, getPlatform, getGroupModelKey } from "./core/chat-id.js";
+import { userGate } from "./adapter/user-gate.js";
+import { shouldDropInbound } from "./core/inbound-filter.js";
 import { SandboxPool } from "./sandbox/sandbox-pool.js";
 import type { ShellWakeEvent } from "./sandbox/sandbox.js";
 import { installSkillsDependencies } from "./sandbox/skill-loader.js";
@@ -21,12 +23,14 @@ import { createMemoryStore } from "./core/memory-factory.js";
 import {
     loadConfig,
     resolveComponentProfiles,
+    resolveComponentTimeout,
     resolveEmbeddingConfig,
     type AppConfig,
     type EnvironmentVariable,
 } from "./core/config.js";
 import { describeImage, ensureSupportedFormat } from "./core/vision-processor.js";
-import { normalizeMessageMediaFields } from "./core/message-enricher.js";
+import { closeOpenAIResponsesWebSockets } from "./core/llm/openai-responses.js";
+import { normalizeMessageMediaFields, resolveEventTimestamp } from "./core/message-enricher.js";
 import { TopicRegistry } from "./pipeline/index.js";
 import {
     existsSync,
@@ -40,6 +44,7 @@ import { TelegramAdapter } from "./adapter/telegram-adapter.js";
 import { DiscordAdapter } from "./adapter/discord-adapter.js";
 import { OneBotAdapter } from "./adapter/onebot-adapter.js";
 import type { PlatformAdapter } from "./adapter/platform-adapter.js";
+import { BackfillCoordinator, resolveBackfillConfig, BACKFILL_FLAG, BACKFILL_STALE_FLAG, BACKFILL_DIRECT_REASON } from "./adapter/backfill.js";
 import { markChatAsRead } from "./adapter/read-receipts.js";
 
 import { SubagentManager } from "./subagent/subagent-manager.js";
@@ -296,7 +301,6 @@ async function main(): Promise<void> {
             apiId: appConfig.telegram.apiId ? "✓" : "✗",
             apiHash: appConfig.telegram.apiHash ? "✓" : "✗",
             botToken: appConfig.telegram.botToken ? "✓" : "✗",
-            whitelist: appConfig.telegram.whitelist?.enabled ? "on" : "off",
         });
     }
     if (appConfig.discord) {
@@ -309,9 +313,14 @@ async function main(): Promise<void> {
         log.info("OneBot 配置", {
             wsUrl: appConfig.onebot.wsUrl ? "✓" : "✗",
             selfId: appConfig.onebot.selfId ? "✓" : "✗",
-            whitelist: appConfig.onebot.whitelist?.enabled ? "on" : "off",
         });
     }
+    log.info("全平台入站 Filter", {
+        enabled: appConfig.chatFilter?.enabled === true,
+        mode: appConfig.chatFilter?.mode ?? "blacklist",
+        chats: appConfig.chatFilter?.chatIds?.length ?? 0,
+        users: appConfig.chatFilter?.userIds?.length ?? 0,
+    });
 
     initMcpBridge({
         persistPath: MCP_CONNECTIONS_PATH,
@@ -492,6 +501,7 @@ async function main(): Promise<void> {
     // ─── Subagent 架构组件初始化 ───
     // 注意: message_log 落盘由 RecordingPipeline Step 4 负责，不再需要独立的 MessageLogWriter hook
     let accumulator: AttentionAccumulator;
+    let backfillCoordinator: BackfillCoordinator | null = null;
     let postTaskWindows: PostTaskWindowManager | null = null;
     const subagentManager = new SubagentManager({
         observerConfig: {
@@ -617,6 +627,37 @@ async function main(): Promise<void> {
         restoredSignalPoolSize: accumulator.getSignalPoolSize(),
     });
 
+    // ─── 离线补抓协调器 ───
+    // 补抓的消息只落盘 + 参与话题聚类；离线期间被 DM / @ 的会话在批次结束后
+    // 收到一次合并唤醒，而不是每条消息唤醒一次。
+    backfillCoordinator = new BackfillCoordinator({
+        nc,
+        adapters,
+        getWatermark: (chatId, ordering) => memory.getBackfillWatermark(chatId, ordering),
+        listKnownChatIds: (platform) => memory.listKnownChatIds(platform),
+        onConsolidatedWake: (chatId, summary) => {
+            const sub = subagentManager.getOrCreate(chatId);
+            const entry = sub.buildQueueEntry("DIRECT_ADDRESS");
+            // reason 会作为 directAddressReason 进入 meta prompt —— 必须让 agent 明白
+            // 这些是"离线期间补看到的旧消息"，而不是刚刚收到的新消息。
+            const reason = `${BACKFILL_DIRECT_REASON}（离线期间补看：共 ${summary.messageCount} 条，`
+                + `其中 ${summary.directCount} 条直接找你（${summary.reasons.join("/") || "未知"}）；`
+                + `消息时间 ${summary.earliestTs} ~ ${summary.latestTs}，均为过去发生的事，回复时注意时间差）`;
+            accumulator.ingest(0, createDirectAddressItem(chatId, {
+                reason,
+                queueEntry: entry,
+                backfill: summary,
+            }));
+            log.info("补抓 → Layer0 合并唤醒", {
+                chatId,
+                messages: summary.messageCount,
+                direct: summary.directCount,
+                window: `${summary.earliestTs} ~ ${summary.latestTs}`,
+                reasons: summary.reasons,
+            });
+        },
+    });
+
     // ─── NC.onPush: 消息实时处理管线 ───
     // mentionKeywords 现在在每次消息到达时动态从 loadConfig() 读取（支持热重载）
 
@@ -673,8 +714,11 @@ async function main(): Promise<void> {
 
             // 同步喂给 RecordingPipeline buffer，使 flush 时 LLM prompt 能看到 agent 消息
             // （与普通消息双路写入一致：即时落盘 DB + 喂给 buffer）
+            // 静默模式（quietMode）下跳过：recording pipeline 完全不参与，避免残留的
+            // agent 消息触发静默计时器 flush。
+            const agentQuietMode = !!memory.getGroupModel(getGroupModelKey(compositeChatId))?.quietMode;
             const agentSub = subagentManager.get(compositeChatId);
-            if (agentSub?.recordingPipeline) {
+            if (agentSub?.recordingPipeline && !agentQuietMode) {
                 const agentMsg: import("./pipeline/types.js").Message = {
                     id: messageId,
                     chatId: compositeChatId,
@@ -696,6 +740,33 @@ async function main(): Promise<void> {
         // 接收所有消息类型事件（TelegramAdapter 使用 "nc.message"）
         if (eventType !== "nc.message") return;
 
+        // 补抓（离线期间漏掉的历史消息）标记：过滤/落盘/聚类照常，唤醒走合并路径
+        const isBackfilled = (event as Record<string, unknown>)[BACKFILL_FLAG] === true;
+
+        const rawSenderId = String(event.userId ?? event.user_id ?? event.senderId ?? "").trim();
+        const senderUid = rawSenderId
+            ? ensureCompositeId(getPlatform(chatId), rawSenderId)
+            : "";
+
+        // ─── 全平台入站过滤：按会话 / 发送者 filter 丢弃消息 ───
+        // 动态读取 loadConfig()（支持热重载，无需重启）。命中过滤则完全丢弃：
+        // 不落盘、不进 Observer/RecordingPipeline、不触发任何后续处理。
+        const chatFilter = loadConfig().chatFilter;
+        if (shouldDropInbound(chatFilter, { chatId, userId: senderUid })) {
+            log.debug("chatFilter 丢弃入站消息", {
+                chatId,
+                userId: senderUid,
+                mode: chatFilter?.mode ?? "blacklist",
+            });
+            return;
+        }
+
+        // ─── 跨平台用户闸门：隐身 / 紧急拉黑用户的消息直接丢弃（所有平台统一，无需重启） ───
+        if (senderUid && userGate.shouldDrop(senderUid)) {
+            log.debug("userGate 丢弃入站消息", { userId: senderUid, chatId });
+            return;
+        }
+
         // ─── 即时落盘：确保 message_log 实时可查 ───
         // RecordingPipeline 的 flush 是延迟触发的（50 条消息 OR 2 分钟静默），
         // 但 attend-handler 在每个 tick（~5s）就会通过 memory.getRecentMessages()
@@ -711,7 +782,9 @@ async function main(): Promise<void> {
                 displayName: String(event.displayName ?? event.senderName ?? event.userName ?? ""),
                 text: String(event.text ?? event.message ?? ""),
                 replyToMessageId: event.replyToMessageId ? String(event.replyToMessageId) : undefined,
-                timestamp: new Date().toISOString(),
+                // 必须用消息原始时间：backfill 补抓的历史消息若打上"现在"，
+                // message_log 的时序（以及基于它的 LLM 上下文）会整体错乱。
+                timestamp: resolveEventTimestamp(event),
                 mediaType: (event as any).mediaInfo?.type ?? undefined,
                 mediaInfo: (event as any).mediaInfo ? JSON.stringify((event as any).mediaInfo) : undefined,
             }]);
@@ -750,9 +823,19 @@ async function main(): Promise<void> {
             }
         }
 
+        // 静默模式（quietMode / mention-only）：普通群消息已即时落盘（上方 storeMessageBatch，
+        // 纯本地 SQLite，不调用任何 LLM），此处跳过 RecordingPipeline —— 不做话题聚类 / 记忆沉淀 /
+        // 信号发布，群消息默认不会被送往任何 LLM API。只有下方的直接提及路径（DM / @ / 触发词 /
+        // 回复 agent）才会唤醒 agent，届时 getRecentMessages() 从本地 message_log 取回最近上下文。
+        const quietMode = !!memory.getGroupModel(getGroupModelKey(chatId))?.quietMode;
+        // 过旧/超量的补抓消息同样跳过 RecordingPipeline：话题聚类和 triage 都要调 LLM，
+        // 离线数天回来的几千条消息会直接把成本打爆。消息本身已落盘，不丢数据。
+        const staleBackfill = (event as Record<string, unknown>)[BACKFILL_STALE_FLAG] === true;
+
         const sub = subagentManager.getOrCreate(chatId);
         // Per-group: Observer + RecordingPipeline 同时处理消息 (subagent.md §3.1)
-        sub.onMessage(event);
+        // 静默模式下 skipRecording=true：仅走 Observer（纯内存），跳过 RecordingPipeline。
+        sub.onMessage(event, { skipRecording: quietMode || staleBackfill });
 
         // 紧急路径：DM / @mention / 文本提及 agent 名字 → 立即注入 Layer 0。
         const isDM = !!event.isDirectMessage;
@@ -762,7 +845,7 @@ async function main(): Promise<void> {
         const mentionKeywords = (loadConfig().notification?.mentionKeywords ?? []).map(k => k.toLowerCase()).filter(k => k.length > 0);
         const messageText = String(event.text ?? event.message ?? "").toLowerCase();
         const hasNameMention = mentionKeywords.length > 0 && mentionKeywords.some(kw => messageText.includes(kw));
-        const isReplyToAgentInPostTaskWindow = postTaskWindows.isReplyToWindowSentMessage(chatId, event);
+        const isReplyToAgentInPostTaskWindow = !isBackfilled && postTaskWindows.isReplyToWindowSentMessage(chatId, event);
         const directReason = isDM
             ? "DM"
             : isMention
@@ -773,6 +856,20 @@ async function main(): Promise<void> {
                         ? "reply-to-agent"
                         : "";
         const isDirectAttention = directReason.length > 0;
+
+        // ─── 补抓消息：到此为止 ───
+        // 已落盘 + 已喂给 Observer/RecordingPipeline（话题聚类照常做），
+        // 但不逐条唤醒、不进 post-task window、不前送给正在执行的 session：
+        // 否则离线期间的几百条消息会逐条触发 attend，并对几小时前的消息逐条回复。
+        // 是否需要回应由 BackfillCoordinator 在批次结束后做一次合并唤醒决定。
+        if (isBackfilled) {
+            backfillCoordinator?.noteBackfilledMessage(chatId, {
+                timestamp: resolveEventTimestamp(event),
+                directReason: directReason || undefined,
+            });
+            return;
+        }
+
         const executor = sub.codeActExecutor as import("./subagent/code-act-executor.js").CodeActExecutor | null;
         const executorProcessing = !!executor?.isProcessing();
 
@@ -999,7 +1096,7 @@ async function main(): Promise<void> {
         const persona = currentConfig.persona;
         const visionConfig = currentConfig.vision;
         const visionLlmConfig = currentConfig.llmRouting.vision
-            ? resolveComponentProfiles("vision", currentConfig)[0]
+            ? resolveComponentProfiles("vision", currentConfig)
             : undefined;
         const chatAdapter = adapters.find((item) => chatId.startsWith(item.platform + ":"));
         const formatMention = chatAdapter
@@ -1046,7 +1143,12 @@ async function main(): Promise<void> {
         const subagent = subagentManager.getOrCreate(chatId);
         let executor = subagent.codeActExecutor as CodeActExecutor | null | undefined;
         if (!executor) {
-            executor = new CodeActExecutor(chatId);
+            const codeActCfg = loadConfig().subagent?.codeAct;
+            executor = new CodeActExecutor(chatId, codeActCfg ? {
+                maxExecutionTimeMs: codeActCfg.maxExecutionTimeMs,
+                maxSessionMessages: codeActCfg.maxSessionMessages,
+                maxTurns: codeActCfg.maxTurns,
+            } : undefined);
             subagent.codeActExecutor = executor;
         }
 
@@ -1122,7 +1224,7 @@ async function main(): Promise<void> {
         getLlmConfigs: () => resolveComponentProfiles("meta", loadConfig()),
         maxTurns: 10,
         codeTimeout: 30_000,
-        llmTimeoutMs: 60_000,
+        getLlmTimeoutMs: () => resolveComponentTimeout("meta") ?? 60_000,
     }));
 
     log.info("MainAgentLoop 配置完成");
@@ -1197,6 +1299,7 @@ async function main(): Promise<void> {
                 mediaDownloader: sharedMediaDownloader,
                 imageCatalog,
                 adapters,
+                get backfillCoordinator() { return backfillCoordinator ?? undefined; },
                 metaSandbox,
                 onConfigSaved: async (config) => {
                     tokenStats.setProfiles(config.llmProfiles ?? {});
@@ -1254,12 +1357,14 @@ async function main(): Promise<void> {
 
     // ─── Background Agent HarnessManager ───
     const bgHarness = appConfig.backgroundAgent?.harness;
-    if (mcpServerInstance && (bgHarness === "claude-code" || bgHarness === "copilot")) {
-        const { HarnessManager, ClaudeCodeLauncher, CopilotCliLauncher } = await import("./harness/index.js");
+    if (mcpServerInstance && (bgHarness === "claude-code" || bgHarness === "codex" || bgHarness === "copilot")) {
+        const { HarnessManager, ClaudeCodeLauncher, CodexCliLauncher, CopilotCliLauncher } = await import("./harness/index.js");
         const { buildDreamingDigest } = await import("./harness/dreaming-context.js");
         const launcher = bgHarness === "copilot"
             ? new CopilotCliLauncher(appConfig.backgroundAgent!.copilotPath)
-            : new ClaudeCodeLauncher(appConfig.backgroundAgent!.claudeCodePath);
+            : bgHarness === "codex"
+                ? new CodexCliLauncher(appConfig.backgroundAgent!.codexPath)
+                : new ClaudeCodeLauncher(appConfig.backgroundAgent!.claudeCodePath);
         const model = appConfig.backgroundAgent!.harnessModel ?? appConfig.backgroundAgent!.claudeModel;
         harnessManager = new HarnessManager({
             launcher,
@@ -1544,6 +1649,53 @@ async function main(): Promise<void> {
     mainLoop.start();
     log.info("🤖 CyberGroupmate 运行中 (Subagent Architecture)");
 
+    // ─── 离线补抓触发 ───
+    // 启动后补一次（进程重启期间的消息），之后每次连接从 disconnected 恢复到
+    // connected 也补一次（掉线重连比"重启"更常见，也更该补）。
+    const backfillTimers: NodeJS.Timeout[] = [];
+    const scheduleBackfill = (platforms: string[], reason: string, force = false): void => {
+        if (!backfillCoordinator) return;
+        const delay = resolveBackfillConfig(loadConfig().backfill).delayMs;
+        const timer = setTimeout(() => {
+            if (shuttingDown) return;
+            log.info("触发离线补抓", { platforms, reason, force });
+            backfillCoordinator!.run(platforms, { force }).catch((err) => {
+                log.warn("离线补抓异常", { platforms, reason, error: String(err) });
+            });
+        }, delay);
+        if (timer.unref) timer.unref();
+        backfillTimers.push(timer);
+    };
+
+    if (resolveBackfillConfig(loadConfig().backfill).enabled) {
+        const readyPlatforms = adapterStatuses.filter(a => a.status === "ok").map(a => a.platform);
+        if (readyPlatforms.length > 0) {
+            // 启动补抓 force：这是进程生命周期内的第一次，不该被节流挡掉
+            scheduleBackfill(readyPlatforms, "startup", true);
+        }
+
+        // 监视连接状态：disconnected/connecting/error → connected 视为一次恢复
+        const lastConnectionState = new Map<string, string>();
+        for (const adapter of adapters) {
+            const state = adapter.getConnectionStatus?.().state;
+            if (state) lastConnectionState.set(adapter.platform, state);
+        }
+        const connectionWatcher = setInterval(() => {
+            if (shuttingDown || !backfillCoordinator) return;
+            for (const adapter of adapters) {
+                const state = adapter.getConnectionStatus?.().state;
+                if (!state) continue;
+                const previous = lastConnectionState.get(adapter.platform);
+                lastConnectionState.set(adapter.platform, state);
+                if (state === "connected" && previous && previous !== "connected" && previous !== "stopped") {
+                    scheduleBackfill([adapter.platform], `reconnected(from ${previous})`);
+                }
+            }
+        }, 5000);
+        if (connectionWatcher.unref) connectionWatcher.unref();
+        backfillTimers.push(connectionWatcher);
+    }
+
     const runWithTimeout = async (name: string, fn: () => Promise<void>, timeoutMs = 15_000): Promise<void> => {
         await Promise.race([
             fn(),
@@ -1564,6 +1716,8 @@ async function main(): Promise<void> {
         clearInterval(topicCleanupInterval);
         clearInterval(reflectionInterval);
         clearInterval(schedulerWatchdogInterval);
+        for (const timer of backfillTimers) clearTimeout(timer);
+        backfillCoordinator?.dispose();
         if (backgroundDreamingInterval) clearInterval(backgroundDreamingInterval);
 
         // 停止 Background Agent harness
@@ -1615,6 +1769,7 @@ async function main(): Promise<void> {
             log.warn("Dashboard stop 失败", { error: String(err) });
         }
         _metricsStopFn?.();
+        closeOpenAIResponsesWebSockets();
 
         // 保存全局状态并释放其自动保存计时器
         accumulator.dispose();

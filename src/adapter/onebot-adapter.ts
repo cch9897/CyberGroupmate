@@ -7,10 +7,12 @@
 
 import type { NotificationCenter } from "../event/notification-center.js";
 import type { OneBotConfig } from "../core/config.js";
-import type { PlatformAdapter } from "./platform-adapter.js";
+import type { AdapterConnectionStatus, BackfillOptions, BackfillResult, PlatformAdapter } from "./platform-adapter.js";
+import { ConnectionTracker } from "./connection-tracker.js";
+import { isNewerThanWatermark, summarizeBackfillNotes } from "./backfill.js";
 import type { MediaDownloader } from "../core/media-downloader.js";
 import { ensureSupportedFormat } from "../core/vision-processor.js";
-import { composeChatId, ensureCompositeId, parseChatId } from "../core/chat-id.js";
+import { composeChatId, ensureCompositeId, getRawId, parseChatId } from "../core/chat-id.js";
 import {
     normalizeMentionTarget as normalizeMentionTargetUtil,
     normalizeMentionTargets as normalizeMentionTargetsUtil,
@@ -121,6 +123,54 @@ type NormalizedOneBotIncomingMessage = {
     mediaInfo?: OneBotMediaInfo;
 };
 
+/** 构造与实时入站完全一致的 NC 消息载荷（补抓路径复用，避免两套字段漂移） */
+function buildOneBotNcMessage(normalized: NormalizedOneBotIncomingMessage): Record<string, unknown> {
+    const source = {
+        scene: "onebot",
+        platform: "onebot",
+        chatId: normalized.chatId,
+        userId: normalized.userId,
+        chatType: normalized.chatType,
+        messageId: normalized.messageId,
+        replyToMessageId: normalized.replyToMessageId,
+    };
+    const core = {
+        chatId: normalized.chatId,
+        userId: normalized.userId,
+        displayName: normalized.displayName,
+        username: normalized.username,
+        text: normalized.text,
+        timestamp: normalized.timestamp,
+        messageId: normalized.messageId,
+        replyToMessageId: normalized.replyToMessageId,
+        chatTitle: normalized.chatTitle,
+        chatType: normalized.chatType,
+        isDirectMessage: normalized.isDirectMessage,
+        mentionsAgent: normalized.mentionsAgent,
+        mentions: normalized.mentions,
+        messageSegments: normalized.messageSegments,
+        mediaInfo: normalized.mediaInfo,
+    };
+
+    return {
+        type: "nc.message",
+        scene: "onebot",
+        source,
+        ...core,
+        payload: {
+            scene: "onebot",
+            ...core,
+            source,
+            platformData: {
+                originalType: "onebot.message",
+                messageSegments: normalized.messageSegments,
+                mentions: normalized.mentions,
+            },
+        },
+        _urgent: normalized.isDirectMessage || normalized.mentionsAgent || normalized.replyToMessageId ? true : false,
+    };
+}
+
 export class OneBotAdapter implements PlatformAdapter {
     readonly platform = "onebot";
 
@@ -129,10 +179,21 @@ export class OneBotAdapter implements PlatformAdapter {
     private stopRequested = false;
     private reconnectTimer: NodeJS.Timeout | null = null;
     private reconnectAttempts = 0;
+    private heartbeatTimer: NodeJS.Timeout | null = null;
+    private lastPongAt = 0;
+    private readonly connection = new ConnectionTracker("onebot");
     private static readonly RECONNECT_BASE_MS = 1000;
     private static readonly RECONNECT_MAX_MS = 30_000;
     /** 重连次数上限：达到后停止重连，避免 NapCat 永久下线时无限刷日志 */
     private static readonly RECONNECT_MAX_ATTEMPTS = 50;
+    /** ws ping 间隔；NapCat 侧不一定主动 ping，半开连接只能靠自己探活 */
+    private static readonly HEARTBEAT_INTERVAL_MS = 30_000;
+    /** 超过该时长没有任何回应（pong 或消息）即认为连接已死 */
+    private static readonly HEARTBEAT_TIMEOUT_MS = 90_000;
+    /** 某会话拉历史失败后的冷却时长（避免反复触发会弄崩连接的 action） */
+    private static readonly HISTORY_FAILURE_COOLDOWN_MS = 60 * 60_000;
+    /** chatId → 冷却截止时间 */
+    private readonly historyFailureCooldown = new Map<string, number>();
     private readonly pending = new Map<string, { resolve: (v: unknown) => void; reject: (err: Error) => void; timer: NodeJS.Timeout }>();
     private readonly mutedChats = new Map<string, number>();
     /** 缓存群名：groupId → group_name
@@ -164,9 +225,164 @@ export class OneBotAdapter implements PlatformAdapter {
 
         this.stopRequested = false;
         this.reconnectAttempts = 0;
-        await this.connect();
+        try {
+            await this.connect();
+        } catch (err) {
+            // 首次连接失败也要进入自动重连，否则要人工重启进程才能恢复。
+            // close 事件通常会安排重连；这里兜住 close 没触发的情况。
+            if (!this.stopRequested && !this.reconnectTimer) {
+                this.scheduleReconnect();
+            }
+            throw err;
+        }
 
         // 连接成功后预加载 peer 名称（whitelist 开启时只拉名单内 peer）
+        this.prefetchPeerNames();
+    }
+
+    getConnectionStatus(): AdapterConnectionStatus {
+        return this.connection.snapshot();
+    }
+
+    /**
+     * 补抓离线期间漏掉的消息。
+     *
+     * NapCat 在我们 WS 断开期间不会缓存消息，只能主动拉历史：
+     * 群聊用 get_group_msg_history，私聊用 get_friend_msg_history（NapCat 扩展，
+     * 非标准 OneBot v11，旧版本可能不支持 —— 失败时记进 notes 而不是抛错）。
+     *
+     * 精度限制：OneBot 的 message_id 不保证单调递增，分页游标是 message_seq，
+     * 所以这里只做"拉最近 N 条 + 按时间和水位线过滤"的近似补齐，
+     * 真正的去重依赖 message_log 的 (chat_id, message_id) 主键。
+     */
+    async fetchMissedMessages(options: BackfillOptions): Promise<BackfillResult> {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+            return { chats: 0, messages: 0, notes: ["onebot adapter 未连接"] };
+        }
+
+        const notes: string[] = [];
+        let chatsTouched = 0;
+        let delivered = 0;
+        const chatIds = options.knownChatIds.slice(0, options.maxChats);
+
+        for (const chatId of chatIds) {
+            // 曾经拉挂过的会话进入冷却：NapCat 对某些会话的 get_group_msg_history
+            // 会超时并把 ws 带崩，反复重试等于反复自杀。
+            const cooldownUntil = this.historyFailureCooldown.get(chatId) ?? 0;
+            if (cooldownUntil > Date.now()) {
+                notes.push(`${chatId} 处于拉历史冷却中（上次失败），跳过`);
+                continue;
+            }
+
+            const watermark = options.getWatermark(chatId);
+            const rawId = getRawId(chatId);
+            const isGroup = rawId.startsWith("group:");
+            const isPrivate = rawId.startsWith("private:");
+            if (!isGroup && !isPrivate) continue;
+
+            const peerId = rawId.slice(rawId.indexOf(":") + 1);
+            if (!peerId) continue;
+
+            let chatDelivered = 0;
+            try {
+                const action = isGroup ? "get_group_msg_history" : "get_friend_msg_history";
+                const params: Record<string, unknown> = isGroup
+                    ? { group_id: Number(peerId) || peerId, count: options.maxMessagesPerChat, reverse_order: false }
+                    : { user_id: Number(peerId) || peerId, count: options.maxMessagesPerChat, reverse_order: false };
+
+                const result = await this.callAction(action, params) as Record<string, unknown>;
+                const data = (result?.data ?? result) as Record<string, unknown> | unknown[];
+                const rawMessages = Array.isArray(data)
+                    ? data
+                    : Array.isArray((data as Record<string, unknown>)?.messages)
+                        ? (data as Record<string, unknown>).messages as unknown[]
+                        : [];
+                if (rawMessages.length === 0) continue;
+
+                // 历史接口返回旧→新或新→旧不统一，统一按 time 正序
+                const sorted = [...rawMessages].sort((left, right) =>
+                    Number((left as Record<string, unknown>)?.time ?? 0) - Number((right as Record<string, unknown>)?.time ?? 0)
+                );
+
+                for (const raw of sorted) {
+                    const event = raw as OneBotIncomingEvent;
+                    // 历史条目缺少 post_type / self_id，补齐后复用同一套标准化逻辑
+                    const patched: OneBotIncomingEvent = {
+                        ...event,
+                        post_type: "message",
+                        self_id: this.config.selfId,
+                        message_type: event.message_type ?? (isGroup ? "group" : "private"),
+                        group_id: isGroup ? (event.group_id ?? peerId) : event.group_id,
+                    } as OneBotIncomingEvent;
+
+                    // 自己发的消息不补抓
+                    if (String(patched.user_id ?? patched.sender?.user_id ?? "") === String(this.config.selfId)) continue;
+
+                    const normalized = await this.normalizeIncomingMessage(patched);
+                    if (!normalized || !normalized.messageId || !normalized.text) continue;
+                    if (normalized.chatId !== chatId) continue;
+                    if (!isNewerThanWatermark(
+                        { messageId: normalized.messageId, timestamp: normalized.timestamp },
+                        watermark,
+                        "timestamp",
+                        options.since,
+                    )) continue;
+
+                    options.deliver(buildOneBotNcMessage(normalized));
+                    chatDelivered++;
+                    if (chatDelivered >= options.maxMessagesPerChat) break;
+                }
+            } catch (err) {
+                notes.push(`${chatId} 拉历史失败: ${String(err).slice(0, 120)}`);
+                this.historyFailureCooldown.set(chatId, Date.now() + OneBotAdapter.HISTORY_FAILURE_COOLDOWN_MS);
+                // 连接已断开就别继续遍历剩下的会话了：每个都会立刻失败，
+                // 只是把日志刷满并拖长整轮耗时。等重连后的触发再补。
+                if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+                    notes.push("websocket 已断开，放弃本轮剩余会话（重连后会重新触发）");
+                    break;
+                }
+                continue;
+            }
+
+            if (chatDelivered > 0) {
+                chatsTouched++;
+                delivered += chatDelivered;
+                log.info("OneBot 补抓会话", { chatId, delivered: chatDelivered });
+            }
+        }
+
+        return { chats: chatsTouched, messages: delivered, notes: summarizeBackfillNotes(notes) };
+    }
+
+    /** 手动重连：立即断开重连，重置退避计数 */
+    async reconnect(): Promise<void> {
+        log.info("OneBotAdapter 手动重连");
+        this.stopRequested = false;
+        this.clearReconnectTimer();
+        this.stopHeartbeat();
+        this.reconnectAttempts = 0;
+        this.connection.resetAttempts();
+
+        const ws = this.ws;
+        this.ws = null;
+        this.started = false;
+        if (ws) {
+            // 换掉 close 监听，避免旧连接的 close 又排一次自动重连
+            ws.removeAllListeners();
+            // ws 在 CONNECTING 状态 terminate() 时会异步发出 error；必须保留消费器，
+            // 否则 Dashboard 手动重连会触发进程级 unhandled error。
+            ws.once("error", (err) => {
+                log.debug("OneBotAdapter 手动重连时旧连接关闭", { error: String(err) });
+            });
+            try {
+                ws.terminate();
+            } catch (err) {
+                log.debug("OneBotAdapter 手动重连时关闭旧连接失败", { error: String(err) });
+            }
+            this.drainPending();
+        }
+
+        await this.connect();
         this.prefetchPeerNames();
     }
 
@@ -174,34 +390,48 @@ export class OneBotAdapter implements PlatformAdapter {
         return new Promise<void>((resolve, reject) => {
             const isReconnect = this.reconnectAttempts > 0;
             let settled = false;
+            this.connection.markConnecting(this.config.wsUrl);
             const wsOpts = this.config.accessToken
                 ? { headers: { Authorization: `Bearer ${this.config.accessToken}` } }
                 : undefined;
             const ws = new WebSocket(this.config.wsUrl, wsOpts);
             this.ws = ws;
 
-            ws.once("open", () => {
+            const settle = (fn: () => void) => {
+                if (settled) return;
                 settled = true;
+                fn();
+            };
+
+            ws.once("open", () => {
                 this.started = true;
                 this.reconnectAttempts = 0;
+                this.connection.markConnected(`${this.config.wsUrl} (self ${this.config.selfId})`);
+                this.startHeartbeat(ws);
                 if (isReconnect) {
                     log.info("OneBotAdapter 重连成功", { wsUrl: this.config.wsUrl });
                 } else {
                     log.info("OneBotAdapter 已连接", { wsUrl: this.config.wsUrl, selfId: this.config.selfId });
                 }
-                resolve();
+                settle(resolve);
             });
 
             ws.once("error", (err) => {
+                this.connection.markDisconnected(String(err));
                 if (isReconnect) {
                     log.warn("OneBotAdapter 重连失败", { error: String(err) });
-                } else if (!settled) {
-                    settled = true;
-                    reject(err instanceof Error ? err : new Error(String(err)));
                 }
+                // 无论首连还是重连都要 settle：否则 scheduleReconnect 里 await 的
+                // promise 永远悬挂。重连的实际重试由 close 处理器负责。
+                settle(() => reject(err instanceof Error ? err : new Error(String(err))));
+            });
+
+            ws.on("pong", () => {
+                this.lastPongAt = Date.now();
             });
 
             ws.on("message", (data) => {
+                this.lastPongAt = Date.now();
                 try {
                     this.handleWsMessage(String(data));
                 } catch (err) {
@@ -209,18 +439,67 @@ export class OneBotAdapter implements PlatformAdapter {
                 }
             });
 
-            ws.on("close", () => {
+            ws.on("close", (code, reason) => {
+                if (this.ws === ws) this.ws = null;
                 this.started = false;
-                this.ws = null;
+                this.stopHeartbeat();
                 this.drainPending();
+                settle(() => reject(new Error(`OneBot websocket closed before open (code ${code})`)));
                 if (this.stopRequested) {
+                    this.connection.markStopped();
                     log.info("OneBot websocket 已关闭");
                     return;
                 }
-                log.warn("OneBot websocket 已断开，将自动重连");
+                this.connection.markDisconnected(`closed code=${code} reason=${String(reason ?? "")}`.trim());
+                log.warn("OneBot websocket 已断开，将自动重连", { code });
                 this.scheduleReconnect();
             });
         });
+    }
+
+    /**
+     * ws 探活：定期 ping，若长时间没有任何回应就主动 terminate 触发重连。
+     *
+     * 半开连接（TCP 还在但对端已死）不会触发 close，没有探活就会静默失联。
+     */
+    private startHeartbeat(ws: WebSocket): void {
+        this.stopHeartbeat();
+        this.lastPongAt = Date.now();
+        this.heartbeatTimer = setInterval(() => {
+            if (this.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
+
+            if (Date.now() - this.lastPongAt > OneBotAdapter.HEARTBEAT_TIMEOUT_MS) {
+                log.warn("OneBot websocket 心跳超时，主动断开重连", {
+                    silentMs: Date.now() - this.lastPongAt,
+                });
+                this.connection.markDisconnected("心跳超时");
+                try {
+                    ws.terminate();
+                } catch (err) {
+                    log.debug("OneBot 心跳超时 terminate 失败", { error: String(err) });
+                }
+                return;
+            }
+
+            try {
+                ws.ping();
+            } catch (err) {
+                log.debug("OneBot ping 失败", { error: String(err) });
+            }
+        }, OneBotAdapter.HEARTBEAT_INTERVAL_MS);
+        if (this.heartbeatTimer.unref) this.heartbeatTimer.unref();
+    }
+
+    private stopHeartbeat(): void {
+        if (!this.heartbeatTimer) return;
+        clearInterval(this.heartbeatTimer);
+        this.heartbeatTimer = null;
+    }
+
+    private clearReconnectTimer(): void {
+        if (!this.reconnectTimer) return;
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
     }
 
     private drainPending(): void {
@@ -246,6 +525,7 @@ export class OneBotAdapter implements PlatformAdapter {
         );
         // ±20% jitter：避免多个 bot 同时断网后同步重连（thundering herd）
         const delay = Math.round(base * (0.8 + Math.random() * 0.4));
+        this.connection.markRetryScheduled(this.reconnectAttempts, delay);
         log.info(
             `OneBotAdapter 将在 ${delay}ms 后重连 (第 ${this.reconnectAttempts}/${OneBotAdapter.RECONNECT_MAX_ATTEMPTS} 次)`,
         );
@@ -254,19 +534,23 @@ export class OneBotAdapter implements PlatformAdapter {
             if (this.stopRequested) return;
             try {
                 await this.connect();
+                this.prefetchPeerNames();
             } catch {
-                // connect() rejects only on first call; reconnect failures
-                // are handled by the close handler which re-schedules.
+                // 连接失败由 close 处理器重新排程；这里只吞掉 rejection，
+                // 避免变成 unhandled rejection。
+                if (!this.stopRequested && !this.reconnectTimer) {
+                    this.scheduleReconnect();
+                }
             }
         }, delay);
+        if (this.reconnectTimer.unref) this.reconnectTimer.unref();
     }
 
     async stop(): Promise<void> {
         this.stopRequested = true;
-        if (this.reconnectTimer) {
-            clearTimeout(this.reconnectTimer);
-            this.reconnectTimer = null;
-        }
+        this.clearReconnectTimer();
+        this.stopHeartbeat();
+        this.connection.markStopped();
         if (!this.ws) return;
         this.ws.close();
         this.ws = null;
@@ -1190,9 +1474,15 @@ export class OneBotAdapter implements PlatformAdapter {
                 segments.push({ type: "record", data: { file: String(file ?? "") } });
                 break;
             case "document":
-            default:
-                segments.push({ type: "file", data: { file: String(file ?? "") } });
+            default: {
+                const data: Record<string, string> = { file: String(file ?? "") };
+                const name = this.resolveOutgoingFileName(media);
+                if (name) {
+                    data.name = name;
+                }
+                segments.push({ type: "file", data });
                 break;
+            }
         }
 
         const caption = typeof media.caption === "string" ? media.caption : undefined;
@@ -1200,6 +1490,26 @@ export class OneBotAdapter implements PlatformAdapter {
             segments.push({ type: "text", data: { text: caption } });
         }
         return segments;
+    }
+
+    /**
+     * 计算发出去的文件在 NapCat 侧显示的文件名。
+     * 优先用调用方显式给的 media.fileName（sendFile 会自动填 basename）；
+     * 若没有（比如 agent 直接 sendMedia 只给了 file 路径），则回退到原始
+     * media.file 的 basename，避免 NapCat 生成 UUID 风格文件名、丢掉后缀。
+     */
+    private resolveOutgoingFileName(media: Record<string, unknown>): string | undefined {
+        if (typeof media.fileName === "string" && media.fileName.trim()) {
+            return media.fileName.trim();
+        }
+        const raw = media.file;
+        if (typeof raw !== "string") return undefined;
+        let value = raw.trim();
+        if (!value || value.startsWith("base64://") || value.startsWith("data:")) return undefined;
+        value = value.replace(/^file:\/\//i, "");
+        value = value.split(/[?#]/, 1)[0];
+        const base = path.basename(value);
+        return base ? base : undefined;
     }
 
     private normalizeOutgoingMessageArg(value: unknown): OneBotOutgoingMessage {
@@ -1349,87 +1659,12 @@ export class OneBotAdapter implements PlatformAdapter {
         if (event.post_type !== "message") return;
         if (String(event.self_id ?? "") !== String(this.config.selfId)) return;
 
-        const normalized = await this.normalizeIncomingMessage(event);
-        if (!normalized) return;
+        this.normalizeIncomingMessage(event).then(normalized => {
+            if (!normalized) return;
 
-        this.nc.push({
-            type: "nc.message",
-            scene: "onebot",
-            source: {
-                scene: "onebot",
-                platform: "onebot",
-                chatId: normalized.chatId,
-                userId: normalized.userId,
-                chatType: normalized.chatType,
-                messageId: normalized.messageId,
-                replyToMessageId: normalized.replyToMessageId,
-            },
-            chatId: normalized.chatId,
-            userId: normalized.userId,
-            displayName: normalized.displayName,
-            username: normalized.username,
-            text: normalized.text,
-            timestamp: normalized.timestamp,
-            messageId: normalized.messageId,
-            replyToMessageId: normalized.replyToMessageId,
-            chatTitle: normalized.chatTitle,
-            chatType: normalized.chatType,
-            isDirectMessage: normalized.isDirectMessage,
-            mentionsAgent: normalized.mentionsAgent,
-            mentions: normalized.mentions,
-            messageSegments: normalized.messageSegments,
-            mediaInfo: normalized.mediaInfo,
-            payload: {
-                scene: "onebot",
-                chatId: normalized.chatId,
-                userId: normalized.userId,
-                displayName: normalized.displayName,
-                username: normalized.username,
-                text: normalized.text,
-                timestamp: normalized.timestamp,
-                messageId: normalized.messageId,
-                replyToMessageId: normalized.replyToMessageId,
-                chatTitle: normalized.chatTitle,
-                chatType: normalized.chatType,
-                isDirectMessage: normalized.isDirectMessage,
-                mentionsAgent: normalized.mentionsAgent,
-                mentions: normalized.mentions,
-                messageSegments: normalized.messageSegments,
-                mediaInfo: normalized.mediaInfo,
-                source: {
-                    scene: "onebot",
-                    platform: "onebot",
-                    chatId: normalized.chatId,
-                    userId: normalized.userId,
-                    chatType: normalized.chatType,
-                    messageId: normalized.messageId,
-                    replyToMessageId: normalized.replyToMessageId,
-                    chatTitle: normalized.chatTitle,
-                    isDirectMessage: normalized.isDirectMessage,
-                    mentionsAgent: normalized.mentionsAgent,
-                    mentions: normalized.mentions,
-                    messageSegments: normalized.messageSegments,
-                    mediaInfo: normalized.mediaInfo,
-                    source: {
-                        scene: "onebot",
-                        platform: "onebot",
-                        chatId: normalized.chatId,
-                        userId: normalized.userId,
-                        chatType: normalized.chatType,
-                        messageId: normalized.messageId,
-                        replyToMessageId: normalized.replyToMessageId,
-                    },
-                    platformData: {
-                        originalType: "onebot.message",
-                        messageSegments: normalized.messageSegments,
-                        mentions: normalized.mentions,
-                    },
-                },
-                platformData: {
-                    originalType: "onebot.message",
-                },
-            },
-            _urgent: normalized.isDirectMessage || normalized.mentionsAgent || normalized.replyToMessageId ? true : false,
+            this.nc.push(buildOneBotNcMessage(normalized) as never);
+        }).catch(err => {
+            log.warn("异步处理 OneBot 消息失败", { error: String(err) });
         });
     }
 
@@ -1535,10 +1770,6 @@ export class OneBotAdapter implements PlatformAdapter {
         const chatId = messageType === "group"
             ? composeChatId("onebot", `group:${String(event.group_id ?? "")}`)
             : composeChatId("onebot", `private:${userId}`);
-
-        if (!this.isWhitelisted(messageType, String(event.group_id ?? ""), userId)) {
-            return null;
-        }
 
         const normalizedMessage = this.normalizeMessageSegments(event.message ?? event.raw_message ?? "");
         const displayName = event.sender?.card || event.sender?.nickname || userId;
@@ -1843,13 +2074,6 @@ export class OneBotAdapter implements PlatformAdapter {
         }
     }
 
-
-    private isWhitelisted(messageType: "private" | "group" | undefined, groupId: string, userId: string): boolean {
-        const wl = this.config.whitelist;
-        if (!wl?.enabled) return true;
-        if (messageType === "group") return wl.groups.includes(groupId);
-        return wl.users.includes(userId);
-    }
 
     private async callAction(action: string, params: Record<string, unknown>): Promise<unknown> {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {

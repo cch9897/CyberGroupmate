@@ -9,6 +9,7 @@ import { getMetaProviders } from "../context-engine/providers/meta-providers.js"
 import { renderTemplate } from "../context-engine/template-engine.js";
 import type { ContextManifest, SectionNode } from "../context-engine/types.js";
 import type { IMemoryStoreV2 } from "../memory-v2/index.js";
+import { forceTrim, shouldCompact } from "../memory-v2/context-manager.js";
 import type { MetaSandbox } from "../meta-sandbox/meta-sandbox.js";
 import { runMetaSession, type MetaLLMCaller, type MetaSessionResult } from "../meta-sandbox/meta-session-runner.js";
 import { buildMetaApiPrefixMap, buildMetaApiReference, lookupMetaApiDocs } from "../meta-sandbox/meta-api/module-registry.js";
@@ -23,7 +24,7 @@ const log = createLogger("meta-session-handler");
 const DEFAULT_BASE_SKILLS = ["runtime", "fs", "skills", "mcp", "cron", "todo", "memory", "privacy", "dispatch", "vision", "shell"];
 const META_END_TURN_MARKER = "<end_turn>";
 const META_RUNNER_NOTICE_PREFIX = "[Meta runner notice]";
-type MetaHistoryMessage = Pick<MetaSessionHistoryEntry, "role" | "content">;
+type MetaHistoryMessage = Pick<MetaSessionHistoryEntry, "role" | "content" | "reasoning">;
 export interface MetaSessionHandler {
     (entries: AttentionQueueEntry[], callbacks: SubagentCallback[]): Promise<(MetaSessionResult & { attendResults?: AttendResult[] }) | null>;
     resetMetaSessionContext?: () => void;
@@ -49,6 +50,7 @@ export interface MetaSessionHandlerDeps {
     llmCaller?: MetaLLMCaller;
     maxTurns?: number;
     codeTimeout?: number;
+    getLlmTimeoutMs?: () => number | undefined;
     llmTimeoutMs?: number;
 }
 
@@ -71,6 +73,7 @@ export function createMetaSessionHandler(deps: MetaSessionHandlerDeps): MetaSess
 
         const sessionHistory = loadMetaSessionHistory(deps);
         const { messages, renderTrees, contextManifest, historySeedMessage } = await buildMetaMessages(deps, engine, sessionHistory, entries, callbacks);
+        enforceMetaTokenBudget(messages, llmConfigs[0]);
         const initialMessageCount = messages.length;
         log.info("运行 Meta session", {
             groups: entries.map((entry) => entry.chatId),
@@ -83,7 +86,7 @@ export function createMetaSessionHandler(deps: MetaSessionHandlerDeps): MetaSess
                     maxTurns: deps.maxTurns,
                     codeTimeout: deps.codeTimeout,
                     llmCaller: deps.llmCaller,
-                    llmTimeoutMs: deps.llmTimeoutMs,
+                    llmTimeoutMs: deps.getLlmTimeoutMs?.() ?? deps.llmTimeoutMs,
                     contextManifest,
                     twoPassConfig: {
                         getPrefixMap: buildMetaApiPrefixMap,
@@ -121,13 +124,47 @@ export function createMetaSessionHandler(deps: MetaSessionHandlerDeps): MetaSess
     return handler;
 }
 
+/**
+ * Meta 侧的最后一道 token 防线（原地修改 messages）。
+ *
+ * meta history 本身按字符数裁剪，但 system prompt + 本轮 context 渲染的体积不受它约束。
+ * 一旦总量超过 meta 模型的窗口，每一轮 meta session 都会直接失败，而 meta 没有任何
+ * LLM 压缩路径可以自救 —— 所以这里做确定性强制裁剪：丢掉中段历史，保留 system prompt
+ * 和本轮的尾部消息。
+ *
+ * 仅在 meta profile 显式配置了 max_context_tokens 时生效，避免用默认 32k 误伤大窗口模型。
+ */
+function enforceMetaTokenBudget(messages: ChatMessage[], llmConfig?: LLMConfig): void {
+    if (!llmConfig?.maxContextTokens || llmConfig.maxContextTokens <= 0) return;
+    if (!shouldCompact(messages, undefined, llmConfig)) return;
+
+    const trimmed = forceTrim(messages, undefined, {
+        targetLlmConfig: llmConfig,
+        reason: "Meta session 上下文超出模型窗口（meta 无摘要模型可用）",
+    });
+    if (trimmed.dropped === 0 && !trimmed.truncated) return;
+
+    log.warn("Meta session 上下文超窗，已强制裁剪", {
+        beforeMessages: messages.length,
+        afterMessages: trimmed.messages.length,
+        dropped: trimmed.dropped,
+        truncated: trimmed.truncated,
+        maxContextTokens: llmConfig.maxContextTokens,
+    });
+    messages.splice(0, messages.length, ...trimmed.messages);
+}
+
 function loadMetaSessionHistory(deps: MetaSessionHandlerDeps): ChatMessage[] {
     const sessionHistory: ChatMessage[] = deps.globalState.getMetaSessionHistory().flatMap((message) => {
         const content = normalizeMetaSessionHistoryContent(message);
         if (!content) {
             return [];
         }
-        return [{ role: message.role, content }];
+        return [{
+            role: message.role,
+            content,
+            ...(message.reasoning ? { reasoning: message.reasoning } : {}),
+        }];
     });
     trimMetaSessionHistoryWindow(sessionHistory);
     return sessionHistory;
@@ -307,7 +344,11 @@ function collectMetaSessionHistory(messages: ChatMessage[]): MetaHistoryMessage[
         if (!content) {
             return [];
         }
-        return [{ role: message.role, content }];
+        return [{
+            role: message.role,
+            content,
+            ...(message.reasoning ? { reasoning: message.reasoning } : {}),
+        }];
     });
 }
 

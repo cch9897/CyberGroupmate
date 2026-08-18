@@ -38,10 +38,14 @@ export interface LLMConfig {
     apiKey: string;
     model: string;
     temperature: number;
+    /** 设为 true 则不传 temperature 参数（用于不支持的模型如 gpt-5.5） */
+    omit_temperature?: boolean;
+    /** 设为 true 则忽略调用方传入的 stop sequences，不向 provider 发送 */
+    omit_stop_sequence?: boolean;
     maxTokens: number;
     /** 模型允许的最大上下文输入 token 数。用于触发 compact。未设置则使用 context_budget.effective_context_window（默认 32000） */
     maxContextTokens?: number;
-    /** Gemini thinking level: "none" | "low" | "medium" | "high" */
+    /** Provider reasoning effort: "none" | "low" | "medium" | "high" | "xhigh" | "max" */
     thinkingLevel?: string;
     /** 此 profile 是否支持多模态图片输入。默认 false */
     vision?: boolean;
@@ -76,8 +80,10 @@ export interface LLMConfig {
      * 适用于某些 API 在出错时返回 200 但 content 包含错误信息的情况。
      */
     errorContentPatterns?: string[];
-    /** OpenAI Responses API 请求模式：stream / non_stream。仅 provider=openai_responses 时生效，默认 non_stream。 */
-    responsesRequestMode?: "stream" | "non_stream";
+    /** OpenAI Responses API 请求模式。仅 provider=openai_responses 时生效，默认 non_stream。 */
+    responsesRequestMode?: "stream" | "non_stream" | "websocket";
+    /** 不发送 max_output_tokens。用于不接受该字段的 Responses 兼容网关。 */
+    omit_max_output_tokens?: boolean;
     /**
      * 仅在「生成回复」时（session/executor reply 路径）注入的额外提示词，贴在 task prompt 最末尾（recency 最高，紧贴生成）。
      * 不影响 memory / meta / 决策路由等其它用途；system prompt 与 persona 均不改动。
@@ -150,7 +156,7 @@ export interface NotificationConfig {
     mentionKeywords: string[];
 }
 
-/** Telegram 入站白名单：仅当 enabled 为 true 时按群组 / 私聊 ID 过滤 */
+/** @deprecated 仅用于迁移旧配置；新配置统一使用 chat_filter */
 export interface TelegramWhitelistConfig {
     /** 是否启用白名单。false 时不拒绝任何聊天 */
     enabled: boolean;
@@ -166,7 +172,7 @@ export interface TelegramConfig {
     apiId: string;
     apiHash: string;
     phone: string;
-    /** 入站白名单（可选） */
+    /** @deprecated 旧版入站白名单，仅用于迁移和 prewarm 兼容 */
     whitelist?: TelegramWhitelistConfig;
     /** bot 模式 mtcute pts 预热群列表（独立于白名单，用于无白名单时也能预热指定群） */
     prewarm?: { groups: string[] };
@@ -198,7 +204,7 @@ export interface OneBotConfig {
     accessToken?: string;
     /** 是否将本地文件编码为 data URL 发送（跨机器部署时建议开启） */
     sendFileAsDataUrl?: boolean;
-    /** 入站白名单（可选） */
+    /** @deprecated 旧版入站白名单，仅用于迁移 */
     whitelist?: {
         enabled: boolean;
         /** 群号列表 */
@@ -391,6 +397,10 @@ export interface RecordingPipelineConfig {
     normalSilenceMs?: number;
     /** 加速静默触发时间（毫秒）。默认 30000 (30 sec) */
     eagerSilenceMs?: number;
+    /** 单次 flush 最多处理的消息数（超出留 buffer 下轮排空）。默认 120。锁死 cluster 输出体积防 decode 超时 */
+    maxFlushBatch?: number;
+    /** buffer 总量硬上限（超出丢最旧消息，防持续失败时无限膨胀＝死亡螺旋）。默认 1000 */
+    maxBufferSize?: number;
 }
 
 /** Dashboard 外部配置 */
@@ -423,6 +433,52 @@ export interface MetricsConfig {
     /** scrape 路径。默认 "/metrics" */
     path?: string;
 }
+
+/** 全平台入站过滤配置：按会话或发送者黑/白名单过滤消息 */
+export interface ChatFilterConfig {
+    /** 是否启用。默认 false */
+    enabled?: boolean;
+    /**
+     * blacklist（黑名单，默认）：列表内的 chatId 被丢弃，其余正常处理。
+     * whitelist（白名单）：仅列表内的 chatId 被处理，其余全部丢弃。
+     */
+    mode?: "blacklist" | "whitelist";
+    /** chatId filter（支持 composite、raw ID 和 `*` 通配符） */
+    chatIds?: string[];
+    /** sender userId filter（支持 composite、raw ID 和 `*` 通配符） */
+    userIds?: string[];
+}
+
+/**
+ * 离线补抓配置：重启 / 掉线重连后补载错过的消息。
+ *
+ * 补抓的消息只落盘 + 参与话题聚类，不会逐条唤醒 agent；
+ * 若离线期间有 DM / @ 提及，会为该会话产生一次合并唤醒。
+ */
+export interface BackfillConfig {
+    /** 是否启用。默认 true */
+    enabled?: boolean;
+    /** 单个会话最多补抓多少条。默认 50 */
+    maxMessagesPerChat?: number;
+    /** 单次补抓最多处理多少个会话。默认 20 */
+    maxChats?: number;
+    /** 只补抓最近多少分钟内的消息。默认 720（12 小时） */
+    maxAgeMinutes?: number;
+    /** 连接恢复后延迟多久开始补抓（毫秒），等平台侧状态稳定。默认 3000 */
+    delayMs?: number;
+    /** 补抓的消息是否下载媒体（图片/贴纸）。默认 false，避免打爆 vision */
+    downloadMedia?: boolean;
+}
+
+/** 紧急拉黑（emergency.block）预设文案。拉黑瞬间对被拉黑者发送一次。 */
+export interface EmergencyBlockConfig {
+    /** 拉黑时发送的预设文案。 */
+    message?: string;
+}
+
+/** 紧急拉黑默认文案（config 未设置时使用）。 */
+export const DEFAULT_EMERGENCY_BLOCK_MESSAGE =
+    "抱歉，这个对话我没有办法继续了。如果你正处于困境或危机中，请联系当地专业求助渠道或你信任的人。相关情况会由管理员处理。";
 
 /** Token 价格配置（每百万 token，USD） */
 export type TokenPricingEntry = NonNullable<LLMConfig["pricing"]>;
@@ -525,6 +581,12 @@ export interface AppConfig {
     envVars?: EnvironmentVariable[];
     /** Prometheus Metrics Exporter 配置 */
     metrics?: MetricsConfig;
+    /** 聊天过滤（按 chatId 黑/白名单过滤入站消息） */
+    chatFilter?: ChatFilterConfig;
+    /** 离线补抓（重启/重连后补载错过的消息） */
+    backfill?: BackfillConfig;
+    /** 紧急拉黑预设文案（emergency.block） */
+    emergencyBlock?: EmergencyBlockConfig;
     /** MCP Server 预配置列表（Sandbox 启动时自动连接） */
     mcpServers?: McpServerPreConfig[];
     /** Grounding（联网事实查证）配置 */
@@ -536,8 +598,9 @@ export interface AppConfig {
         enabled?: boolean;
         mcpPort?: number;
         mcpToken?: string;
-        harness?: "claude-code" | "copilot";
+        harness?: "claude-code" | "codex" | "copilot";
         claudeCodePath?: string;
+        codexPath?: string;
         copilotPath?: string;
         harnessModel?: string;
         schedule?: string;
@@ -558,6 +621,8 @@ const DEFAULT_LLM: LLMConfig = {
     apiKey: "",
     model: "gpt-4o",
     temperature: 0.7,
+    omit_temperature: false,
+    omit_stop_sequence: false,
     maxTokens: 8192,
 };
 
@@ -729,6 +794,9 @@ export function loadConfig(configPath?: string, forceReload?: boolean): AppConfi
         recordingPipeline: parseRecordingPipelineConfig(fileConfig),
         envVars: parseEnvVars(fileConfig),
         metrics: parseMetricsConfig(fileConfig),
+        chatFilter: parseChatFilterConfig(fileConfig),
+        backfill: parseBackfillConfig(fileConfig),
+        emergencyBlock: parseEmergencyBlockConfig(fileConfig),
         mcpServers: parseMcpServersConfig(fileConfig),
         grounding: parseGroundingConfig(fileConfig),
         rateLimiting: parseRateLimitingConfig(fileConfig),
@@ -853,6 +921,107 @@ function parseMetricsConfig(fileConfig: Record<string, unknown>): MetricsConfig 
         port: raw.port != null ? num(raw.port, 9091) : undefined,
         path: str(raw.path),
     };
+}
+
+function parseChatFilterConfig(fileConfig: Record<string, unknown>): ChatFilterConfig | undefined {
+    const raw = (fileConfig.chat_filter ?? fileConfig.chatFilter) as Record<string, unknown> | undefined;
+    if (raw && typeof raw === "object") {
+        const mode = str(raw.mode);
+        const chatIdsRaw = raw.chat_ids ?? raw.chatIds;
+        const userIdsRaw = raw.user_ids ?? raw.userIds;
+        return {
+            enabled: raw.enabled != null ? Boolean(raw.enabled) : undefined,
+            mode: mode === "whitelist" ? "whitelist" : mode === "blacklist" ? "blacklist" : undefined,
+            chatIds: stringList(chatIdsRaw),
+            userIds: stringList(userIdsRaw),
+        };
+    }
+
+    return migrateLegacyWhitelists(fileConfig);
+}
+
+function stringList(value: unknown): string[] | undefined {
+    return Array.isArray(value)
+        ? value.map(item => String(item).trim()).filter(Boolean)
+        : undefined;
+}
+
+/** Convert adapter-local allowlists into one global whitelist on load. */
+function migrateLegacyWhitelists(fileConfig: Record<string, unknown>): ChatFilterConfig | undefined {
+    const telegram = (fileConfig.telegram ?? {}) as Record<string, unknown>;
+    const discord = (fileConfig.discord ?? {}) as Record<string, unknown>;
+    const onebot = (fileConfig.onebot ?? {}) as Record<string, unknown>;
+    const telegramWhitelist = telegram.whitelist as Record<string, unknown> | undefined;
+    const onebotWhitelist = onebot.whitelist as Record<string, unknown> | undefined;
+    const hasTelegramWhitelist = telegramWhitelist?.enabled === true;
+    const hasOneBotWhitelist = onebotWhitelist?.enabled === true;
+
+    if (!hasTelegramWhitelist && !hasOneBotWhitelist) return undefined;
+
+    const chatIds: string[] = [];
+    const add = (value: string) => {
+        if (value && !chatIds.includes(value)) chatIds.push(value);
+    };
+    const prefixed = (platform: string, value: unknown) => {
+        const id = String(value).trim();
+        return id.startsWith(`${platform}:`) ? id : `${platform}:${id}`;
+    };
+
+    if (Object.keys(telegram).length > 0) {
+        if (hasTelegramWhitelist) {
+            for (const id of stringList(telegramWhitelist?.groups) ?? []) add(prefixed("telegram", id));
+            for (const id of stringList(telegramWhitelist?.users) ?? []) add(prefixed("telegram", id));
+        } else {
+            add("telegram:*");
+        }
+    }
+
+    if (Object.keys(onebot).length > 0) {
+        if (hasOneBotWhitelist) {
+            for (const rawId of stringList(onebotWhitelist?.groups) ?? []) {
+                const id = String(rawId).replace(/^onebot:/, "").replace(/^group:/, "");
+                add(`onebot:group:${id}`);
+            }
+            for (const rawId of stringList(onebotWhitelist?.users) ?? []) {
+                const id = String(rawId).replace(/^onebot:/, "").replace(/^private:/, "");
+                add(`onebot:private:${id}`);
+            }
+        } else {
+            add("onebot:*");
+        }
+    }
+
+    if (Object.keys(discord).length > 0) add("discord:*");
+
+    return { enabled: true, mode: "whitelist", chatIds, userIds: [] };
+}
+
+function parseBackfillConfig(fileConfig: Record<string, unknown>): BackfillConfig | undefined {
+    const raw = (fileConfig.backfill ?? fileConfig.offline_backfill) as Record<string, unknown> | undefined;
+    if (!raw || typeof raw !== "object") return undefined;
+    const positive = (value: unknown): number | undefined => {
+        if (value == null) return undefined;
+        const parsed = Number(value);
+        return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : undefined;
+    };
+    return {
+        enabled: raw.enabled != null ? Boolean(raw.enabled) : undefined,
+        maxMessagesPerChat: positive(raw.max_messages_per_chat ?? raw.maxMessagesPerChat),
+        maxChats: positive(raw.max_chats ?? raw.maxChats),
+        maxAgeMinutes: positive(raw.max_age_minutes ?? raw.maxAgeMinutes),
+        delayMs: positive(raw.delay_ms ?? raw.delayMs),
+        downloadMedia: (raw.download_media ?? raw.downloadMedia) != null
+            ? Boolean(raw.download_media ?? raw.downloadMedia)
+            : undefined,
+    };
+}
+
+function parseEmergencyBlockConfig(fileConfig: Record<string, unknown>): EmergencyBlockConfig | undefined {
+    const raw = (fileConfig.emergency_block ?? fileConfig.emergencyBlock) as Record<string, unknown> | undefined;
+    if (!raw || typeof raw !== "object") return undefined;
+    const message = str(raw.message);
+    if (message == null) return undefined;
+    return { message };
 }
 
 // ─── MCP Servers 预配置解析 ───
@@ -1015,6 +1184,8 @@ function parseRecordingPipelineConfig(fileConfig: Record<string, unknown>): Reco
         eagerThreshold: raw.eager_threshold != null ? num(raw.eager_threshold, 15) : undefined,
         normalSilenceMs: raw.normal_silence_ms != null ? num(raw.normal_silence_ms, 120000) : undefined,
         eagerSilenceMs: raw.eager_silence_ms != null ? num(raw.eager_silence_ms, 30000) : undefined,
+        maxFlushBatch: raw.max_flush_batch != null ? num(raw.max_flush_batch, 120) : undefined,
+        maxBufferSize: raw.max_buffer_size != null ? num(raw.max_buffer_size, 1000) : undefined,
     };
 }
 
@@ -1095,6 +1266,7 @@ function parseBackgroundAgentConfig(fileConfig: Record<string, unknown>): AppCon
     if (!raw || typeof raw !== "object") return undefined;
     const harnessStr = str(raw.harness);
     const harness = harnessStr === "claude-code" ? "claude-code" as const
+        : harnessStr === "codex" ? "codex" as const
         : harnessStr === "copilot" ? "copilot" as const
         : undefined;
     return {
@@ -1103,6 +1275,7 @@ function parseBackgroundAgentConfig(fileConfig: Record<string, unknown>): AppCon
         mcpToken: str(raw.mcp_token) ?? undefined,
         harness,
         claudeCodePath: str(raw.claude_code_path) ?? undefined,
+        codexPath: str(raw.codex_path) ?? undefined,
         copilotPath: str(raw.copilot_path) ?? undefined,
         harnessModel: str(raw.harness_model) ?? str(raw.claude_model) ?? undefined,
         claudeModel: str(raw.claude_model) ?? undefined,
@@ -1185,6 +1358,8 @@ function parseLLMProfile(raw: Record<string, unknown>): LLMConfig {
         apiKey: str(raw.api_key) ?? DEFAULT_LLM.apiKey,
         model: str(raw.model) ?? DEFAULT_LLM.model,
         temperature: num(raw.temperature, DEFAULT_LLM.temperature),
+        omit_temperature: Boolean(raw.omit_temperature ?? DEFAULT_LLM.omit_temperature),
+        omit_stop_sequence: Boolean(raw.omit_stop_sequence ?? DEFAULT_LLM.omit_stop_sequence),
         maxTokens: num(raw.max_tokens, DEFAULT_LLM.maxTokens),
         maxContextTokens: raw.max_context_tokens != null ? num(raw.max_context_tokens, 0) : undefined,
         thinkingLevel: str(raw.thinking_level),
@@ -1204,7 +1379,8 @@ function parseLLMProfile(raw: Record<string, unknown>): LLMConfig {
         errorContentPatterns: (Array.isArray(raw.error_content_patterns) && raw.error_content_patterns.length > 0)
             ? raw.error_content_patterns.map(String)
             : undefined,
-        responsesRequestMode: (str(raw.responses_request_mode) as "stream" | "non_stream" | undefined),
+        responsesRequestMode: (str(raw.responses_request_mode) as "stream" | "non_stream" | "websocket" | undefined),
+        omit_max_output_tokens: Boolean(raw.omit_max_output_tokens),
         replyPrompt: str(raw.reply_prompt),
     };
 }
@@ -1314,8 +1490,11 @@ export function serializeConfigToObject(config: AppConfig): Record<string, unkno
         if (p.customHeaders && Object.keys(p.customHeaders).length > 0) entry.custom_headers = p.customHeaders;
         if (p.errorContentPatterns && p.errorContentPatterns.length > 0) entry.error_content_patterns = p.errorContentPatterns;
         if (p.responsesRequestMode) entry.responses_request_mode = p.responsesRequestMode;
+        if (p.omit_max_output_tokens === true) entry.omit_max_output_tokens = true;
         if (p.replyPrompt) entry.reply_prompt = p.replyPrompt;
         if (p.supportsPrefill === false) entry.supports_prefill = false;
+        if (p.omit_temperature === true) entry.omit_temperature = true;
+        if (p.omit_stop_sequence === true) entry.omit_stop_sequence = true;
         if (p.pricing) {
             const pricing: Record<string, unknown> = {
                 input: p.pricing.input,
@@ -1377,15 +1556,19 @@ export function serializeConfigToObject(config: AppConfig): Record<string, unkno
                 max_delay: config.telegram.humanizedDelay.maxDelay,
             };
         }
-        if (config.telegram.whitelist) {
+        if (config.telegram.whitelist && !config.chatFilter) {
             tg.whitelist = {
                 enabled: config.telegram.whitelist.enabled,
                 groups: config.telegram.whitelist.groups,
                 users: config.telegram.whitelist.users,
             };
         }
-        if (config.telegram.prewarm) {
-            tg.prewarm = { groups: config.telegram.prewarm.groups };
+        const prewarmGroups = config.telegram.prewarm?.groups
+            ?? (config.chatFilter && config.telegram.whitelist?.enabled
+                ? config.telegram.whitelist.groups
+                : undefined);
+        if (prewarmGroups?.length) {
+            tg.prewarm = { groups: prewarmGroups };
         }
         obj.telegram = tg;
     }
@@ -1411,7 +1594,7 @@ export function serializeConfigToObject(config: AppConfig): Record<string, unkno
         if (config.onebot.sendFileAsDataUrl != null) {
             ob.send_file_as_data_url = config.onebot.sendFileAsDataUrl;
         }
-        if (config.onebot.whitelist) {
+        if (config.onebot.whitelist && !config.chatFilter) {
             ob.whitelist = {
                 enabled: config.onebot.whitelist.enabled,
                 groups: config.onebot.whitelist.groups,
@@ -1673,6 +1856,7 @@ export function serializeConfigToObject(config: AppConfig): Record<string, unkno
         if (config.backgroundAgent.mcpToken != null) ba.mcp_token = config.backgroundAgent.mcpToken;
         if (config.backgroundAgent.harness != null) ba.harness = config.backgroundAgent.harness;
         if (config.backgroundAgent.claudeCodePath != null) ba.claude_code_path = config.backgroundAgent.claudeCodePath;
+        if (config.backgroundAgent.codexPath != null) ba.codex_path = config.backgroundAgent.codexPath;
         if (config.backgroundAgent.copilotPath != null) ba.copilot_path = config.backgroundAgent.copilotPath;
         if (config.backgroundAgent.harnessModel != null) ba.harness_model = config.backgroundAgent.harnessModel;
         if (config.backgroundAgent.claudeModel != null) ba.claude_model = config.backgroundAgent.claudeModel;
@@ -1681,6 +1865,31 @@ export function serializeConfigToObject(config: AppConfig): Record<string, unkno
         if (config.backgroundAgent.maxBudgetUsd != null) ba.max_budget_usd = config.backgroundAgent.maxBudgetUsd;
         if (config.backgroundAgent.extraArgs && config.backgroundAgent.extraArgs.length > 0) ba.extra_args = config.backgroundAgent.extraArgs;
         if (Object.keys(ba).length > 0) obj.background_agent = ba;
+    }
+
+    // metrics（此前遗漏：解析+启动都有，但序列化缺失，导致 dashboard 存一次配置就清空）
+    if (config.metrics) {
+        const m: Record<string, unknown> = {};
+        if (config.metrics.enabled != null) m.enabled = config.metrics.enabled;
+        if (config.metrics.host) m.host = config.metrics.host;
+        if (config.metrics.port != null) m.port = config.metrics.port;
+        if (config.metrics.path) m.path = config.metrics.path;
+        if (Object.keys(m).length > 0) obj.metrics = m;
+    }
+
+    // chat_filter
+    if (config.chatFilter) {
+        const cf: Record<string, unknown> = {};
+        if (config.chatFilter.enabled != null) cf.enabled = config.chatFilter.enabled;
+        if (config.chatFilter.mode) cf.mode = config.chatFilter.mode;
+        if (config.chatFilter.chatIds && config.chatFilter.chatIds.length > 0) cf.chat_ids = config.chatFilter.chatIds;
+        if (config.chatFilter.userIds && config.chatFilter.userIds.length > 0) cf.user_ids = config.chatFilter.userIds;
+        if (Object.keys(cf).length > 0) obj.chat_filter = cf;
+    }
+
+    // emergency_block
+    if (config.emergencyBlock && config.emergencyBlock.message != null) {
+        obj.emergency_block = { message: config.emergencyBlock.message };
     }
 
     return obj;

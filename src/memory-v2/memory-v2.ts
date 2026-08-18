@@ -435,6 +435,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                 marked_sensitive INTEGER DEFAULT 0,
                 sensitive_reason TEXT,
                 sensitive_at TEXT,
+                quiet_mode INTEGER DEFAULT 0,
                 updated_at TEXT NOT NULL
             );
 
@@ -593,6 +594,9 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         try { this.db.exec(`ALTER TABLE group_models ADD COLUMN marked_sensitive INTEGER DEFAULT 0`); } catch { /* 列已存在 */ }
         try { this.db.exec(`ALTER TABLE group_models ADD COLUMN sensitive_reason TEXT`); } catch { /* 列已存在 */ }
         try { this.db.exec(`ALTER TABLE group_models ADD COLUMN sensitive_at TEXT`); } catch { /* 列已存在 */ }
+
+        // group_models 新增 quiet_mode 列（静默/mention-only 模式，兼容旧数据库）
+        try { this.db.exec(`ALTER TABLE group_models ADD COLUMN quiet_mode INTEGER DEFAULT 0`); } catch { /* 列已存在 */ }
 
         // person_identities 新增 username 列（兼容旧数据库）
         try { this.db.exec(`ALTER TABLE person_identities ADD COLUMN username TEXT`); } catch { /* 列已存在 */ }
@@ -1285,6 +1289,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
             if (data.markedSensitive !== undefined) builder.set("marked_sensitive", data.markedSensitive ? 1 : 0);
             if (data.sensitiveReason !== undefined) builder.set("sensitive_reason", data.sensitiveReason);
             if (data.sensitiveAt !== undefined) builder.set("sensitive_at", data.sensitiveAt);
+            if (data.quietMode !== undefined) builder.set("quiet_mode", data.quietMode ? 1 : 0);
             builder.set("updated_at", ts);
             builder.where("chat_id", chatId);
 
@@ -1297,8 +1302,8 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                     chat_id, chat_title, description, dominant_language, communication_norms,
                     active_members, avg_messages_per_day, peak_hours, agent_role,
                     engagement_level, recent_feedback, hot_topics, taboo_topics,
-                    last_reflected_at, is_direct_message, marked_sensitive, sensitive_reason, sensitive_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    last_reflected_at, is_direct_message, marked_sensitive, sensitive_reason, sensitive_at, quiet_mode, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `).run(
                 chatId,
                 data.chatTitle ?? "",
@@ -1318,6 +1323,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                 data.markedSensitive ? 1 : 0,
                 data.sensitiveReason ?? null,
                 data.sensitiveAt ?? null,
+                data.quietMode ? 1 : 0,
                 ts,
             );
             log.debug("upsertGroupModel: INSERT", { chatId, title: data.chatTitle ?? "" });
@@ -1338,6 +1344,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
             markedSensitive: !!(row.marked_sensitive as number),
             sensitiveReason: (row.sensitive_reason as string) ?? undefined,
             sensitiveAt: (row.sensitive_at as string) ?? null,
+            quietMode: !!(row.quiet_mode as number),
             description: row.description as string,
             dominantLanguage: row.dominant_language as string,
             communicationNorms: fromJSON(row.communication_norms as string, []),
@@ -2481,6 +2488,42 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         }));
     }
 
+    /**
+     * 补抓水位线：该会话本地已知的"最新"消息。
+     *
+     * telegram / discord 的 message id 单调递增（tg 会话内递增、discord snowflake），
+     * 按数值取最大值最可靠；其余平台（如 onebot，message_id 不保证有序）退回按时间取最新。
+     */
+    getBackfillWatermark(chatId: string, ordering: "numeric-id" | "timestamp" = "numeric-id"): { messageId: string; timestamp: string } | null {
+        const orderBy = ordering === "numeric-id"
+            // 非纯数字 id（如 agent 自己生成的兜底 id）排在最后，避免污染水位线
+            ? "CASE WHEN message_id GLOB '[0-9]*' THEN 0 ELSE 1 END ASC, CAST(message_id AS INTEGER) DESC"
+            : "timestamp DESC";
+        const row = this.db.prepare(
+            `SELECT message_id, timestamp FROM message_log
+             WHERE chat_id = ?
+             ORDER BY ${orderBy}
+             LIMIT 1`
+        ).get(chatId) as { message_id?: string; timestamp?: string } | undefined;
+
+        if (!row?.message_id) return null;
+        return { messageId: String(row.message_id), timestamp: String(row.timestamp ?? "") };
+    }
+
+    /** 本地 message_log 中出现过的会话（可按平台前缀过滤），用于决定补抓范围 */
+    listKnownChatIds(platformPrefix?: string): string[] {
+        const rows = platformPrefix
+            ? this.db.prepare(
+                `SELECT chat_id, MAX(timestamp) AS last_ts FROM message_log
+                 WHERE chat_id LIKE ? GROUP BY chat_id ORDER BY last_ts DESC`
+            ).all(`${platformPrefix}:%`) as Record<string, unknown>[]
+            : this.db.prepare(
+                `SELECT chat_id, MAX(timestamp) AS last_ts FROM message_log
+                 GROUP BY chat_id ORDER BY last_ts DESC`
+            ).all() as Record<string, unknown>[];
+        return rows.map((row) => String(row.chat_id));
+    }
+
     searchFacts(query: string, options: {
         subject?: string;
         categories?: FactCategory[];
@@ -3268,6 +3311,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
             markedSensitive: !!(row.marked_sensitive as number),
             sensitiveReason: (row.sensitive_reason as string) ?? undefined,
             sensitiveAt: (row.sensitive_at as string) ?? null,
+            quietMode: !!(row.quiet_mode as number),
             description: row.description as string,
             dominantLanguage: row.dominant_language as string,
             communicationNorms: fromJSON(row.communication_norms as string, []),

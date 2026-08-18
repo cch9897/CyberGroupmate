@@ -25,6 +25,7 @@
   import BackgroundAgentPanel from './panels/BackgroundAgentPanel.svelte';
   import TopicDetailPanel from './panels/TopicDetailPanel.svelte';
   import EnqueueModal from './panels/EnqueueModal.svelte';
+  import MemoryEditModal from './panels/MemoryEditModal.svelte';
 
   let refreshTimer;
 
@@ -80,5 +81,6 @@
     <div class:hidden={$activeTab !== 'topic-detail'}><TopicDetailPanel /></div>
 
     <EnqueueModal />
+    <MemoryEditModal />
   </div>
 </div>

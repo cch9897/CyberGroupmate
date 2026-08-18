@@ -204,6 +204,35 @@ export function normalizeMessageMediaFields(
     }
 }
 
+/**
+ * 解析入站事件的「消息原始时间」。
+ *
+ * 落盘必须用消息真正发出的时间，而不是入库时间：
+ * message_log 按 timestamp 排序，补抓（backfill）离线期间的历史消息时如果打上
+ * "现在"，整个会话的时序就乱了。adapter 都会把平台时间写进 event.timestamp。
+ *
+ * @param fallback 无法解析时的兜底时间（默认当前时间）
+ */
+export function resolveEventTimestamp(event: unknown, fallback: Date = new Date()): string {
+    const raw = (event as { timestamp?: unknown; date?: unknown } | null | undefined);
+    for (const value of [raw?.timestamp, raw?.date]) {
+        if (value instanceof Date && Number.isFinite(value.getTime())) {
+            return value.toISOString();
+        }
+        if (typeof value === "number" && Number.isFinite(value)) {
+            // 秒级（10 位）时间戳统一按毫秒处理
+            const ms = value < 1e12 ? value * 1000 : value;
+            const date = new Date(ms);
+            if (Number.isFinite(date.getTime())) return date.toISOString();
+        }
+        if (typeof value === "string" && value.trim()) {
+            const parsed = new Date(value);
+            if (Number.isFinite(parsed.getTime())) return parsed.toISOString();
+        }
+    }
+    return fallback.toISOString();
+}
+
 // ─── 核心函数 ───
 
 /**

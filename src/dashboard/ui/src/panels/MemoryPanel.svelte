@@ -8,7 +8,6 @@
   import InteractionsTab from "./memory/InteractionsTab.svelte";
   import RecallTab from "./memory/RecallTab.svelte";
   import ChatLogTab from "./memory/ChatLogTab.svelte";
-  import MemoryEditModal from "./MemoryEditModal.svelte";
 
   const subTabs = [
     { id: "m-persons", label: "用户画像", icon: "fa-user" },
@@ -82,8 +81,6 @@
     {/key}
   </div>
 </div>
-
-<MemoryEditModal />
 
 <style>
   /* ── Two-column layout ── */

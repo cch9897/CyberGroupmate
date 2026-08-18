@@ -163,6 +163,89 @@ function createMemoryStub() {
 }
 
 describe("createMetaSessionHandler", () => {
+    it("resolves the meta llm timeout for each handler run", async () => {
+        const sandbox = new MetaSandbox({});
+        const timeoutValues = [11_000, 22_000];
+        const seenTimeouts: number[] = [];
+        const handler = createMetaSessionHandler({
+            getPersona: () => ({ name: "测试编排者", description: "验证 meta timeout 热更新" }),
+            globalState: {
+                getSessionDigests: () => [],
+                getMetaSessionHistory: () => [],
+                appendMetaSessionHistory: () => undefined,
+            },
+            memory: createMemoryStub() as any,
+            sandbox,
+            getLlmConfigs: () => [TEST_LLM_CONFIG],
+            getLlmTimeoutMs: () => {
+                const nextTimeout = timeoutValues.shift();
+                assert.notEqual(nextTimeout, undefined, "expected a timeout value for this handler run");
+                return nextTimeout;
+            },
+            llmCaller: async (messages, _configs, options): Promise<LLMResponse> => {
+                seenTimeouts.push(options?.timeoutMs ?? -1);
+                if (String(messages.at(-1)?.content ?? "").includes("MetaSandbox observation")) {
+                    return {
+                        content: "[SESSION_DIGEST]done[/SESSION_DIGEST]\n<end_turn>",
+                    };
+                }
+                return {
+                    content: [
+                        "先执行一下。",
+                        "",
+                        "```ts",
+                        "return 1;",
+                        "```",
+                    ].join("\n"),
+                };
+            },
+        });
+
+        await handler([createEntry()], []);
+        await handler([createEntry()], []);
+
+        assert.deepEqual(seenTimeouts, [11_000, 11_000, 22_000, 22_000]);
+    });
+
+    it("falls back to the static meta llm timeout when the getter returns undefined", async () => {
+        const sandbox = new MetaSandbox({});
+        const seenTimeouts: number[] = [];
+        const handler = createMetaSessionHandler({
+            getPersona: () => ({ name: "测试编排者", description: "验证 meta timeout 回退" }),
+            globalState: {
+                getSessionDigests: () => [],
+                getMetaSessionHistory: () => [],
+                appendMetaSessionHistory: () => undefined,
+            },
+            memory: createMemoryStub() as any,
+            sandbox,
+            getLlmConfigs: () => [TEST_LLM_CONFIG],
+            getLlmTimeoutMs: () => undefined,
+            llmTimeoutMs: 33_000,
+            llmCaller: async (messages, _configs, options): Promise<LLMResponse> => {
+                seenTimeouts.push(options?.timeoutMs ?? -1);
+                if (String(messages.at(-1)?.content ?? "").includes("MetaSandbox observation")) {
+                    return {
+                        content: "[SESSION_DIGEST]done[/SESSION_DIGEST]\n<end_turn>",
+                    };
+                }
+                return {
+                    content: [
+                        "先执行一下。",
+                        "",
+                        "```ts",
+                        "return 1;",
+                        "```",
+                    ].join("\n"),
+                };
+            },
+        });
+
+        await handler([createEntry()], []);
+
+        assert.deepEqual(seenTimeouts, [33_000, 33_000]);
+    });
+
     it("uses ContextEngine sections and only replays deltas for messages/topics/profiles", async () => {
         const sandbox = new MetaSandbox({});
         const llmCalls: ChatMessage[][] = [];

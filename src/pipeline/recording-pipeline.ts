@@ -67,6 +67,26 @@ const DEFAULT_EAGER_THRESHOLD = 15;
 const DEFAULT_NORMAL_SILENCE = 2 * 60 * 1000;  // 2 min
 /** 加速静默触发（毫秒） */
 const DEFAULT_EAGER_SILENCE = 30 * 1000;       // 30 sec
+/**
+ * 单次 flush 最多处理的消息数，超出的留 buffer 下轮排空。
+ * cluster 输出∝消息数、decode 仅 ~40-80 tok/s，批次过大必撞超时；封顶把输出锁在安全区。
+ */
+const DEFAULT_MAX_FLUSH_BATCH = 120;
+/** buffer 总量硬上限：持续失败时防止 unshift 回退让 buffer 无限膨胀（越滚越大死亡螺旋），超出丢最旧。 */
+const DEFAULT_MAX_BUFFER_SIZE = 1000;
+/** 本轮批次未排空时，下一次自动 flush 的短延迟（毫秒），用于尽快排空积压。 */
+const DRAIN_REARM_DELAY_MS = 3000;
+
+/**
+ * 把配置里的批次/缓冲上限夹到「有限正整数」，非法值（0/负数/小数/NaN/Infinity）回退默认。
+ * 防两个陷阱：maxFlushBatch=0 → slice(0,0) 空批 + 每 3s 空转排空；
+ * maxBufferSize=0 → slice(-0)===slice(0) 反而保留整个 buffer、封顶失效。
+ */
+function clampPositiveInt(value: number | undefined, fallback: number): number {
+    if (value == null) return fallback;
+    const n = Math.floor(value);
+    return Number.isFinite(n) && n >= 1 ? n : fallback;
+}
 
 
 
@@ -94,6 +114,8 @@ export class RecordingPipeline extends EventEmitter {
     private readonly eagerThreshold: number;
     private readonly normalSilence: number;
     private readonly eagerSilence: number;
+    private readonly maxFlushBatch: number;
+    private readonly maxBufferSize: number;
 
     constructor(
         private registry: TopicRegistry,
@@ -111,6 +133,8 @@ export class RecordingPipeline extends EventEmitter {
         this.eagerThreshold = pipelineConfig?.eagerThreshold ?? DEFAULT_EAGER_THRESHOLD;
         this.normalSilence = pipelineConfig?.normalSilenceMs ?? DEFAULT_NORMAL_SILENCE;
         this.eagerSilence = pipelineConfig?.eagerSilenceMs ?? DEFAULT_EAGER_SILENCE;
+        this.maxFlushBatch = clampPositiveInt(pipelineConfig?.maxFlushBatch, DEFAULT_MAX_FLUSH_BATCH);
+        this.maxBufferSize = clampPositiveInt(pipelineConfig?.maxBufferSize, DEFAULT_MAX_BUFFER_SIZE);
     }
 
     /**
@@ -207,14 +231,17 @@ export class RecordingPipeline extends EventEmitter {
         if (this.isFlushing || this.buffer.length === 0) return;
 
         this.isFlushing = true;
-        const messages = [...this.buffer];
-        this.buffer = [];
+        // 批次上限：单次最多处理 maxFlushBatch 条，其余留在 buffer 下轮排空。
+        // 输出∝消息数、decode ~40-80 tok/s，批次过大 cluster 必撞超时——封顶从根上锁死单次输出体积。
+        const messages = this.buffer.slice(0, this.maxFlushBatch);
+        this.buffer = this.buffer.slice(this.maxFlushBatch);
         this.isEagerMode = false;  // 每次 flush 后重置
         const clusterOnly = options?.clusterOnly ?? false;
 
-        log.info("flush 开始", { messageCount: messages.length, clusterOnly });
+        log.info("flush 开始", { messageCount: messages.length, remaining: this.buffer.length, clusterOnly });
         this.emit("flush:start", messages.length);
 
+        let hadError = false;
         try {
             // ─── Step 1: 话题聚类 ───
             const groupedByChat = this.groupByChat(messages);
@@ -223,16 +250,17 @@ export class RecordingPipeline extends EventEmitter {
                 const existingTopics = this.registry.getByChat(chatId);
                 const messageContext = await this.buildRecordingMessageContext(chatMessages, chatId);
 
-                const clustering = await this.llmTopicClustering(chatMessages, existingTopics, messageContext);
+                let clustering = await this.llmTopicClustering(chatMessages, existingTopics, messageContext);
 
-                // 聚类返回空结果时，消息累积回 buffer 等待下轮 flush，不浪费 triage 调用
+                // 防御性兜底：llmTopicClustering 已保证非空有效 assignments。万一未来回归导致空结果，
+                // 也走本地默认归类而非 unshift 回 buffer——后者会被 finally 的 re-arm 当成功重排，
+                // 让同批消息 3s 后再跑一次、无限循环（死亡螺旋）。绝不把消息写回 buffer。
                 if (clustering.assignments.length === 0) {
-                    log.info("聚类结果为空，消息回退到 buffer", {
+                    log.warn("聚类结果为空，使用本地默认归类（不回退 buffer）", {
                         chatId,
                         messageCount: chatMessages.length,
                     });
-                    this.buffer.push(...chatMessages);
-                    continue;
+                    clustering = this.fallbackClustering(chatMessages);
                 }
 
                 // ─── Step 2: 摘要 + Triage（clusterOnly 模式跳过）───
@@ -381,13 +409,39 @@ export class RecordingPipeline extends EventEmitter {
                 this.emit("flush:complete", updatedTopics);
             }
         } catch (err) {
+            hadError = true;
             log.error("flush 失败", { error: err instanceof Error ? err.message : String(err) });
             this.emit("flush:error", err);
             // 把消息放回缓冲头部，避免丢失
             this.buffer.unshift(...messages);
+            // 保底回退：buffer 总量封顶。持续失败时（非 LLM 错误，如落盘异常）unshift 会让 buffer 无限膨胀，
+            // 批次越滚越大 → 更必然失败＝死亡螺旋。超出上限即丢弃最旧（含反复失败的批次），保留最新消息、自愈。
+            if (this.buffer.length > this.maxBufferSize) {
+                const dropped = this.buffer.length - this.maxBufferSize;
+                this.buffer = this.buffer.slice(-this.maxBufferSize);
+                log.warn("buffer 超过上限，丢弃最旧消息以防死亡螺旋", { dropped, cap: this.maxBufferSize });
+            }
         } finally {
             this.isFlushing = false;
+            // 本轮批次上限有溢出（或回退的消息）→ 短延迟后继续排空，别干等下一条消息/静默定时器。
+            // unref：这条排空定时器不该独自把进程吊住（长活进程无所谓，测试/退出时要能干净结束）。
+            if (this.shouldRearmDrain(hadError)) {
+                const drainTimer = setTimeout(() => { void this.flush(); }, DRAIN_REARM_DELAY_MS);
+                drainTimer.unref?.();
+            }
         }
+    }
+
+    /**
+     * flush 收尾时是否安排「排空定时器」继续处理积压。
+     * - 成功路径：只要 buffer 还有余量就排空——含 < minFlushSize 的尾巴（如批次上限切剩的 1–9 条），
+     *   否则这段尾巴会一直滞留到该群下次活跃/静默触发才落盘。
+     * - 失败路径：沿用 minFlushSize 阈值。持续失败（非 LLM 错误，如落盘异常）时若无脑排空，
+     *   会变成每 3s 对同一小批次热重试刷屏；保留阈值让小残留等更多消息再一起重试。
+     */
+    private shouldRearmDrain(hadError: boolean): boolean {
+        if (this.disposed || this.buffer.length === 0) return false;
+        return hadError ? this.buffer.length >= this.minFlushSize : true;
     }
 
     /**
@@ -427,28 +481,117 @@ export class RecordingPipeline extends EventEmitter {
             { role: "user", content: prompt },
         ];
 
-        const response = await callLLMWithFallback(llmMessages, resolveComponentProfiles("recording_cluster"), { caller: "recording-cluster", timeoutMs: resolveComponentTimeout("recording_cluster") });
+        let response;
+        try {
+            response = await callLLMWithFallback(llmMessages, resolveComponentProfiles("recording_cluster"), { caller: "recording-cluster", timeoutMs: resolveComponentTimeout("recording_cluster") });
+        } catch (err) {
+            // 保底回退：LLM 彻底失败（超时/网关，所有 profile+重试用尽）时不抛出，降级为本地单话题归类。
+            // 关键：这样本批次仍被记录并从 buffer 排空，绝不把整批 unshift 回 buffer 头触发死亡螺旋。
+            log.warn("话题聚类 LLM 调用失败，保底降级为单话题归类", {
+                error: err instanceof Error ? err.message : String(err),
+                messageCount: messages.length,
+            });
+            return this.fallbackClustering(messages);
+        }
 
+        // LLM 调用成功、返回内容 → 交给归一化校验（解析失败 / 合法但语义空或无效 → 本地默认归类）。
+        return this.normalizeClusteringResult(response.content, messages);
+    }
+
+    /**
+     * 归一化 + 校验 cluster LLM 的原始输出。
+     *
+     * 关键不变量：**永不返回空 assignments**。空结果会被 flush() 视为「成功但没产出」，
+     * 若把消息 unshift 回 buffer，finally 的 re-arm 会把它当成功重排 → 同批消息 3s 后再跑一次
+     * → 无限循环（死亡螺旋）。因此这里把以下软失败全部降级为本地默认归类：
+     * - JSON 解析失败（raw 非合法 JSON）
+     * - 合法 JSON 但缺 assignments 数组
+     * - 合法 JSON 但 assignments 为空 / 全部无效（messageId 不在本批 / topicId 空）
+     * 日志按类别区分，便于与 LLM 调用失败（在 llmTopicClustering catch 处告警）对账。
+     *
+     * 部分有效时保留有效项，并给未被覆盖的消息补默认归类，保证消息绝不静默丢失。
+     */
+    private normalizeClusteringResult(rawContent: string, messages: Message[]): TopicClusteringResult {
+        let parsed: { assignments?: unknown; evolutions?: unknown };
         try {
             // 提取 JSON（处理可能的 markdown 包裹）
-            const jsonStr = response.content
+            const jsonStr = rawContent
                 .replace(/```json\s*/g, "")
                 .replace(/```\s*/g, "")
                 .trim();
-            return JSON.parse(jsonStr) as TopicClusteringResult;
+            parsed = JSON.parse(jsonStr) as { assignments?: unknown; evolutions?: unknown };
         } catch {
-            log.warn("话题聚类 LLM 输出解析失败，使用默认归类", { raw: response.content.slice(0, 200) });
-            // 回退：所有消息归为一个新话题
-            return {
-                assignments: messages.map(m => ({
-                    messageId: m.id,
-                    topicId: "NEW_1",
-                    topicLabel: "对话讨论",
-                    keywords: [],
-                })),
-                evolutions: [],
-            };
+            log.warn("话题聚类 LLM 输出 JSON 解析失败，使用本地默认归类", { raw: rawContent.slice(0, 200) });
+            return this.fallbackClustering(messages);
         }
+
+        if (!Array.isArray(parsed.assignments)) {
+            log.warn("话题聚类 LLM 输出合法但缺 assignments 数组，使用本地默认归类", {
+                raw: rawContent.slice(0, 200),
+                messageCount: messages.length,
+            });
+            return this.fallbackClustering(messages);
+        }
+
+        // 过滤非法 assignment：messageId 必须指向本批真实消息、topicId 必须非空字符串。
+        const messageIds = new Set(messages.map(m => m.id));
+        const validAssignments = (parsed.assignments as unknown[]).filter(
+            (a): a is TopicClusteringResult["assignments"][number] =>
+                typeof a === "object" && a !== null &&
+                typeof (a as { messageId?: unknown }).messageId === "string" &&
+                messageIds.has((a as { messageId: string }).messageId) &&
+                typeof (a as { topicId?: unknown }).topicId === "string" &&
+                (a as { topicId: string }).topicId.trim().length > 0,
+        );
+
+        if (validAssignments.length === 0) {
+            log.warn("话题聚类 LLM 输出合法但 assignments 为空或全部无效，使用本地默认归类", {
+                raw: rawContent.slice(0, 200),
+                messageCount: messages.length,
+            });
+            return this.fallbackClustering(messages);
+        }
+
+        // 覆盖完整性：给任何未被有效 assignment 覆盖的消息补默认归类，绝不让消息静默丢失。
+        const assignedIds = new Set(validAssignments.map(a => a.messageId));
+        const missingMessages = messages.filter(m => !assignedIds.has(m.id));
+        if (missingMessages.length > 0) {
+            log.warn("话题聚类 LLM 漏归部分消息，未覆盖部分补默认归类", {
+                missing: missingMessages.length,
+                total: messages.length,
+            });
+        }
+
+        return {
+            assignments: [
+                ...validAssignments,
+                ...missingMessages.map(m => ({
+                    messageId: m.id,
+                    topicId: "NEW_FALLBACK",
+                    topicLabel: "对话讨论",
+                    keywords: [] as string[],
+                })),
+            ],
+            evolutions: Array.isArray(parsed.evolutions)
+                ? (parsed.evolutions as TopicClusteringResult["evolutions"])
+                : [],
+        };
+    }
+
+    /**
+     * 保底降级归类：LLM 不可用（超时/网关挂/输出解析失败）时，把整批消息归为一个新话题。
+     * 目的是保证消息仍被落盘、buffer 被排空——牺牲话题粒度换取「绝不死循环」。
+     */
+    private fallbackClustering(messages: Message[]): TopicClusteringResult {
+        return {
+            assignments: messages.map(m => ({
+                messageId: m.id,
+                topicId: "NEW_1",
+                topicLabel: "对话讨论",
+                keywords: [],
+            })),
+            evolutions: [],
+        };
     }
 
     /**
@@ -497,7 +640,17 @@ export class RecordingPipeline extends EventEmitter {
             { role: "user", content: userMessage },
         ];
 
-        const response = await callLLMWithFallback(llmMessages, resolveComponentProfiles("recording_triage"), { caller: "recording-triage", timeoutMs: resolveComponentTimeout("recording_triage") });
+        let response;
+        try {
+            response = await callLLMWithFallback(llmMessages, resolveComponentProfiles("recording_triage"), { caller: "recording-triage", timeoutMs: resolveComponentTimeout("recording_triage") });
+        } catch (err) {
+            // 保底回退：triage LLM 彻底失败时不抛出（否则 flush 进 catch → 回退 buffer → 死亡螺旋）。
+            // 返回空 triage：话题仍按 clustering 落盘，仅缺 LLM 摘要（后续 reflection 可补）。
+            log.warn("话题摘要 Triage LLM 调用失败，跳过摘要（话题仍落盘）", {
+                error: err instanceof Error ? err.message : String(err),
+            });
+            return { topics: [] };
+        }
 
         let result: TopicSummaryTriageResult;
         try {

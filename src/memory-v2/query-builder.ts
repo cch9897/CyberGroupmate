@@ -54,7 +54,7 @@ export const COLUMN_WHITELIST = {
         "communication_norms", "active_members", "avg_messages_per_day",
         "peak_hours", "agent_role", "engagement_level", "recent_feedback",
         "hot_topics", "taboo_topics", "last_reflected_at", "is_direct_message",
-        "marked_sensitive", "sensitive_reason", "sensitive_at", "updated_at",
+        "marked_sensitive", "sensitive_reason", "sensitive_at", "quiet_mode", "updated_at",
     ],
     interactions: [
         "chat_id", "user_id", "topic_id", "type", "summary",

@@ -1516,9 +1516,14 @@ function clamp01(value: number): number {
  * 支持纯 JSON 和 markdown 代码块包裹两种格式
  */
 export function parseReflectionJSON(raw: string): ReflectionLLMOutput | null {
-    // 尝试提取 markdown 代码块中的 JSON
+    // 尝试提取 markdown 代码块中的 JSON。优先匹配成对的 ```...```；
+    // 若只有起始围栏而无收尾（常见于输出撞 maxTokens 被截断），也剥掉起始/残留围栏，
+    // 否则开头的 ``` 会让 JSON.parse 直接抛 "Unexpected token `" 而整轮反思零落库。
     const codeBlockMatch = raw.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
-    const jsonStr = codeBlockMatch ? codeBlockMatch[1].trim() : raw.trim();
+    const jsonStr = (codeBlockMatch
+        ? codeBlockMatch[1]
+        : raw.trim().replace(/^```(?:json)?[ \t]*\r?\n?/i, "").replace(/\r?\n?```[ \t]*$/i, "")
+    ).trim();
 
     try {
         const parsed = JSON.parse(jsonStr) as Partial<ReflectionLLMOutput>;

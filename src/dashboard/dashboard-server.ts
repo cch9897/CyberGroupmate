@@ -65,7 +65,8 @@ export class DashboardServer {
         // WebSocket upgrade with token auth
         this.server.on("upgrade", (request, socket, head) => {
             const url = new URL(request.url ?? "", `http://localhost:${this.config.port}`);
-            const token = url.searchParams.get("token");
+            const token = url.searchParams.get("token")
+                || request.headers.authorization?.replace("Bearer ", "");
             if (token !== this.config.token) {
                 socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
                 socket.destroy();

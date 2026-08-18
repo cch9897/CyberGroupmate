@@ -9,6 +9,8 @@ import * as fs from "node:fs";
 import { join } from "node:path";
 import type { DashboardDeps } from "./types.js";
 import type { EventBridge } from "./event-bridge.js";
+import { userGate } from "../adapter/user-gate.js";
+import type { AdapterConnectionStatus } from "../adapter/platform-adapter.js";
 import type { CodeActExecutor } from "../subagent/code-act-executor.js";
 import { refreshModuleRegistryCache } from "../subagent/code-act-executor.js";
 import { createLogger } from "../core/logger.js";
@@ -369,6 +371,30 @@ function buildGlobalStateSummary(
             })),
         },
     };
+}
+
+/**
+ * 汇总各平台 adapter 的连接状态。
+ * 未实现 getConnectionStatus 的 adapter 用 unknown 占位，避免前端缺项。
+ */
+export function collectAdapterStatuses(deps: Pick<DashboardDeps, "adapters">): AdapterConnectionStatus[] {
+    return (deps.adapters ?? []).map((adapter) => {
+        const supportsReconnect = typeof adapter.reconnect === "function";
+        const status = adapter.getConnectionStatus?.();
+        if (status) {
+            return { ...status, supportsReconnect };
+        }
+        return {
+            platform: adapter.platform,
+            state: "connected",
+            since: "",
+            reconnectAttempts: 0,
+            nextRetryAt: null,
+            lastConnectedAt: null,
+            detail: "该 adapter 未上报连接状态",
+            supportsReconnect,
+        };
+    });
 }
 
 function getSchedulerBindingId(event: SchedulerEvent): string {
@@ -1816,6 +1842,61 @@ export function createApiRouter(deps: DashboardDeps, bridge: EventBridge): Route
         }
     });
 
+    // ─── 平台连接状态 ───
+    router.get("/adapters", (_req, res) => {
+        res.json({ adapters: collectAdapterStatuses(deps) });
+    });
+
+    // 手动重连指定平台
+    router.post("/adapters/:platform/reconnect", async (req, res) => {
+        const platform = String(req.params.platform ?? "");
+        const adapter = (deps.adapters ?? []).find((item) => item.platform === platform);
+        if (!adapter) {
+            res.status(404).json({ error: `unknown platform: ${platform}` });
+            return;
+        }
+        if (typeof adapter.reconnect !== "function") {
+            res.status(400).json({ error: `${platform} adapter 不支持手动重连` });
+            return;
+        }
+
+        try {
+            log.info("Dashboard 手动重连 adapter", { platform });
+            await adapter.reconnect();
+            res.json({ ok: true, status: adapter.getConnectionStatus?.() ?? null });
+        } catch (err) {
+            log.warn("Dashboard 手动重连失败", { platform, error: String(err) });
+            res.status(500).json({
+                error: String(err),
+                status: adapter.getConnectionStatus?.() ?? null,
+            });
+        }
+    });
+
+    // 手动触发离线补抓（补载掉线/重启期间漏掉的消息）
+    router.post("/adapters/backfill", async (req, res) => {
+        if (!deps.backfillCoordinator) {
+            res.status(400).json({ error: "backfill coordinator 未初始化" });
+            return;
+        }
+        const platformRaw = req.body?.platform;
+        const platforms = typeof platformRaw === "string" && platformRaw
+            ? [platformRaw]
+            : Array.isArray(platformRaw) && platformRaw.length > 0
+                ? platformRaw.map(String)
+                : undefined;
+
+        try {
+            log.info("Dashboard 手动触发离线补抓", { platforms: platforms ?? "all" });
+            // 手动触发绕过自动节流（用户明确要求补一次）
+            const outcome = await deps.backfillCoordinator.run(platforms, { force: true });
+            res.json({ ok: true, ...outcome });
+        } catch (err) {
+            log.warn("Dashboard 手动补抓失败", { error: String(err) });
+            res.status(500).json({ error: String(err) });
+        }
+    });
+
     // ─── Mute Control ───
     // 获取所有 muted 聊天状态
     router.get("/mute/status", (_req, res) => {
@@ -1911,6 +1992,38 @@ export function createApiRouter(deps: DashboardDeps, bridge: EventBridge): Route
         }
         log.info("Dashboard unmute all", { count });
         res.json({ ok: true, unmutedCount: count });
+    });
+
+    // ─── Invisible Users（隐身用户：消息对 Bot 完全不可见，跨平台）───
+    const toUserRows = (ids: string[]) => ids.map((id) => ({ userId: id, platform: id.split(":")[0] || "" }));
+
+    router.get("/invisible", (_req, res) => {
+        res.json({ users: toUserRows(userGate.getInvisible()) });
+    });
+
+    // 覆盖设置隐身用户列表（立即生效，无需重启）
+    router.put("/invisible", (req, res) => {
+        const ids = Array.isArray(req.body?.userIds)
+            ? req.body.userIds.map((v: unknown) => String(v).trim()).filter(Boolean)
+            : [];
+        userGate.setInvisible(ids);
+        log.info("Dashboard 更新隐身用户列表", { count: ids.length });
+        res.json({ ok: true });
+    });
+
+    // ─── Blocked Users（紧急拉黑：LLM 触发，仅此处人工解除；跨平台）───
+    router.get("/blocked", (_req, res) => {
+        res.json({ users: toUserRows(userGate.getBlocked()) });
+    });
+
+    // 覆盖设置拉黑列表（主要用于人工解除；立即生效，无需重启）
+    router.put("/blocked", (req, res) => {
+        const ids = Array.isArray(req.body?.userIds)
+            ? req.body.userIds.map((v: unknown) => String(v).trim()).filter(Boolean)
+            : [];
+        userGate.setBlocked(ids);
+        log.info("Dashboard 更新拉黑列表", { count: ids.length });
+        res.json({ ok: true });
     });
 
     // ─── System Prompts Override ───
@@ -2070,11 +2183,15 @@ export function createApiRouter(deps: DashboardDeps, bridge: EventBridge): Route
         if (!deps.harnessManager) {
             return res.json({ enabled: false });
         }
+        // getStatus() 已用 summarizeRun() 去掉 events；currentRun/runs 也必须去掉 events
+        // （列表视图不需要 events，避免每 2.5s 传输数万条事件对象）
+        const rawCurrent = deps.harnessManager.getCurrentRun();
+        const rawRuns = deps.harnessManager.getRecentRuns(20);
         res.json({
             enabled: true,
             ...deps.harnessManager.getStatus(),
-            currentRun: deps.harnessManager.getCurrentRun(),
-            runs: deps.harnessManager.getRecentRuns(20),
+            currentRun: rawCurrent ? { ...rawCurrent, events: [] } : null,
+            runs: rawRuns.map((run) => ({ ...run, events: [] })),
         });
     });
 

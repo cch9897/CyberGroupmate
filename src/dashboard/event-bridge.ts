@@ -15,6 +15,10 @@ import type { ContextManifest } from "../context-engine/types.js";
 import { getGroupModelKey } from "../core/chat-id.js";
 import { getMetaCodeActState } from "../meta-sandbox/meta-session-runner.js";
 import { getMetaHistoryWindowStatus } from "../main-agent/meta-history-retention.js";
+import { collectAdapterStatuses } from "./api-routes.js";
+
+/** 平台连接状态轮询间隔 */
+const ADAPTER_STATUS_POLL_MS = 3000;
 
 const log = createLogger("dashboard-bridge");
 
@@ -174,6 +178,8 @@ export class EventBridge {
     private maxRecent = 200;
     /** LLM 日志专用缓冲（10000 条） */
     readonly llmLogBuffer = new LLMLogBuffer(10000);
+    /** 上一次广播的 adapter 状态指纹（去重，避免每秒刷屏） */
+    private lastAdapterFingerprint = "";
 
     constructor(deps: DashboardDeps) {
         this.deps = deps;
@@ -182,6 +188,29 @@ export class EventBridge {
         this.hookCodeActEvents();
         this.hookRecordingPipelineEvents();
         this.hookContextEngine();
+        this.hookAdapterConnectionPolling();
+    }
+
+    /**
+     * 轮询各平台连接状态并在变化时广播。
+     * snapshot 只在建连时发一次，掉线/重连必须靠推送才能实时反映在 UI 上。
+     */
+    private hookAdapterConnectionPolling(): void {
+        const timer = setInterval(() => {
+            if (this.clients.size === 0) return;
+            const adapters = collectAdapterStatuses(this.deps);
+            const fingerprint = JSON.stringify(adapters.map((a) =>
+                [a.platform, a.state, a.reconnectAttempts, a.nextRetryAt, a.lastError].join("|")
+            ));
+            if (fingerprint === this.lastAdapterFingerprint) return;
+            this.lastAdapterFingerprint = fingerprint;
+            this.broadcast({
+                type: "adapters:connection",
+                timestamp: new Date().toISOString(),
+                data: { adapters },
+            }, true);
+        }, ADAPTER_STATUS_POLL_MS);
+        if (timer.unref) timer.unref();
     }
 
     addClient(ws: WebSocket): void {
@@ -474,6 +503,7 @@ export class EventBridge {
                 isProcessing: metaCodeAct.isProcessing,
                 historyBudget: metaHistoryStatus,
             },
+            adapters: collectAdapterStatuses(this.deps),
             queue: accumulator.getSnapshot(),
             pendingCallbacks: q5.peek(),
             globalState: globalState.getState(),

@@ -8,10 +8,14 @@
  */
 
 import type { NotificationCenter } from "../event/notification-center.js";
-import type { TelegramConfig } from "../core/config.js";
-import type { PlatformAdapter } from "./platform-adapter.js";
+import { loadConfig, type TelegramConfig } from "../core/config.js";
+import type { AdapterConnectionStatus, BackfillOptions, BackfillResult, PlatformAdapter } from "./platform-adapter.js";
+import { ConnectionTracker } from "./connection-tracker.js";
+import { BACKFILL_FLAG, BACKFILL_STALE_FLAG, isNewerThanWatermark, resolveBackfillConfig, summarizeBackfillNotes } from "./backfill.js";
 import { composeChatId, parseChatId, isTelegram, isValidCompositeChatId, ensureCompositeId, getPlatform } from "../core/chat-id.js";
 import { createLogger } from "../core/logger.js";
+import { shouldDropInbound } from "../core/inbound-filter.js";
+import { userGate } from "./user-gate.js";
 import type { MediaDownloader } from "../core/media-downloader.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -33,35 +37,12 @@ function normalizeWhitelistId(raw: string): string {
 // ─── 常量 ───
 
 const DEFAULT_MEDIA_CACHE_DIR = "workspace/media-cache";
-const INVISIBLE_USERS_PATH = "workspace/invisible-users.json";
 const OUTGOING_MEDIA_FILE_EXTENSIONS = new Set([
     ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".avif", ".heic", ".heif",
     ".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi",
     ".mp3", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".wav", ".flac",
     ".pdf", ".txt", ".zip", ".rar", ".7z",
 ]);
-
-// ─── Invisible Users 持久化 ───
-
-function loadInvisibleUsers(): Set<string> {
-    try {
-        if (fs.existsSync(INVISIBLE_USERS_PATH)) {
-            const data = JSON.parse(fs.readFileSync(INVISIBLE_USERS_PATH, "utf-8"));
-            if (Array.isArray(data)) return new Set(data);
-        }
-    } catch { /* ignore corrupt file */ }
-    return new Set();
-}
-
-function saveInvisibleUsers(users: Set<string>): void {
-    try {
-        const dir = path.dirname(INVISIBLE_USERS_PATH);
-        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-        fs.writeFileSync(INVISIBLE_USERS_PATH, JSON.stringify([...users]), "utf-8");
-    } catch (err) {
-        log.warn("saveInvisibleUsers: 写入失败", { error: String(err) });
-    }
-}
 
 // ─── 媒体文件缓存 ───
 
@@ -154,6 +135,50 @@ interface TelegramClientLike {
 
 type TelegramClientFactory = (config: TelegramConfig) => Promise<TelegramClientLike>;
 
+/** 构造与实时入站完全一致的 NC 消息载荷（补抓路径复用，避免两套字段漂移） */
+function buildTelegramNcMessage(normalized: NormalizedIncomingMessage): Record<string, unknown> {
+    const source = {
+        scene: "telegram",
+        platform: "telegram",
+        chatId: normalized.chatId,
+        userId: normalized.userId,
+        chatType: normalized.chatType,
+        messageId: normalized.messageId,
+        replyToMessageId: normalized.replyToMessageId,
+    };
+    const core = {
+        chatId: normalized.chatId,
+        userId: normalized.userId,
+        displayName: normalized.displayName,
+        username: normalized.username,
+        text: normalized.text,
+        timestamp: normalized.timestamp,
+        messageId: normalized.messageId,
+        replyToMessageId: normalized.replyToMessageId,
+        chatTitle: normalized.chatTitle,
+        chatType: normalized.chatType,
+        isDirectMessage: normalized.isDirectMessage,
+        mentionsAgent: normalized.mentionsAgent,
+        mediaInfo: normalized.mediaInfo,
+    };
+
+    return {
+        type: "nc.message",
+        scene: "telegram",
+        source,
+        ...core,
+        payload: {
+            scene: "telegram",
+            ...core,
+            source,
+            platformData: {
+                originalType: "telegram.message",
+            },
+        },
+        _urgent: normalized.isDirectMessage || normalized.mentionsAgent || normalized.replyToMessageId ? true : false,
+    };
+}
+
 interface PlainUser {
     id: string;
     displayName?: string;
@@ -185,8 +210,8 @@ export interface MediaInfo {
     fileSize?: number;
     /** 入站时自动下载到本地后的绝对路径（20MB 内） */
     filePath?: string;
-    /** 下载状态。too_large 时需要 sandbox 手动调用 downloadMedia/getMessage 再自行处理。 */
-    downloadStatus?: "downloaded" | "cached" | "too_large" | "failed";
+    /** 下载状态。too_large / skipped_backfill 时需要 sandbox 手动调用 downloadMedia/getMessage 再自行处理。 */
+    downloadStatus?: "downloaded" | "cached" | "too_large" | "failed" | "skipped_backfill";
     downloadError?: string;
 }
 
@@ -256,9 +281,25 @@ const MAX_MTCUTE_OBJECT_REFS = 1000;
 export class TelegramAdapter implements PlatformAdapter {
     readonly platform = "telegram";
 
+    private static readonly RECONNECT_BASE_MS = 2000;
+    private static readonly RECONNECT_MAX_MS = 60_000;
+    /** mtcute 卡在 connecting/offline 超过该时长即重建 client */
+    private static readonly OFFLINE_RECOVERY_TIMEOUT_MS = 120_000;
+
     private client: any | null = null;
     private selfUser: PlainUser | null = null;
     private messageHandler: ((msg: any) => Promise<void>) | null = null;
+    private readonly connection = new ConnectionTracker("telegram");
+    private stopRequested = false;
+    private reconnectTimer: NodeJS.Timeout | null = null;
+    private reconnectAttempts = 0;
+    private offlineWatchdog: NodeJS.Timeout | null = null;
+    private startInFlight: Promise<void> | null = null;
+    /** mtcute 正在 catch-up（补齐离线期间的更新）；期间到达的消息按 backfill 处理 */
+    private catchingUp = false;
+    private catchUpDelivered = 0;
+    /** client 世代号：连接状态监听器在 start() 之前订阅，用它判断是否仍属当前 client */
+    private clientGeneration = 0;
     private mediaCache = new MediaFileCache();
     private mtcuteObjectRefCounter = 0;
     private mtcuteObjectRefs = new Map<string, MtcuteObjectRefRecord>();
@@ -267,13 +308,11 @@ export class TelegramAdapter implements PlatformAdapter {
     // ─── 拟人化延迟状态 ───
     private lastSendTimes = new Map<string, number>();
 
-    // ─── /invisible & /mute 状态 ───
-    private invisibleUsers: Set<string> = loadInvisibleUsers();
+    // ─── /mute 状态（invisible/blocked 已迁移到跨平台 userGate） ───
     private mutedChats: Map<string, number> = new Map();  // chatId → expiry timestamp (ms)
 
-    /** 白名单 ID 集合（配置加载时构建，与 rawId 比对） */
-    private readonly whitelistGroupIds: Set<string>;
-    private readonly whitelistUserIds: Set<string>;
+    /** 旧白名单群组仍可作为 bot 模式 pts 预热来源。 */
+    private readonly legacyPrewarmGroupIds: Set<string>;
 
     constructor(
         private config: TelegramConfig,
@@ -283,17 +322,55 @@ export class TelegramAdapter implements PlatformAdapter {
         private createClient: TelegramClientFactory = defaultTelegramClientFactory,
         private mediaDownloader?: MediaDownloader,
     ) {
-        const wl = config.whitelist;
-        this.whitelistGroupIds = new Set((wl?.groups ?? []).map(normalizeWhitelistId));
-        this.whitelistUserIds = new Set((wl?.users ?? []).map(normalizeWhitelistId));
+        this.legacyPrewarmGroupIds = new Set((config.whitelist?.groups ?? []).map(normalizeWhitelistId));
     }
 
     async start(): Promise<void> {
         if (this.client) return;
+        if (this.startInFlight) return this.startInFlight;
 
+        this.stopRequested = false;
+        this.startInFlight = this.doStart().finally(() => {
+            this.startInFlight = null;
+        });
+
+        try {
+            await this.startInFlight;
+        } catch (err) {
+            // mtcute 只在建连之后自己重连；首次 start 失败必须由我们排程重试，
+            // 否则 adapter 会一直保持死状态直到人工重启进程。
+            this.connection.markDisconnected(String(err));
+            this.scheduleReconnect(String(err));
+            throw err;
+        }
+    }
+
+    getConnectionStatus(): AdapterConnectionStatus {
+        return this.connection.snapshot();
+    }
+
+    /** 手动重连：销毁 client 并重建，重置退避计数 */
+    async reconnect(): Promise<void> {
+        log.info("TelegramAdapter 手动重连");
+        this.clearReconnectTimer();
+        this.reconnectAttempts = 0;
+        this.connection.resetAttempts();
+        await this.teardownClient("manual reconnect");
+        this.stopRequested = false;
+        await this.start();
+    }
+
+    private async doStart(): Promise<void> {
         this.validateConfig();
+        this.connection.markConnecting(`mode=${this.config.mode ?? "userbot"}`);
 
         const client = await this.createClient(this.config);
+
+        // 必须在 client.start() 之前订阅连接状态：mtcute 的 catchUp 是在
+        // start() 内部的 startUpdatesLoop() 里启动的，"updating" 事件会在 start()
+        // 返回之前就发出。订阅晚了就收不到，catch-up 补回来的历史消息会被误判为新消息。
+        const generation = ++this.clientGeneration;
+        this.attachConnectionListeners(client, generation);
 
         const self = this.config.mode === "bot"
             ? await client.start({ botToken: this.config.botToken })
@@ -309,6 +386,10 @@ export class TelegramAdapter implements PlatformAdapter {
         this.client = client;
         this.selfUser = this.normalizeUser(self);
         this.rememberPeerObject(self);
+        this.reconnectAttempts = 0;
+        this.connection.markConnected(
+            `${this.selfUser.displayName ?? this.selfUser.firstName ?? this.selfUser.id} (${this.selfUser.id}), mode=${this.config.mode ?? "userbot"}`,
+        );
 
         // Bot mode: mtcute lazily registers channel pts/cpts. Pre-warm known groups
         // via getChat so the update loop sees their pts before any messages arrive.
@@ -316,7 +397,7 @@ export class TelegramAdapter implements PlatformAdapter {
         if (this.config.mode === "bot" && typeof client.getChat === "function") {
             const prewarmIds = this.config.prewarm?.groups?.length
                 ? new Set(this.config.prewarm.groups.map(normalizeWhitelistId))
-                : this.whitelistGroupIds;
+                : this.legacyPrewarmGroupIds;
             for (const rawId of prewarmIds) {
                 const numericId = Number(rawId);
                 if (!Number.isSafeInteger(numericId)) continue;
@@ -330,24 +411,31 @@ export class TelegramAdapter implements PlatformAdapter {
         }
 
         this.messageHandler = async (msg: any) => {
-            const normalized = await this.normalizeIncomingMessage(msg);
+            // mtcute 在 catch-up（updates.getDifference 补齐离线期间的更新）期间
+            // 走的也是这个回调。此时把消息标记为 backfill，让下游只落盘 + 聚类，
+            // 不逐条唤醒 agent 去回复几小时前的消息。
+            const isCatchUp = this.catchingUp;
+            const normalized = await this.normalizeIncomingMessage(msg, {
+                skipMediaDownload: isCatchUp && !this.backfillDownloadMedia(),
+            });
             if (!normalized || !normalized.messageId || !normalized.text) return;
 
-            // ─── 入站白名单（开启时仅处理列出的群组或私聊） ───
-            if (!this.passesTelegramWhitelist(normalized)) {
-                log.debug("白名单拒绝", { chatId: normalized.chatId, isDirectMessage: normalized.isDirectMessage });
-                return;
-            }
+            // Commands are consumed inside the adapter, before nc.message reaches the
+            // coordinator, so apply the same shared filter here to prevent replies
+            // from chats that the global filter rejects.
+            if (shouldDropInbound(loadConfig().chatFilter, {
+                chatId: normalized.chatId,
+                userId: normalized.userId,
+            })) return;
 
             // ─── /invisible & /mute 命令拦截 ───
-            const cmdHandled = await this.handleBotCommand(normalized, msg);
-            if (cmdHandled) return;  // 命令消息不进入 NC
-
-            // ─── invisible 用户消息静默丢弃 ───
-            if (this.invisibleUsers.has(normalized.userId)) {
-                log.debug("invisible 用户消息已丢弃", { userId: normalized.userId, chatId: normalized.chatId });
-                return;
+            // 补抓的历史命令不再执行（几小时前的 /mute 现在执行毫无意义），只当普通消息落盘。
+            if (!isCatchUp) {
+                const cmdHandled = await this.handleBotCommand(normalized, msg);
+                if (cmdHandled) return;  // 命令消息不进入 NC
             }
+
+            // invisible / 紧急拉黑用户的消息由 main.ts 的 userGate 统一丢弃（跨平台）。
 
             log.debug("接收 Telegram 消息", {
                 messageId: normalized.messageId,
@@ -358,63 +446,23 @@ export class TelegramAdapter implements PlatformAdapter {
                 mentionsAgent: normalized.mentionsAgent,
                 textPreview: normalized.text.slice(0, 80),
                 mediaType: normalized.mediaInfo?.type,
+                backfill: isCatchUp,
             });
 
-            this.nc.push({
-                type: "nc.message",
-                scene: "telegram",
-                source: {
-                    scene: "telegram",
-                    platform: "telegram",
-                    chatId: normalized.chatId,
-                    userId: normalized.userId,
-                    chatType: normalized.chatType,
-                    messageId: normalized.messageId,
-                    replyToMessageId: normalized.replyToMessageId,
-                },
-                chatId: normalized.chatId,
-                userId: normalized.userId,
-                displayName: normalized.displayName,
-                username: normalized.username,
-                text: normalized.text,
-                timestamp: normalized.timestamp,
-                messageId: normalized.messageId,
-                replyToMessageId: normalized.replyToMessageId,
-                chatTitle: normalized.chatTitle,
-                chatType: normalized.chatType,
-                isDirectMessage: normalized.isDirectMessage,
-                mentionsAgent: normalized.mentionsAgent,
-                mediaInfo: normalized.mediaInfo,
-                payload: {
-                    scene: "telegram",
-                    chatId: normalized.chatId,
-                    userId: normalized.userId,
-                    displayName: normalized.displayName,
-                    username: normalized.username,
-                    text: normalized.text,
-                    timestamp: normalized.timestamp,
-                    messageId: normalized.messageId,
-                    replyToMessageId: normalized.replyToMessageId,
-                    chatTitle: normalized.chatTitle,
-                    chatType: normalized.chatType,
-                    isDirectMessage: normalized.isDirectMessage,
-                    mentionsAgent: normalized.mentionsAgent,
-                    mediaInfo: normalized.mediaInfo,
-                    source: {
-                        scene: "telegram",
-                        platform: "telegram",
-                        chatId: normalized.chatId,
-                        userId: normalized.userId,
-                        chatType: normalized.chatType,
-                        messageId: normalized.messageId,
-                        replyToMessageId: normalized.replyToMessageId,
-                    },
-                    platformData: {
-                        originalType: "telegram.message",
-                    },
-                },
-                _urgent: normalized.isDirectMessage || normalized.mentionsAgent || normalized.replyToMessageId ? true : false,
-            });
+            const payload = buildTelegramNcMessage(normalized);
+            if (isCatchUp) {
+                this.catchUpDelivered++;
+                // mtcute 的 getDifference 不受我们的 max_age / 条数上限约束：
+                // 离线几天回来可能一次涌入几千条。过旧或超量的部分标记为 stale ——
+                // 仍然落盘（不丢数据），但跳过要调 LLM 的 RecordingPipeline。
+                this.nc.push({
+                    ...payload,
+                    [BACKFILL_FLAG]: true,
+                    ...(this.isStaleCatchUp(normalized.timestamp) ? { [BACKFILL_STALE_FLAG]: true } : {}),
+                } as never);
+            } else {
+                this.nc.push(payload as never);
+            }
         };
 
         client.onNewMessage.add(this.messageHandler);
@@ -422,6 +470,10 @@ export class TelegramAdapter implements PlatformAdapter {
     }
 
     async stop(): Promise<void> {
+        this.stopRequested = true;
+        this.clearReconnectTimer();
+        this.clearOfflineWatchdog();
+        this.connection.markStopped();
         if (!this.client) return;
 
         if (this.messageHandler) {
@@ -435,6 +487,272 @@ export class TelegramAdapter implements PlatformAdapter {
 
         this.client = null;
         this.selfUser = null;
+    }
+
+    /**
+     * 订阅 mtcute 的连接状态。
+     *
+     * mtcute 自己会在传输层重连，我们只做两件事：
+     * 1. 把状态暴露出去（dashboard 显示）
+     * 2. 长时间回不到 connected 时重建 client——mtcute 偶尔会卡在
+     *    connecting/offline 再也不恢复，这时只有重建才能救
+     */
+    private attachConnectionListeners(client: any, generation: number): void {
+        // 用 generation 而不是 this.client 做归属判断：订阅发生在 start() 之前，
+        // 那时 this.client 还没赋值。teardown / 重连会 bump generation 让旧监听器失效。
+        const isCurrent = () => this.clientGeneration === generation && !this.stopRequested;
+
+        const onState = (state: string) => {
+            if (!isCurrent()) return;
+            switch (state) {
+                case "updating":
+                    // mtcute 开始 catch-up：接下来到达的消息是离线期间漏掉的历史消息
+                    this.clearOfflineWatchdog();
+                    this.connection.markConnected();
+                    if (!this.catchingUp) {
+                        this.catchingUp = true;
+                        this.catchUpDelivered = 0;
+                        log.info("Telegram 开始 catch-up，补抓离线期间的消息");
+                    }
+                    break;
+                case "connected":
+                    this.clearOfflineWatchdog();
+                    this.connection.markConnected();
+                    if (this.catchingUp) {
+                        this.catchingUp = false;
+                        log.info("Telegram catch-up 结束", { backfilled: this.catchUpDelivered });
+                    }
+                    break;
+                case "connecting":
+                    this.connection.markConnecting();
+                    this.armOfflineWatchdog(client, state);
+                    break;
+                case "offline":
+                default:
+                    this.connection.markDisconnected(`mtcute state=${state}`);
+                    this.armOfflineWatchdog(client, state);
+                    break;
+            }
+            log.debug("Telegram 连接状态变化", { state });
+        };
+
+        try {
+            client.onConnectionState?.add?.(onState);
+        } catch (err) {
+            log.warn("订阅 Telegram 连接状态失败（不影响收发）", { error: String(err) });
+        }
+
+        try {
+            client.onError?.add?.((err: unknown) => {
+                if (!isCurrent()) return;
+                this.connection.noteError(String(err));
+                log.warn("Telegram client error", { error: String(err) });
+            });
+        } catch {
+            // 老版本没有 onError，忽略
+        }
+    }
+
+    private armOfflineWatchdog(client: any, state: string): void {
+        if (this.offlineWatchdog) return;
+        this.offlineWatchdog = setTimeout(() => {
+            this.offlineWatchdog = null;
+            if (this.stopRequested || (this.client && this.client !== client)) return;
+            log.warn("Telegram 长时间未恢复连接，重建 client", {
+                state,
+                timeoutMs: TelegramAdapter.OFFLINE_RECOVERY_TIMEOUT_MS,
+            });
+            void this.rebuildAfterStall();
+        }, TelegramAdapter.OFFLINE_RECOVERY_TIMEOUT_MS);
+        if (this.offlineWatchdog.unref) this.offlineWatchdog.unref();
+    }
+
+    private clearOfflineWatchdog(): void {
+        if (!this.offlineWatchdog) return;
+        clearTimeout(this.offlineWatchdog);
+        this.offlineWatchdog = null;
+    }
+
+    private backfillDownloadMedia(): boolean {
+        try {
+            return resolveBackfillConfig(loadConfig().backfill).downloadMedia;
+        } catch {
+            return false;
+        }
+    }
+
+    /** catch-up 消息是否"过旧或超量"（需要跳过 LLM 参与的聚类环节） */
+    private isStaleCatchUp(timestamp: string): boolean {
+        let budget: ReturnType<typeof resolveBackfillConfig>;
+        try {
+            budget = resolveBackfillConfig(loadConfig().backfill);
+        } catch {
+            return false;
+        }
+
+        const recordingBudget = budget.maxChats * budget.maxMessagesPerChat;
+        if (this.catchUpDelivered > recordingBudget) return true;
+
+        const ts = Date.parse(timestamp);
+        if (!Number.isFinite(ts)) return false;
+        return Date.now() - ts > budget.maxAgeMinutes * 60_000;
+    }
+
+    /**
+     * 补抓离线期间漏掉的消息（catch-up 的兜底）。
+     *
+     * mtcute 的 catchUp 已能覆盖大部分场景，但 gap 太大时服务端会返回
+     * differenceTooLong，逐条更新就拿不到了。此时对 userbot 用
+     * iterDialogs（带 unreadCount）+ getHistory 精确补齐。
+     *
+     * bot 模式无法调用 messages.getHistory（Telegram 禁止 bot 读历史），
+     * 只能依赖 catchUp，这里直接返回并说明原因。
+     */
+    async fetchMissedMessages(options: BackfillOptions): Promise<BackfillResult> {
+        if (!this.client) {
+            return { chats: 0, messages: 0, notes: ["telegram adapter 未连接"] };
+        }
+        if (this.config.mode === "bot") {
+            return {
+                chats: 0,
+                messages: 0,
+                notes: ["bot 模式无历史读取权限（Telegram 禁止 bot 调 messages.getHistory），仅依赖 catchUp"],
+            };
+        }
+        if (typeof this.client.iterDialogs !== "function" || typeof this.client.getHistory !== "function") {
+            return { chats: 0, messages: 0, notes: ["当前 client 不支持 iterDialogs/getHistory"] };
+        }
+
+        const notes: string[] = [];
+        const skipMediaDownload = !this.backfillDownloadMedia();
+        const selfCompositeId = this.selfUser?.id
+            ? composeChatId("telegram", String(this.selfUser.id))
+            : "";
+        let chatsTouched = 0;
+        let delivered = 0;
+
+        // 1. 找出候选会话：有未读的对话 + 本地已知的会话（两者取并集，按上限截断）
+        const candidates = new Map<string, { rawId: string; unread: number }>();
+        try {
+            for await (const dialog of this.client.iterDialogs({ limit: Math.max(options.maxChats * 2, 20) })) {
+                const peer = (dialog as { peer?: { id?: unknown } })?.peer;
+                const rawId = String(peer?.id ?? "");
+                if (!rawId) continue;
+                const unread = Number((dialog as { unreadCount?: unknown })?.unreadCount ?? 0);
+                const chatId = composeChatId("telegram", rawId);
+                if (unread > 0 || options.knownChatIds.includes(chatId)) {
+                    candidates.set(chatId, { rawId, unread });
+                }
+                if (candidates.size >= options.maxChats) break;
+            }
+        } catch (err) {
+            notes.push(`iterDialogs 失败: ${String(err).slice(0, 120)}`);
+        }
+
+        // 2. 逐个会话拉历史，只投递水位线之后的消息
+        for (const [chatId, info] of candidates) {
+            const watermark = options.getWatermark(chatId);
+            let chatDelivered = 0;
+
+            try {
+                const limit = Math.min(
+                    options.maxMessagesPerChat,
+                    // 有未读数时按未读数多取一点，避免边界漏掉
+                    info.unread > 0 ? info.unread + 5 : options.maxMessagesPerChat,
+                );
+                const history = await this.client.getHistory(Number(info.rawId) || info.rawId, { limit });
+                if (!Array.isArray(history)) continue;
+
+                // getHistory 返回新→旧，反转成时间正序投递
+                for (const raw of [...history].reverse()) {
+                    const normalized = await this.normalizeIncomingMessage(raw, { skipMediaDownload });
+                    if (!normalized || !normalized.messageId || !normalized.text) continue;
+                    if (normalized.chatId !== chatId) continue;
+                    // 自己发的消息不需要补抓
+                    if (selfCompositeId && normalized.userId === selfCompositeId) continue;
+                    if (!isNewerThanWatermark(
+                        { messageId: normalized.messageId, timestamp: normalized.timestamp },
+                        watermark,
+                        "numeric-id",
+                        options.since,
+                    )) continue;
+
+                    options.deliver(buildTelegramNcMessage(normalized));
+                    chatDelivered++;
+                    if (chatDelivered >= options.maxMessagesPerChat) break;
+                }
+            } catch (err) {
+                notes.push(`${chatId} getHistory 失败: ${String(err).slice(0, 120)}`);
+                continue;
+            }
+
+            if (chatDelivered > 0) {
+                chatsTouched++;
+                delivered += chatDelivered;
+                log.info("Telegram 补抓会话", { chatId, delivered: chatDelivered, unread: info.unread });
+            }
+        }
+
+        return { chats: chatsTouched, messages: delivered, notes: summarizeBackfillNotes(notes) };
+    }
+
+    private async rebuildAfterStall(): Promise<void> {
+        try {
+            await this.teardownClient("offline recovery timeout");
+            await this.start();
+        } catch (err) {
+            log.warn("Telegram 重建 client 失败，等待自动重连", { error: String(err) });
+        }
+    }
+
+    /** 销毁当前 client，但不进入 stopped 状态（用于重连） */
+    private async teardownClient(reason: string): Promise<void> {
+        this.clearOfflineWatchdog();
+        // bump 世代号：旧 client 的连接状态监听器立即失效
+        this.clientGeneration++;
+        this.catchingUp = false;
+        const client = this.client;
+        this.client = null;
+        this.selfUser = null;
+        if (!client) return;
+
+        try {
+            if (this.messageHandler) {
+                client.onNewMessage?.remove?.(this.messageHandler);
+            }
+            await client.destroy?.();
+        } catch (err) {
+            log.warn("Telegram client 销毁失败", { reason, error: String(err) });
+        }
+        this.messageHandler = null;
+    }
+
+    private scheduleReconnect(reason: string): void {
+        if (this.stopRequested || this.reconnectTimer) return;
+        this.reconnectAttempts++;
+        const delay = Math.min(
+            TelegramAdapter.RECONNECT_BASE_MS * Math.pow(2, this.reconnectAttempts - 1),
+            TelegramAdapter.RECONNECT_MAX_MS,
+        );
+        this.connection.markRetryScheduled(this.reconnectAttempts, delay);
+        log.info(`TelegramAdapter 将在 ${delay}ms 后重连 (第 ${this.reconnectAttempts} 次)`, { reason });
+        this.reconnectTimer = setTimeout(async () => {
+            this.reconnectTimer = null;
+            if (this.stopRequested) return;
+            try {
+                await this.teardownClient("reconnect");
+                await this.start();
+            } catch (err) {
+                log.warn("TelegramAdapter 重连失败", { error: String(err) });
+            }
+        }, delay);
+        if (this.reconnectTimer.unref) this.reconnectTimer.unref();
+    }
+
+    private clearReconnectTimer(): void {
+        if (!this.reconnectTimer) return;
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
     }
 
     canHandle(method: string): boolean {
@@ -600,7 +918,8 @@ export class TelegramAdapter implements PlatformAdapter {
             case "telegram.getChatMembers": {
                 const peer = await this.ensurePeerCached(args[0]);
                 const peers = await this.client.getChatMembers(peer, args[1]);
-                return peers.map((p: any) => this.normalizePeer(p));
+                // mtcute ChatMember 的 id/username 在 .user 子对象里，展平后才能拿到
+                return peers.map((p: any) => this.normalizePeer(p?.user ?? p));
             }
             case "telegram.getHistory": {
                 try {
@@ -1953,12 +2272,7 @@ export class TelegramAdapter implements PlatformAdapter {
         }
     }
 
-    // ─── /invisible & /mute 公开查询方法 ───
-
-    /** 检查用户是否处于 invisible 状态 */
-    isUserInvisible(userId: string): boolean {
-        return this.invisibleUsers.has(userId);
-    }
+    // ─── /mute 公开查询方法（invisible/blocked 已迁移到跨平台 userGate） ───
 
     /** 检查聊天是否被 mute（未过期） */
     isChatMuted(chatId: string): boolean {
@@ -2009,27 +2323,6 @@ export class TelegramAdapter implements PlatformAdapter {
         return result;
     }
 
-    /**
-     * 入站白名单：enabled 时，群组消息仅当 chat rawId 在 groups 中通过；
-     * 私聊仅当 rawId 在 users 中通过。
-     */
-    private passesTelegramWhitelist(
-        normalized: NormalizedIncomingMessage,
-    ): boolean {
-        const wl = this.config.whitelist;
-        if (!wl?.enabled) return true;
-        let rawId: string;
-        try {
-            rawId = parseChatId(normalized.chatId).rawId;
-        } catch {
-            rawId = normalizeWhitelistId(normalized.chatId);
-        }
-        if (normalized.isDirectMessage) {
-            return this.whitelistUserIds.has(rawId);
-        }
-        return this.whitelistGroupIds.has(rawId);
-    }
-
     /** 将指定聊天标记为已读（通过 Telegram readHistory） */
     async markAsRead(chatId: string): Promise<void> {
         try {
@@ -2061,19 +2354,16 @@ export class TelegramAdapter implements PlatformAdapter {
             }
         }
 
-        // ── /invisible ──
+        // ── /invisible ──（跨平台 userGate 统一维护隐身集）
         if (/^\/invisible(?:@\S+)?$/i.test(text)) {
             const userId = normalized.userId;
-            if (this.invisibleUsers.has(userId)) {
-                this.invisibleUsers.delete(userId);
-                saveInvisibleUsers(this.invisibleUsers);
-                log.info("/invisible OFF", { userId, chatId: normalized.chatId });
-                await this.replySafe(normalized.chatId, `👁 你已取消隐身。Bot 将正常处理你的消息。`, 8000);
-            } else {
-                this.invisibleUsers.add(userId);
-                saveInvisibleUsers(this.invisibleUsers);
+            const nowInvisible = userGate.toggleInvisible(userId);
+            if (nowInvisible) {
                 log.info("/invisible ON", { userId, chatId: normalized.chatId });
                 await this.replySafe(normalized.chatId, `🫥 你已开启隐身。你的所有消息将对 Bot 完全不可见（不处理、不记录）。再次发送 /invisible 可取消。`, 8000);
+            } else {
+                log.info("/invisible OFF", { userId, chatId: normalized.chatId });
+                await this.replySafe(normalized.chatId, `👁 你已取消隐身。Bot 将正常处理你的消息。`, 8000);
             }
             return true;
         }
@@ -2665,7 +2955,10 @@ export class TelegramAdapter implements PlatformAdapter {
         }
     }
 
-    private async normalizeIncomingMessage(msg: any): Promise<NormalizedIncomingMessage | null> {
+    private async normalizeIncomingMessage(
+        msg: any,
+        opts?: { skipMediaDownload?: boolean },
+    ): Promise<NormalizedIncomingMessage | null> {
         const plain = this.normalizeMessage(msg);
         if (!plain.chat?.id) return null;
 
@@ -2678,7 +2971,13 @@ export class TelegramAdapter implements PlatformAdapter {
         // ── 媒体元数据提取 ──
         const mediaInfo = plain.mediaInfo;
         if (mediaInfo && plain.id) {
-            await this.downloadIncomingMedia(mediaInfo, chatId, plain.id, plain.media);
+            // 补抓一批历史消息时逐条下载媒体会打爆 vision / 磁盘，默认跳过；
+            // 需要的话 agent 可以事后用 telegram.downloadMedia 单独取。
+            if (opts?.skipMediaDownload) {
+                mediaInfo.downloadStatus = "skipped_backfill";
+            } else {
+                await this.downloadIncomingMedia(mediaInfo, chatId, plain.id, plain.media);
+            }
         }
 
         // 对纯 media 消息生成占位文本，确保 text 非空
@@ -2948,6 +3247,15 @@ async function defaultTelegramClientFactory(config: TelegramConfig): Promise<Tel
         apiId: Number(config.apiId),
         apiHash: config.apiHash,
         storage: "workspace/tg-session/account",
+        // 离线补抓的核心开关。
+        // 默认 catchUp=false 时 mtcute 启动会把本地 pts 直接对齐到服务端当前值，
+        // 等于主动丢弃离线期间的所有更新。打开后会走 updates.getDifference，
+        // 漏掉的消息按普通 onNewMessage 派发（catch-up 期间连接状态为 "updating"，
+        // adapter 借此把它们标记为 backfill，避免逐条唤醒）。
+        updates: {
+            catchUp: true,
+            catchUpChannels: true,
+        },
     };
     if (proxyUrl) {
         const url = new URL(proxyUrl.replace(/^socks5:\/\//, "socks5h://").replace(/^socks:\/\//, "socks5h://"));

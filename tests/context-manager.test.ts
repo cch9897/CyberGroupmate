@@ -19,8 +19,10 @@ import {
     classifyMessages,
     identifyProtectedMessages,
     compact,
+    forceTrim,
     mergeContextBudget,
     DEFAULT_CONTEXT_BUDGET,
+    FORCE_TRIM_MARKER,
     type ContextBudget,
 } from "../src/memory-v2/context-manager.js";
 import type { ChatMessage } from "../src/core/llm.js";
@@ -114,6 +116,20 @@ describe("estimateMessagesTokens", () => {
         // CJK 启发式: ~75
         assert.ok(tokens > 0, `总 tokens ${tokens} > 0`);
         assert.ok(tokens <= 100, `总 tokens ${tokens} <= 100`);
+    });
+
+    it("includes native reasoning token usage", () => {
+        const visibleOnly = estimateMessagesTokens([{ role: "assistant", content: "ok" }]);
+        const withReasoning = estimateMessagesTokens([{
+            role: "assistant",
+            content: "ok",
+            reasoning: {
+                provider: "openai_responses",
+                items: [{ type: "reasoning", encrypted_content: "opaque" }],
+                tokenCount: 123,
+            },
+        }]);
+        assert.equal(withReasoning, visibleOnly + 123);
     });
 });
 
@@ -402,6 +418,191 @@ describe("session rolling truncation 已替换", () => {
         assert.ok(
             executorContent.includes("await contextManagerCompact("),
             "code-act-executor 应包含 context-manager compact 调用"
+        );
+    });
+
+    it("code-act-executor 在 compact 失败时有强制裁剪兜底", async () => {
+        const { readFileSync } = await import("node:fs");
+        const executorContent = readFileSync("src/subagent/code-act-executor.ts", "utf-8");
+        assert.ok(
+            executorContent.includes("forceTrimSession"),
+            "code-act-executor 应含 forceTrimSession 兜底"
+        );
+    });
+});
+
+// ─── 10. 强制裁剪（compact 模型不可用兜底） ───
+
+describe("forceTrim", () => {
+    /** 小窗口 session 模型：用于稳定触发超窗 */
+    const smallWindowProfile: LLMConfig = {
+        provider: "openai",
+        baseUrl: "http://127.0.0.1:1/v1",
+        apiKey: "test",
+        model: "session-small-window",
+        temperature: 0,
+        maxTokens: 100,
+        maxContextTokens: 800,
+    };
+
+    function oversizedMessages(): ChatMessage[] {
+        return [
+            { role: "system", content: "SYSTEM PROMPT" },
+            ...makeMessages(20, 400),
+        ];
+    }
+
+    it("丢弃未受保护的候选，保留 system prompt 和尾部", () => {
+        const messages = oversizedMessages();
+
+        const result = forceTrim(messages, undefined, { targetLlmConfig: smallWindowProfile });
+
+        assert.ok(result.dropped > 0, "应丢弃消息");
+        assert.ok(result.messages.length < messages.length, "裁剪后条数应减少");
+        assert.equal(result.messages[0].role, "system");
+        assert.equal(result.messages[0].content, "SYSTEM PROMPT", "system prompt 必须保留");
+        // 尾部消息保留（预算极小时内容可能被截断，但不会被整条丢弃）
+        assert.match(
+            result.messages[result.messages.length - 1].content,
+            /^消息 19: /,
+            "最后一条消息（尾部）必须保留",
+        );
+    });
+
+    it("插入强制裁剪占位说明，且不生成假摘要", () => {
+        const result = forceTrim(oversizedMessages(), undefined, {
+            targetLlmConfig: smallWindowProfile,
+            reason: "compact 模型不可用",
+        });
+
+        const note = result.messages[1];
+        assert.equal(note.scope, "context-briefing");
+        assert.ok(note.content.includes(FORCE_TRIM_MARKER), "应含强制裁剪标记");
+        assert.ok(note.content.includes("compact 模型不可用"), "应写入裁剪原因");
+        assert.ok(!note.content.includes("Context Briefing"), "不应伪装成摘要");
+    });
+
+    it("裁剪后回到预算内", () => {
+        const messages = oversizedMessages();
+        assert.ok(shouldCompact(messages, undefined, smallWindowProfile), "前置条件：应超窗");
+
+        const result = forceTrim(messages, undefined, { targetLlmConfig: smallWindowProfile });
+
+        assert.equal(result.stillOverBudget, false, "裁剪后不应仍然超预算");
+        assert.equal(
+            shouldCompact(result.messages, undefined, smallWindowProfile),
+            false,
+            "裁剪后 shouldCompact 应为 false",
+        );
+    });
+
+    it("未超预算时原样返回", () => {
+        const messages: ChatMessage[] = [
+            { role: "system", content: "s" },
+            { role: "user", content: "hi" },
+            { role: "assistant", content: "hello" },
+        ];
+        const result = forceTrim(messages, undefined, {
+            targetLlmConfig: { ...smallWindowProfile, maxContextTokens: 100_000 },
+        });
+
+        assert.equal(result.dropped, 0);
+        assert.equal(result.truncated, false);
+        assert.equal(result.messages, messages, "应返回原数组引用");
+    });
+
+    it("单条超大消息会被截断而不是无限超窗", () => {
+        const bulk = (word: string) => `${word} `.repeat(1_500);
+        const messages: ChatMessage[] = [
+            { role: "system", content: "s" },
+            { role: "user", content: bulk("alpha") },
+            { role: "assistant", content: bulk("beta") },
+            { role: "user", content: bulk("gamma") },
+        ];
+
+        const result = forceTrim(messages, undefined, { targetLlmConfig: smallWindowProfile });
+
+        assert.equal(result.truncated, true, "应触发内容截断");
+        assert.ok(
+            estimateMessagesTokens(result.messages) < estimateMessagesTokens(messages),
+            "截断后 token 应减少",
+        );
+    });
+});
+
+describe("compact 在摘要模型不可用时强制裁剪", () => {
+    const targetProfile: LLMConfig = {
+        provider: "openai",
+        baseUrl: "http://127.0.0.1:1/v1",
+        apiKey: "test",
+        model: "session-small-window",
+        temperature: 0,
+        maxTokens: 100,
+        maxContextTokens: 800,
+    };
+
+    function oversizedMessages(): ChatMessage[] {
+        return [
+            { role: "system", content: "SYSTEM PROMPT" },
+            ...makeMessages(20, 400),
+        ];
+    }
+
+    it("没有配置 compact 模型 → 强制裁剪而不是原样返回超窗上下文", async () => {
+        const messages = oversizedMessages();
+
+        const result = await compact(messages, [], undefined, { targetLlmConfig: targetProfile });
+
+        assert.notEqual(result, messages, "不应原样返回");
+        assert.ok(result.length < messages.length, "应已裁剪");
+        assert.ok(
+            result.some((m) => m.content.includes(FORCE_TRIM_MARKER)),
+            "应含强制裁剪标记",
+        );
+        assert.equal(
+            shouldCompact(result, undefined, targetProfile),
+            false,
+            "裁剪后应回到预算内",
+        );
+    });
+
+    it("compact 模型调用失败 → 强制裁剪并保留尾部", async () => {
+        const messages = oversizedMessages();
+
+        // 起一个立刻返回 400 的假 endpoint，模拟"compact 模型坏了"
+        // （400 属于不可重试错误，测试不会卡在退避上）
+        const { createServer } = await import("node:http");
+        const server = createServer((_req, res) => {
+            res.writeHead(400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: { message: "compact model is broken" } }));
+        });
+        await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+        const port = (server.address() as { port: number }).port;
+
+        let result: ChatMessage[];
+        try {
+            const brokenCompactProfile: LLMConfig = {
+                ...targetProfile,
+                model: "broken-compact-model",
+                baseUrl: `http://127.0.0.1:${port}/v1`,
+            };
+            result = await compact(messages, [brokenCompactProfile], undefined, {
+                targetLlmConfig: targetProfile,
+            });
+        } finally {
+            await new Promise<void>((resolve) => server.close(() => resolve()));
+        }
+
+        assert.ok(result.length < messages.length, "应已裁剪");
+        assert.ok(
+            result.some((m) => m.content.includes(FORCE_TRIM_MARKER)),
+            "应含强制裁剪标记",
+        );
+        assert.match(result[result.length - 1].content, /^消息 19: /, "尾部消息必须保留");
+        assert.equal(
+            shouldCompact(result, undefined, targetProfile),
+            false,
+            "裁剪后应回到预算内",
         );
     });
 });

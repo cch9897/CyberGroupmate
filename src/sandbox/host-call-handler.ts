@@ -15,6 +15,7 @@ import {
     resolveComponentProfiles,
     saveConfig,
     validateConfig,
+    DEFAULT_EMERGENCY_BLOCK_MESSAGE,
     type AppConfig,
     type EnvironmentVariable,
 } from "../core/config.js";
@@ -33,6 +34,7 @@ import { createMemoryApi, scrubDossiers, scrubIdentityMatches } from "../meta-sa
 import { createPrivacyApi } from "../meta-sandbox/meta-api/privacy.js";
 import type { AttentionAccumulator } from "../accumulator/attention-accumulator.js";
 import type { PlatformAdapter } from "../adapter/platform-adapter.js";
+import { userGate } from "../adapter/user-gate.js";
 import { getTelegramMtcuteWriteTarget, TELEGRAM_MTCUTE_WRITE_METHODS } from "../core/telegram-mtcute-passthrough.js";
 import { getOneBotNapCatWriteTarget, isOneBotNapCatWriteAction, normalizeOneBotNapCatAction } from "../core/onebot-napcat-passthrough.js";
 import { timestampInputToIso } from "../core/timezone.js";
@@ -668,7 +670,19 @@ export function createSandboxHostCallHandler(chatId: string, deps: CreateSandbox
         }
 
         if (method === "vision.see") {
-            const imagePaths = args as string[];
+            const first = args[0];
+            const hasOptions = first && typeof first === "object" && !Array.isArray(first);
+            let customPrompt: string | undefined;
+            let imagePaths: string[];
+            if (hasOptions) {
+                const opts = first as { prompt?: unknown };
+                if (typeof opts.prompt === "string" && opts.prompt.trim()) {
+                    customPrompt = opts.prompt.trim();
+                }
+                imagePaths = args.slice(1) as string[];
+            } else {
+                imagePaths = args as string[];
+            }
             if (!imagePaths || imagePaths.length === 0) {
                 throw new Error("vision.see() 至少需要传入一个图片路径");
             }
@@ -706,7 +720,7 @@ export function createSandboxHostCallHandler(chatId: string, deps: CreateSandbox
                 };
                 const mimeType = mimeMap[ext] ?? "image/png";
                 const { buffer, mimeType: finalMime } = await ensureSupportedFormat(rawBuffer, mimeType);
-                return describeImage(buffer, finalMime, visionConfigs);
+                return describeImage(buffer, finalMime, visionConfigs, customPrompt);
             }));
 
             return results;
@@ -753,7 +767,16 @@ export function createSandboxHostCallHandler(chatId: string, deps: CreateSandbox
             const ctx = policy();
             // R1（显式 target）：显式查别的私密会话的群内画像 → 收窄回当前会话视角。
             const effective = (targetChatId && isExplicitReadBlocked(targetChatId, ctx)) ? chatId : (targetChatId ?? chatId);
-            const profile = memory.getUserProfile(userId, effective) as unknown as Record<string, unknown> | null;
+            // Alias fallback: agent 可能传 displayName/username 而非规范 userId
+            let resolvedUserId = userId;
+            if (!memory.getPersonIdentity(userId)) {
+                const aliasHits = memory.searchByAlias(userId, 1);
+                if (aliasHits.length > 0) {
+                    resolvedUserId = aliasHits[0].userId;
+                    log.info("getUserProfile alias resolved", { from: userId, to: resolvedUserId } as any);
+                }
+            }
+            const profile = memory.getUserProfile(resolvedUserId, effective) as unknown as Record<string, unknown> | null;
             if (profile && Array.isArray((profile as { recentFacts?: unknown[] }).recentFacts)) {
                 (profile as { recentFacts: unknown[] }).recentFacts =
                     scrubFactsByVisibility((profile as { recentFacts: any[] }).recentFacts, ctx, method).kept;
@@ -962,6 +985,35 @@ export function createSandboxHostCallHandler(chatId: string, deps: CreateSandbox
                 return privacyApi.markSensitive(target, reason);
             }
             return privacyApi.status(target);
+        }
+
+        // emergency.block：紧急拉黑对方（跨平台）。新拉黑时发一次预设文案 + 拉黑（幂等，只能拉不能解）。
+        if (method === "emergency.block") {
+            const platform = getPlatform(chatId);
+            const rawUserId = args[0] as string | undefined;
+            // 省略 userId 时默认拉黑当前会话对方（私聊场景 chatId 即对端 composite id）。
+            let target = typeof rawUserId === "string" && rawUserId.trim().length > 0 ? rawUserId.trim() : chatId;
+            if (!target.includes(":")) target = ensureCompositeId(platform, target);
+            const rawReason = args[1] as string | undefined;
+            const reason = typeof rawReason === "string" && rawReason.trim().length > 0 ? rawReason.trim() : undefined;
+
+            const { newlyBlocked } = userGate.block(target);
+            let notified = false;
+            if (newlyBlocked) {
+                // 通过当前平台 adapter 的 sendText 发一次预设文案（send 失败不影响拉黑）。
+                const adapter = adapters.find(a => a.platform === platform);
+                const message = loadConfig().emergencyBlock?.message ?? DEFAULT_EMERGENCY_BLOCK_MESSAGE;
+                if (adapter) {
+                    try {
+                        await adapter.handleCall(`${platform}.sendText`, [chatId, message]);
+                        notified = true;
+                    } catch (err) {
+                        log.warn("emergency.block: 预设文案发送失败", { chatId, error: String(err).slice(0, 120) });
+                    }
+                }
+            }
+            log.info("emergency.block", { boundChatId: chatId, target, reason: reason?.slice(0, 120), newlyBlocked, notified });
+            return { userId: target, blocked: true, alreadyBlocked: !newlyBlocked, notified };
         }
 
         if (method === "mcp.list") {

@@ -44,6 +44,40 @@
 
   $: isCurrentChatMuted = $selectedChatId ? mutedChatIds.has($selectedChatId) : false;
   $: anyMuted = mutedChatIds.size > 0;
+
+  // ─── 静默模式（quietMode / mention-only）状态 ───
+  // 开启后：普通群消息仍本地落盘，但不进入 recording pipeline、不触发任何 LLM；
+  // 只有被直接提及（DM / @ / 触发词 / 回复）时才唤醒并获取最近上下文。
+  let quietByChat = {};  // chatId → bool
+  let quietLoading = false;
+
+  async function loadQuietMode(chatId) {
+    if (!chatId) return;
+    try {
+      const res = await api(`/memory/group/${encodeURIComponent(chatId)}`);
+      const model = res?.model ?? res ?? {};
+      quietByChat = { ...quietByChat, [chatId]: !!model.quietMode };
+    } catch { /* ignore */ }
+  }
+
+  // 切换选中会话时加载其 quietMode（依赖 $selectedChatId，变化时自动重跑）
+  $: if ($selectedChatId) loadQuietMode($selectedChatId);
+  $: isCurrentChatQuiet = $selectedChatId ? !!quietByChat[$selectedChatId] : false;
+
+  async function toggleChatQuiet() {
+    if (!$selectedChatId || quietLoading) return;
+    const chatId = $selectedChatId;
+    const next = !quietByChat[chatId];
+    quietLoading = true;
+    try {
+      await api(`/memory/group/${encodeURIComponent(chatId)}`, { method: "PUT", body: { quietMode: next } });
+      quietByChat = { ...quietByChat, [chatId]: next };
+    } catch (e) {
+      alert("切换静默模式失败: " + e.message);
+    } finally {
+      quietLoading = false;
+    }
+  }
   // 全局禁言 = 所有已知群都被 mute
   $: isGlobalMuted = allChatIds.length > 0 && allChatIds.every(id => mutedChatIds.has(id));
   // 当前群是因为全局禁言而被 mute（不是单独 mute 的）
@@ -319,6 +353,16 @@
                 {#if reflecting}<span class="loading loading-spinner loading-xs"
                   ></span>{:else}<i class="fa-solid fa-brain"></i>{/if}
                 Reflect
+              </button>
+              <button
+                class="btn btn-xs {isCurrentChatQuiet ? 'btn-warning' : 'btn-ghost'}"
+                title={isCurrentChatQuiet ? '静默模式：仅被直接提及（DM/@/触发词/回复）时响应，群消息不进入 recording pipeline / LLM。点击关闭。' : '正常模式：处理全部群消息。点击开启静默（仅提及时响应）。'}
+                disabled={quietLoading}
+                onclick={toggleChatQuiet}
+              >
+                {#if quietLoading}<span class="loading loading-spinner loading-xs"
+                  ></span>{:else}<i class="fa-solid {isCurrentChatQuiet ? 'fa-moon' : 'fa-comments'}"></i>{/if}
+                {isCurrentChatQuiet ? '静默' : '正常'}
               </button>
             </div>
           {:else}

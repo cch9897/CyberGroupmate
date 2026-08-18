@@ -34,6 +34,7 @@ export const appState = writable({
   globalState: {},
   sandboxPool: {},
   mainLoop: {},
+  adapters: [],
 });
 
 // ─── Messages ───

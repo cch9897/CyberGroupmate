@@ -3,7 +3,6 @@
   export let telegramEnabled = false;
   export let pwFocus;
   export let pwBlur;
-  import MonacoEditor from "../../components/MonacoEditor.svelte";
 </script>
 
 <h3 class="card-title text-sm">
@@ -117,48 +116,4 @@
       >
     </div>
   {/if}
-  <div class="divider text-xs opacity-50 my-3">
-    入站白名单 <span class="restart-hint"
-      ><i class="fa-solid fa-rotate-right"></i> 修改需重启</span
-    >
-  </div>
-  <p class="text-xs opacity-50 mb-2">启用后仅处理列表中的群组或私聊；私聊按对方用户 ID 匹配。</p>
-  <label class="cfg-check mb-2">
-    <input
-      type="checkbox"
-      class="toggle toggle-xs"
-      bind:checked={config.telegram.whitelist.enabled}
-    />
-    <span>启用白名单</span>
-  </label>
-  <div class="cfg-grid-2">
-    <div class="cfg-field col-span-2"
-      ><span class="cfg-label">群组 ID（每行一个，如 -1001234567890）</span>
-      <MonacoEditor
-        language="plaintext"
-        height={120}
-        value={config.telegram.whitelist.groups.join("\n")}
-        on:change={(e) => {
-          config.telegram.whitelist.groups = e.detail.value
-            .split(/\r?\n/)
-            .map((s) => s.trim())
-            .filter(Boolean);
-        }}
-      /></div
-    >
-    <div class="cfg-field col-span-2"
-      ><span class="cfg-label">私聊用户 ID（每行一个）</span>
-      <MonacoEditor
-        language="plaintext"
-        height={120}
-        value={config.telegram.whitelist.users.join("\n")}
-        on:change={(e) => {
-          config.telegram.whitelist.users = e.detail.value
-            .split(/\r?\n/)
-            .map((s) => s.trim())
-            .filter(Boolean);
-        }}
-      /></div
-    >
-  </div>
 </div>

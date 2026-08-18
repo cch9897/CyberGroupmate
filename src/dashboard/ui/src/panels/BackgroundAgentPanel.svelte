@@ -16,6 +16,8 @@
   let selectedEventsRunId = null;
   let eventLogSource = 'memory';
   let visibleEvents = [];
+  // 智能轮询：有运行中的任务时拉 events，否则只刷新状态
+  const POLL_INTERVAL = 10000;       // 状态轮询：10s（原 2.5s 太猛）
 
   $: allRuns = status?.enabled
     ? [status.currentRun, ...(status.runs ?? [])].filter(Boolean)
@@ -44,7 +46,9 @@
       status = next;
       const runId = selectedRunId ?? next.currentRun?.id ?? next.runs?.[0]?.id;
       if (!selectedRunId && runId) selectedRunId = runId;
-      if (runId) await loadRunEvents(runId, selectedEventsRunId === runId);
+      // 只在选中运行正在执行或首次加载时才拉 events
+      const needsEvents = selectedRun && (!selectedRun.endedAt || selectedEvents.length === 0);
+      if (runId && needsEvents) await loadRunEvents(runId, selectedEventsRunId === runId);
     } catch (e) {
       status = { enabled: false, error: String(e) };
     }
@@ -276,6 +280,11 @@
     const subtype = ev.subtype == null ? '' : String(ev.subtype);
     if (NOISE.has(type) || (subtype && (NOISE.has(subtype) || NOISE.has(`${type}/${subtype}`)))) return [];
 
+    // Codex CLI (`codex exec --json`)
+    if (type === 'error') return [{ kind: 'error', text: stringifyContent(ev.message ?? ev.error ?? ev) }];
+    if (type.startsWith('thread.') || type.startsWith('turn.')) return [codexLifecycle(ev, type)];
+    if (type.startsWith('item.')) return codexItem(ev, type);
+
     // Claude Code (stream-json)
     if (type === 'assistant') return claudeAssistant(ev);
     if (type === 'user') return claudeUser(ev);
@@ -367,6 +376,83 @@
     return { kind: 'result', label: '运行结果', text: typeof ev.result === 'string' ? ev.result : '', chips };
   }
 
+  function codexLifecycle(ev, type) {
+    if (type === 'thread.started') {
+      return { kind: 'session', label: 'Codex 会话', chips: [{ k: 'Thread', v: ev.thread_id }] };
+    }
+    if (type === 'turn.started') return { kind: 'session', label: 'Codex 回合开始' };
+    if (type === 'turn.failed') {
+      return { kind: 'error', label: 'Codex 回合失败', text: stringifyContent(ev.error ?? ev.message ?? '') };
+    }
+    if (type === 'turn.completed') {
+      const usage = ev.usage ?? {};
+      const chips = [
+        { k: '输入', v: usage.input_tokens },
+        { k: '缓存', v: usage.cached_input_tokens },
+        { k: '输出', v: usage.output_tokens },
+        { k: '推理', v: usage.reasoning_output_tokens },
+      ].filter((c) => c.v != null);
+      return { kind: 'result', label: 'Codex 回合完成', chips };
+    }
+    return { kind: 'session', label: type.replace('.', ' · ') };
+  }
+
+  function codexItem(ev, type) {
+    const item = ev.item ?? {};
+    const completed = type === 'item.completed';
+    if (item.type === 'agent_message') {
+      return completed && item.text ? [{ kind: 'assistant', text: item.text }] : [];
+    }
+    if (item.type === 'reasoning') {
+      return completed && item.text ? [{ kind: 'thinking', text: item.text }] : [];
+    }
+    if (item.type === 'command_execution') {
+      if (!completed) {
+        return type === 'item.started'
+          ? [{ kind: 'tool_use', tool: { name: 'shell', input: item.command } }]
+          : [];
+      }
+      return [{
+        kind: 'tool_result',
+        tool: {
+          name: 'shell',
+          ok: item.status === 'completed' && (item.exit_code == null || item.exit_code === 0),
+          output: stringifyContent(item.aggregated_output ?? item.output ?? ''),
+        },
+      }];
+    }
+    if (item.type === 'mcp_tool_call') {
+      const name = [item.server, item.tool].filter(Boolean).join('.') || 'mcp';
+      if (!completed) {
+        return type === 'item.started'
+          ? [{ kind: 'tool_use', tool: { name, input: item.arguments } }]
+          : [];
+      }
+      return [{
+        kind: 'tool_result',
+        tool: {
+          name,
+          ok: item.status === 'completed' && !item.error,
+          output: stringifyContent(item.result ?? item.error ?? ''),
+        },
+      }];
+    }
+    if (item.type === 'web_search') {
+      return completed
+        ? [{ kind: 'tool_result', tool: { name: 'web_search', ok: item.status === 'completed', output: stringifyContent(item.result ?? '') } }]
+        : type === 'item.started'
+          ? [{ kind: 'tool_use', tool: { name: 'web_search', input: item.query } }]
+          : [];
+    }
+    if (item.type === 'file_change' && completed) {
+      return [{ kind: 'meta', label: '文件改动', text: stringifyContent(item.changes ?? item) }];
+    }
+    if (item.type === 'plan_update' && completed) {
+      return [{ kind: 'meta', label: '计划更新', text: stringifyContent(item.plan ?? item) }];
+    }
+    return completed ? [{ kind: 'raw', label: item.type ?? type, text: stringifyContent(item) }] : [];
+  }
+
   function copilotAssistant(ev) {
     const text = ev?.data?.content;
     if (typeof text === 'string' && text.trim()) {
@@ -403,7 +489,7 @@
 
   onMount(() => {
     refresh();
-    const timer = setInterval(refresh, 2500);
+    const timer = setInterval(refresh, POLL_INTERVAL);
     return () => clearInterval(timer);
   });
 </script>
@@ -443,7 +529,7 @@
       <div class="text-sm text-base-content/60">正在加载做梦系统状态...</div>
     {:else if !status?.enabled}
       <div class="alert">
-        <span>Background Agent 未启用。在配置编辑 → 做梦系统中选择一个 Harness 类型（Claude Code 或 Copilot CLI）。</span>
+        <span>Background Agent 未启用。在配置编辑 → 做梦系统中选择一个 Harness 类型（Claude Code、Codex CLI 或 Copilot CLI）。</span>
       </div>
     {:else}
       <div class="stats stats-vertical lg:stats-horizontal shadow-sm bg-base-200">

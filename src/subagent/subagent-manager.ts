@@ -18,6 +18,7 @@ import { CodeActExecutor } from "./code-act-executor.js";
 import type { SubagentConfig, GroupStickiness, StickinessLevel } from "./types.js";
 import { DEFAULT_SUBAGENT_CONFIG } from "./types.js";
 import { createLogger } from "../core/logger.js";
+import { loadConfig } from "../core/config.js";
 import { existsSync, readdirSync, mkdirSync } from "node:fs";
 import { join, basename } from "node:path";
 import { chatIdToFileName, fileNameToChatId, getPlatform, type PlatformName } from "../core/chat-id.js";
@@ -162,7 +163,12 @@ export class SubagentManager {
 
                         // 创建 CodeActExecutor 并恢复 session
                         if (!subagent.codeActExecutor) {
-                            const executor = new CodeActExecutor(chatId);
+                            const codeActCfg = loadConfig().subagent?.codeAct;
+                            const executor = new CodeActExecutor(chatId, codeActCfg ? {
+                                maxExecutionTimeMs: codeActCfg.maxExecutionTimeMs,
+                                maxSessionMessages: codeActCfg.maxSessionMessages,
+                                maxTurns: codeActCfg.maxTurns,
+                            } : undefined);
                             const loaded = executor.loadSession(filePath);
 
                             if (loaded) {
