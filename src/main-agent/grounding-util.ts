@@ -1,9 +1,10 @@
 /**
  * grounding-util.ts — 并行 Grounding（联网事实查证）工具
  *
- * 支持两个 Provider：
+ * 支持三个 Provider：
  * - Google Gemini (googleSearch tool)
  * - Grok xAI (web_search via Responses API)
+ * - Custom (OpenAI 兼容端点，经 chat/completions + web_search_options 搜索；适用于 ZenMux / OpenRouter / cliproxy 等网关)
  *
  * 设计原则：
  * 1. 对话内容先经过隐私过滤（人名替换为 User N，去除 @mention，去除时间戳）
@@ -12,6 +13,7 @@
  */
 
 import { GoogleGenAI } from "@google/genai";
+import { z } from "zod";
 import type { GroundingConfig } from "../core/config.js";
 import { groundingProvider } from "../context-engine/providers/pipeline-providers.js";
 import { createLogger } from "../core/logger.js";
@@ -318,6 +320,167 @@ async function callGrokGrounding(
     return result;
 }
 
+// Custom (OpenAI 兼容) / chat/completions 响应的最小结构（外部网关数据，zod 校验）
+const customCitationSchema = z.object({
+    type: z.literal("url_citation").optional(),
+    title: z.string().optional(),
+    url: z.string().optional(),
+    url_citation: z.object({
+        title: z.string().optional(),
+        url: z.string().optional(),
+    }).optional(),
+});
+
+const customMessageSchema = z.object({
+    content: z.string().optional(),
+    annotations: z.array(customCitationSchema).optional(),
+});
+
+const customResponseSchema = z.object({
+    choices: z.array(z.object({
+        message: customMessageSchema.optional(),
+    })).optional(),
+    usage: z.object({
+        prompt_tokens: z.number().optional(),
+        completion_tokens: z.number().optional(),
+        total_tokens: z.number().optional(),
+    }).optional(),
+});
+
+// ─── Provider: Custom (OpenAI 兼容端点, 经 web_search_options 联网搜索) ───
+
+async function callCustomGrounding(
+    config: GroundingConfig,
+    promptText: string,
+): Promise<string | undefined> {
+    const baseUrl = (config.baseUrl ?? "").replace(/\/$/, "");
+    const model = config.model ?? "";
+    if (!baseUrl || !model) {
+        log.warn("Custom Grounding 缺少 baseUrl 或 model，跳过", { baseUrl: baseUrl || undefined, model: model || undefined });
+        return undefined;
+    }
+
+    // 发射 llm:call 事件
+    const callId = nextGroundingCallId();
+    const startTime = Date.now();
+    if (llmEvents.listenerCount("llm:call") > 0) {
+        const callEvent: LLMCallEvent = {
+            callId,
+            caller: "grounding-custom",
+            model,
+            temperature: 0,
+            maxTokens: 0,
+            provider: "openai",
+            messageSummaries: [{ role: "user", contentPreview: promptText, imageCount: 0 }],
+            timestamp: new Date().toISOString(),
+        };
+        llmEvents.emit("llm:call", callEvent);
+    }
+
+    const response = await fetch(`${baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${config.apiKey}`,
+        },
+        body: JSON.stringify({
+            model,
+            messages: [{ role: "user", content: promptText }],
+            web_search_options: { search_context_size: "medium" },
+        }),
+    });
+
+    if (!response.ok) {
+        const body = await response.text().catch(() => "");
+        const errMsg = `Custom Grounding API ${response.status}: ${body.slice(0, 200)}`;
+        // 发射错误的 llm:response
+        if (llmEvents.listenerCount("llm:response") > 0) {
+            llmEvents.emit("llm:response", {
+                callId,
+                caller: "grounding-custom",
+                contentPreview: "",
+                contentLength: 0,
+                durationMs: Date.now() - startTime,
+                error: errMsg,
+                timestamp: new Date().toISOString(),
+            } as LLMResponseEvent);
+        }
+        log.warn("Custom Grounding API 错误", {
+            status: response.status,
+            body: body.slice(0, 300),
+            elapsed: `${((Date.now() - startTime) / 1000).toFixed(2)}s`,
+        });
+        return undefined;
+    }
+
+    const parsed = customResponseSchema.safeParse(await response.json());
+    if (!parsed.success) {
+        log.warn("Custom Grounding 响应格式异常", { elapsed: `${((Date.now() - startTime) / 1000).toFixed(2)}s` });
+        return undefined;
+    }
+
+    const { choices, usage } = parsed.data;
+    const message = choices?.[0]?.message;
+    const textContent = message?.content ?? "";
+    const annotations = message?.annotations ?? [];
+
+    // Guardrail: 检查是否真的执行了联网搜索（存在 url_citation 引用）
+    const hasWebSearch = annotations.some(
+        (a) => a.type === "url_citation" || a.url_citation != null,
+    );
+
+    // 发射 llm:response 事件
+    if (llmEvents.listenerCount("llm:response") > 0) {
+        const responseEvent: LLMResponseEvent = {
+            callId,
+            caller: "grounding-custom",
+            contentPreview: hasWebSearch ? textContent : "(guardrail: no url_citation)",
+            contentLength: textContent.length,
+            usage: usage ? {
+                promptTokens: usage.prompt_tokens,
+                completionTokens: usage.completion_tokens,
+                totalTokens: usage.total_tokens,
+            } : undefined,
+            durationMs: Date.now() - startTime,
+            error: hasWebSearch ? undefined : "guardrail: no search results, dropped",
+            timestamp: new Date().toISOString(),
+        };
+        llmEvents.emit("llm:response", responseEvent);
+    }
+
+    if (!textContent) {
+        log.info("Custom Grounding 返回空文本，丢弃", { elapsed: `${((Date.now() - startTime) / 1000).toFixed(2)}s` });
+        return undefined;
+    }
+
+    if (!hasWebSearch) {
+        log.info("Custom Grounding 未返回搜索引用，丢弃", { elapsed: `${((Date.now() - startTime) / 1000).toFixed(2)}s` });
+        return undefined;
+    }
+
+    // 提取搜索引用（用于日志统计；结构与 Grok 的 url_citation 一致）
+    const sources: string[] = [];
+    for (const ann of annotations) {
+        const citation = ann.url_citation ?? ann;
+        const url = citation.url;
+        if (url) {
+            sources.push(`- ${citation.title ?? url}: ${url}`);
+        }
+    }
+
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+    log.info("Custom Grounding 完成", {
+        elapsed: `${elapsed}s`,
+        model,
+        sources: sources.length,
+        tokens: usage
+            ? `${usage.prompt_tokens ?? "?"}→${usage.completion_tokens ?? "?"}`
+            : "N/A",
+    });
+
+    return textContent;
+}
+
 // ─── 对外接口 ───
 
 /**
@@ -333,10 +496,6 @@ export async function runParallelGrounding(
     messagesText: string,
     activePersons?: Array<{ displayName: string; userId?: string; username?: string }>,
 ): Promise<string | undefined> {
-    if (!config.apiKey) {
-        log.debug("Grounding 未配置 API Key，跳过");
-        return undefined;
-    }
 
     // 1. 隐私脱敏
     const sanitizedText = sanitizeForGrounding(messagesText, activePersons);
@@ -344,7 +503,6 @@ export async function runParallelGrounding(
         log.debug("Grounding 脱敏后文本过短，跳过");
         return undefined;
     }
-
     // 2. 渲染 prompt
     const promptText = groundingProvider.render({ sanitizedText });
 
@@ -354,6 +512,8 @@ export async function runParallelGrounding(
             return await callGoogleGrounding(config, promptText);
         } else if (config.provider === "grok") {
             return await callGrokGrounding(config, promptText);
+        } else if (config.provider === "custom") {
+            return await callCustomGrounding(config, promptText);
         } else {
             log.warn("未知 Grounding provider", { provider: config.provider });
             return undefined;

@@ -134,7 +134,7 @@
       if (!config.llmRouting.timeouts) config.llmRouting.timeouts = {};
       if (!config.recordingPipeline) config.recordingPipeline = {};
       if (!config.envVars) config.envVars = [];
-      if (!config.grounding) config.grounding = { provider: 'google', apiKey: '' };
+      if (!config.grounding) config.grounding = { provider: 'google', apiKey: '', enabled: true };
       if (!config.rateLimiting) config.rateLimiting = { enabled: false, maxConcurrency: 0, requestsPerMinute: 0, perProfile: {} };
       if (!config.rateLimiting.perProfile) config.rateLimiting.perProfile = {};
       // Adapter 启用状态：根据后端是否返回了有效配置来判断

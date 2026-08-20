@@ -283,7 +283,7 @@ async function maybeRunGrounding(
     deps: DispatchApiDeps,
     contentDirection: string,
 ): Promise<string | undefined> {
-    if (!deps.groundingConfig?.apiKey) {
+    if (!deps.groundingConfig?.apiKey || deps.groundingConfig?.enabled === false) {
         return undefined;
     }
 

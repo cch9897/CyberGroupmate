@@ -40,6 +40,7 @@ import type { MainAgentGlobalState, SchedulerEvent, SessionDigestEntry } from ".
 import { createCronApi, createReminderApi } from "../meta-sandbox/meta-api/scheduler.js";
 import { createTodoApi } from "../meta-sandbox/meta-api/todo.js";
 
+import { runParallelGrounding } from "../main-agent/grounding-util.js";
 const log = createLogger("dashboard-api");
 const SKILLS_ROOT = join(process.cwd(), "workspace", "skills");
 const DEBUG_EXECUTION_LOCKS = new Set<string>();
@@ -1839,6 +1840,63 @@ export function createApiRouter(deps: DashboardDeps, bridge: EventBridge): Route
         } catch (err: unknown) {
             const errMsg = err instanceof Error ? err.message : String(err);
             res.json({ ok: false, error: errMsg.includes("abort") ? "连接超时 (15s)" : errMsg });
+        }
+    });
+
+    router.post("/grounding/test", async (req, res) => {
+        try {
+            const body = (req.body ?? {}) as Record<string, unknown>;
+            const provider = String(body.provider ?? "");
+            const apiKey = String(body.apiKey ?? "");
+            const baseUrl = String(body.baseUrl ?? "");
+            const model = String(body.model ?? "");
+            const testText = String(body.testText ?? "");
+
+            if (!["google", "grok", "custom"].includes(provider)) {
+                res.status(400).json({ ok: false, error: "provider 必填（google / grok / custom）" });
+                return;
+            }
+            // 上面 includes 校验后收窄为合法 provider 值
+            const gProvider = provider as "google" | "grok" | "custom";
+            if (!apiKey) {
+                res.status(400).json({ ok: false, error: "apiKey 必填" });
+                return;
+            }
+            if (provider === "custom" && (!baseUrl || !model)) {
+                res.status(400).json({ ok: false, error: "custom 需要 baseUrl 与 model" });
+                return;
+            }
+            if (testText.trim().length < 10) {
+                res.status(400).json({ ok: false, error: "测试文本至少 10 个字符" });
+                return;
+            }
+            const start = Date.now();
+            const result = await Promise.race([
+                runParallelGrounding(
+                    { provider: gProvider, apiKey, baseUrl, model },
+                    testText,
+                ),
+                new Promise<undefined>((resolve) => {
+                    setTimeout(() => resolve(undefined), 90_000);
+                }),
+            ]);
+            const elapsedMs = Date.now() - start;
+
+            if (result) {
+                res.json({ ok: true, result, elapsedMs });
+            } else {
+                res.json({
+                    ok: true,
+                    dropped: true,
+                    elapsedMs,
+                    error: elapsedMs >= 90_000
+                        ? "请求超时 (90s)"
+                        : "无搜索结果，guardrail 已丢弃（检查 provider 是否真正支持联网搜索）",
+                });
+            }
+        } catch (err: unknown) {
+            const errMsg = err instanceof Error ? err.message : String(err);
+            res.json({ ok: false, error: errMsg.slice(0, 500) });
         }
     });
 

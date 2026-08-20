@@ -522,13 +522,15 @@ export interface McpServerPreConfig {
 
 /** Grounding（联网事实查证）配置 */
 export interface GroundingConfig {
-    /** 搜索提供者：google (Gemini Google Search) 或 grok (xAI Web Search) */
-    provider: "google" | "grok";
+    /** 总开关：显式 false 时完全禁用（生产触发链跳过；Dashboard 手动测试不受影响）。默认 true */
+    enabled?: boolean;
+    /** 搜索提供者：google (Gemini Google Search)、grok (xAI Web Search) 或 custom (任意 OpenAI 兼容端点，经 web_search_options 搜索，如 ZenMux / OpenRouter / cliproxy 等网关) */
+    provider: "google" | "grok" | "custom";
     /** API Key */
     apiKey: string;
-    /** 自定义 Base URL（Grok 默认 https://api.x.ai/v1，Google 无需设置） */
+    /** 自定义 Base URL（Grok 默认 https://api.x.ai/v1，Google 无需设置，custom 必填，如 http://192.168.50.10:8317/v1） */
     baseUrl?: string;
-    /** 使用的模型（Grok 默认 grok-3-mini-fast，Google 默认 gemini-2.0-flash-lite） */
+    /** 使用的模型（Grok 默认 grok-3-mini-fast，Google 默认 gemini-2.0-flash-lite，custom 必填，如 google/gemini-3-flash-preview） */
     model?: string;
 }
 
@@ -1227,10 +1229,11 @@ function parsePrivacyConfig(fileConfig: Record<string, unknown>): PrivacyConfig 
 function parseGroundingConfig(fileConfig: Record<string, unknown>): GroundingConfig | undefined {
     const raw = fileConfig.grounding as Record<string, unknown> | undefined;
     if (!raw || typeof raw !== "object") return undefined;
-    const provider = str(raw.provider) as "google" | "grok" | undefined;
+    const provider = str(raw.provider) as "google" | "grok" | "custom" | undefined;
     const apiKey = str(raw.api_key);
     if (!provider || !apiKey) return undefined;
     return {
+        enabled: raw.enabled !== false,
         provider,
         apiKey,
         baseUrl: str(raw.base_url),
