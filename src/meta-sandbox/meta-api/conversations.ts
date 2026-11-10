@@ -1,5 +1,7 @@
 import { getGroupModelKey, getPlatform } from "../../core/chat-id.js";
 import { formatMessageBody } from "../../core/message-enricher.js";
+import { loadConfig } from "../../core/config.js";
+import { isChatBlockedByFilter } from "../../core/inbound-filter.js";
 import { requireNonEmptyString } from "./params.js";
 import type {
     GroupModel,
@@ -156,7 +158,23 @@ type SubagentManagerReader = {
     getAllSubagents: () => unknown[];
 };
 
-export function createConversationsApi(memory: ConversationsReader, subagentManager?: SubagentManagerReader) {
+export interface ConversationsApiOptions {
+    /**
+     * chat_filter 读侧闸口：返回 false 的会话整体隐藏（inbox 剔除、messages 拒绝、query 过滤）。
+     * 默认每次调用读取 `loadConfig().chatFilter`，因此 Dashboard 放行并 saveConfig 后立即生效。
+     * 单元测试可注入固定谓词，避免隐式依赖仓库 config.yaml。
+     */
+    isChatAllowed?: (chatId: string) => boolean;
+}
+
+export function createConversationsApi(
+    memory: ConversationsReader,
+    subagentManager?: SubagentManagerReader,
+    apiOptions: ConversationsApiOptions = {},
+) {
+    const isChatAllowed = apiOptions.isChatAllowed
+        ?? ((chatId: string) => !isChatBlockedByFilter(loadConfig().chatFilter, chatId));
+
     return {
         inbox: async (options: ConversationsInboxOptions = {}): Promise<ConversationsInboxResult> => {
             const limit = clampLimit(options.limit, 20, 100);
@@ -168,7 +186,10 @@ export function createConversationsApi(memory: ConversationsReader, subagentMana
 
             const subagents = getSubagents(subagentManager);
             const subagentByChatId = new Map(subagents.map((subagent) => [subagent.chatId, subagent]));
-            const chatIds = collectInboxChatIds(memory, subagents, allowed);
+            // chat_filter 读侧闸口：subagent 与 group_models 两个来源都必须剔除。
+            // 不能依赖「latestMessage 为空」——被过滤会话在过滤生效前可能已有历史消息。
+            const chatIds = collectInboxChatIds(memory, subagents, allowed)
+                .filter((chatId) => isChatAllowed(chatId));
 
             const allItems = chatIds
                 .map((chatId) => buildInboxItem(memory, chatId, subagentByChatId.get(chatId)))
@@ -190,6 +211,9 @@ export function createConversationsApi(memory: ConversationsReader, subagentMana
                 "chatId",
                 "形如 telegram:-1001234567890 / telegram:92604174，可先用 conversations.inbox() 查",
             );
+            if (!isChatAllowed(chatId)) {
+                throw new Error(`[chat_filter] conversations.messages 拒绝读取：chat=${chatId} 被 chat_filter 拦截。`);
+            }
             const limit = clampLimit(options.limit, 50, 99);
             const before = timestampInputToIso(decodeMessageCursor(options.cursor) ?? options.before) ?? undefined;
             const after = timestampInputToIso(options.after) ?? undefined;
@@ -198,6 +222,7 @@ export function createConversationsApi(memory: ConversationsReader, subagentMana
                 after,
                 before,
                 limit: limit + 1,
+                includeBlocked: false,
             }));
             const messages = rows.slice(0, limit);
             const chatTitle = resolveChatTitle(memory, chatId);
@@ -213,11 +238,18 @@ export function createConversationsApi(memory: ConversationsReader, subagentMana
         query: async (filters: ConversationsQueryFilters = {}): Promise<ConversationsQueryResult> => {
             const normalizedFilters = normalizeFilters(filters);
             const limit = clampLimit(filters.limit, 20, 100);
-            const chatIds = uniqueStrings(filters.chatIds);
+            const requestedChatIds = uniqueStrings(filters.chatIds);
+            // chat_filter 读侧闸口：显式限定的 blocked 会话直接剔除；若全部被剔除，
+            // 必须返回空结果，而不是退化成「全局搜索」把别的会话内容带回来。
+            const chatIds = requestedChatIds.filter((chatId) => isChatAllowed(chatId));
             const keyword = filters.keyword?.trim();
             const resolvedUsers = resolveUsers(memory, normalizedFilters, limit);
             const userIds = resolvedUsers.map((user) => user.userId);
             const fallbackName = filters.user && userIds.length === 0 ? filters.user.trim() : undefined;
+
+            if (requestedChatIds.length > 0 && chatIds.length === 0) {
+                return { messages: [], topics: [], resolvedUsers };
+            }
 
             const messages = enrichMessages(memory, queryMessages(memory, {
                 filters: normalizedFilters,
@@ -226,14 +258,15 @@ export function createConversationsApi(memory: ConversationsReader, subagentMana
                 keyword,
                 userIds,
                 fallbackName,
-            }));
+                includeBlocked: false,
+            })).filter((row) => isChatAllowed(row.chatId));
             const topics = enrichTopics(memory, queryTopics(memory, {
                 filters: normalizedFilters,
                 limit,
                 chatIds,
                 keyword,
                 userIds,
-            }));
+            })).filter((row) => isChatAllowed(row.chatId));
 
             return { messages, topics, resolvedUsers };
         },
@@ -275,7 +308,8 @@ function buildInboxItem(
 ): ConversationInboxItem {
     const groupModel = resolveGroupModel(memory, chatId);
     const chatTitle = groupModel?.chatTitle || resolveChatTitle(memory, chatId);
-    const latest = memory.getRecentMessages(chatId, 1)[0];
+    // 第二道防线：即使 chat 级过滤漏掉，blocked 行也不得进入 latestMessage / unread 统计。
+    const latest = memory.getRecentMessages(chatId, 1, { includeBlocked: false })[0];
     const latestMessage = latest ? recentMessageToInboxMessage(memory, latest) : undefined;
     const lastAttendedAt = subagent?.lastAttendedAt ?? null;
     const observerUnreadCount = subagent?.observer?.getBufferSize?.() ?? 0;
@@ -352,9 +386,9 @@ function countUnreadMessages(
         return 0;
     }
     if (!lastAttendedAt) {
-        return memory.getRecentMessages(chatId, 100).length;
+        return memory.getRecentMessages(chatId, 100, { includeBlocked: false }).length;
     }
-    return memory.queryMessages({ chatIds: [chatId], after: lastAttendedAt, limit: 100 })
+    return memory.queryMessages({ chatIds: [chatId], after: lastAttendedAt, limit: 100, includeBlocked: false })
         .filter((message) => message.timestamp > lastAttendedAt)
         .length;
 }
@@ -493,9 +527,10 @@ function queryMessages(
         keyword?: string;
         userIds: string[];
         fallbackName?: string;
+        includeBlocked?: boolean;
     },
 ): MessageSearchResult[] {
-    const { filters, limit, chatIds, keyword, userIds, fallbackName } = input;
+    const { filters, limit, chatIds, keyword, userIds, fallbackName, includeBlocked } = input;
 
     if (userIds.length > 0) {
         const rows = queryMessagesByKeyword(memory, {
@@ -505,6 +540,7 @@ function queryMessages(
             after: filters.after,
             before: filters.before,
             limit,
+            includeBlocked,
         });
         if (rows.length > 0 || !keyword) {
             return rows;
@@ -519,6 +555,7 @@ function queryMessages(
             after: filters.after,
             before: filters.before,
             limit,
+            includeBlocked,
         });
         if (nameRows.length > 0) {
             return nameRows;
@@ -532,6 +569,7 @@ function queryMessages(
             after: filters.after,
             before: filters.before,
             limit,
+            includeBlocked,
         });
     }
 
@@ -541,7 +579,7 @@ function queryMessages(
 
     const merged: MessageSearchResult[] = [];
     for (const chatId of chatIds) {
-        const rows = memory.getRecentMessages(chatId, limit * 2)
+        const rows = memory.getRecentMessages(chatId, limit * 2, { includeBlocked })
             .filter((row) => matchesMessageFilters(row, filters))
             .map((row) => ({
                 messageId: row.messageId,
@@ -571,6 +609,7 @@ function queryMessagesWith(
         after?: string;
         before?: string;
         limit: number;
+        includeBlocked?: boolean;
     },
 ): MessageSearchResult[] {
     return sortMessages(memory.queryMessages(input)).slice(0, input.limit);
@@ -585,6 +624,7 @@ function queryMessagesByKeyword(
         after?: string;
         before?: string;
         limit: number;
+        includeBlocked?: boolean;
     },
 ): MessageSearchResult[] {
     const terms = splitSearchTerms(input.keyword);
@@ -595,6 +635,7 @@ function queryMessagesByKeyword(
             after: input.after,
             before: input.before,
             limit: input.limit,
+            includeBlocked: input.includeBlocked,
         });
     }
 
@@ -607,6 +648,7 @@ function queryMessagesByKeyword(
             after: input.after,
             before: input.before,
             limit: input.limit,
+            includeBlocked: input.includeBlocked,
         });
         for (const row of rows) {
             merged.set(`${row.chatId}:${row.messageId}`, row);

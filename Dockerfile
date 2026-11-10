@@ -1,6 +1,9 @@
 # ── Stage 1: Install dependencies (includes native module compilation) ──
 FROM node:22-bookworm AS deps
 
+# 墙内 npm 源拉不动，改用 npmmirror 国内镜像
+ENV NPM_CONFIG_REGISTRY=https://registry.npmmirror.com
+
 RUN apt-get update && \
     apt-get install -y --no-install-recommends python3 make g++ && \
     rm -rf /var/lib/apt/lists/*
@@ -13,6 +16,8 @@ RUN pnpm install --frozen-lockfile
 
 # ── Stage 2: Build dashboard UI ──
 FROM node:22-bookworm AS ui-build
+# 墙内 npm 源拉不动，改用 npmmirror 国内镜像
+ENV NPM_CONFIG_REGISTRY=https://registry.npmmirror.com
 RUN npm install -g pnpm@11.3.0
 WORKDIR /app/src/dashboard/ui
 COPY src/dashboard/ui/package.json src/dashboard/ui/pnpm-lock.yaml src/dashboard/ui/pnpm-workspace.yaml ./

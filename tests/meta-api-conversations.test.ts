@@ -95,7 +95,7 @@ describe("createConversationsApi", () => {
     });
 
     it("queries messages and topics across chats by keyword", async () => {
-        const api = createConversationsApi(memory);
+        const api = createConversationsApi(memory, undefined, { isChatAllowed: () => true });
         const result = await api.query({ keyword: "团建", limit: 10 });
 
         assert.equal(result.messages.length, 2);
@@ -106,7 +106,7 @@ describe("createConversationsApi", () => {
     });
 
     it("splits message keyword terms and searches them with OR semantics", async () => {
-        const api = createConversationsApi(memory);
+        const api = createConversationsApi(memory, undefined, { isChatAllowed: () => true });
         const result = await api.query({
             chatIds: ["g1", "g2"],
             keyword: "死亡读秒 windowserver",
@@ -117,7 +117,7 @@ describe("createConversationsApi", () => {
     });
 
     it("resolves user aliases before searching message bodies", async () => {
-        const api = createConversationsApi(memory);
+        const api = createConversationsApi(memory, undefined, { isChatAllowed: () => true });
         const result = await api.query({ user: "Soha", limit: 10 });
 
         assert.deepEqual(result.resolvedUsers.map((user) => user.userId), ["u2"]);
@@ -128,7 +128,7 @@ describe("createConversationsApi", () => {
     });
 
     it("falls back to recent lists when no keyword is provided", async () => {
-        const api = createConversationsApi(memory);
+        const api = createConversationsApi(memory, undefined, { isChatAllowed: () => true });
         const result = await api.query({ chatIds: ["g2"], userId: "u2", limit: 5 });
 
         assert.equal(result.messages.length, 3);
@@ -139,7 +139,7 @@ describe("createConversationsApi", () => {
     });
 
     it("lists chat messages with cursor pagination", async () => {
-        const api = createConversationsApi(memory);
+        const api = createConversationsApi(memory, undefined, { isChatAllowed: () => true });
 
         const firstPage = await api.messages("g1", { limit: 1 });
         assert.deepEqual(firstPage.messages.map((row) => row.messageId), ["g1-2"]);
@@ -174,7 +174,7 @@ describe("createConversationsApi", () => {
                     codeActExecutor: { getQueueSize: () => 0, isProcessing: () => true },
                 },
             ],
-        });
+        }, { isChatAllowed: () => true });
 
         const result = await api.inbox({ limit: 10 });
 
@@ -194,7 +194,7 @@ describe("createConversationsApi", () => {
                 { chatId: "g1", lastAttendedAt: "2026-01-03T10:30:00Z" },
                 { chatId: "g2", lastAttendedAt: "2026-01-03T11:30:00Z" },
             ],
-        });
+        }, { isChatAllowed: () => true });
 
         const firstPage = await api.inbox({ limit: 1, unreadFirst: false });
         assert.equal(firstPage.items[0].chatId, "g2");

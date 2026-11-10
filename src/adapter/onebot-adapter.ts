@@ -14,6 +14,11 @@ import type { MediaDownloader } from "../core/media-downloader.js";
 import type { StickerSendPolicy } from "../core/sticker-send-policy.js";
 import { ensureSupportedFormat } from "../core/vision-processor.js";
 import { composeChatId, ensureCompositeId, getRawId, parseChatId } from "../core/chat-id.js";
+import {
+    normalizeMentionTarget as normalizeMentionTargetUtil,
+    normalizeMentionTargets as normalizeMentionTargetsUtil,
+    summarizeOneBotMessage,
+} from "./onebot-message-utils.js";
 import { assertNoAccidentalTextMention, outgoingOneBotMentions, validateOneBotMentionTarget } from "../core/onebot-mentions.js";
 import { createLogger } from "../core/logger.js";
 import {
@@ -23,7 +28,7 @@ import {
     normalizeOneBotNapCatAction,
 } from "../core/onebot-napcat-passthrough.js";
 import { WebSocket } from "ws";
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import path from "node:path";
@@ -41,6 +46,134 @@ const log = createLogger("onebot-adapter");
 function normalizeQqImageKey(value: string): string {
     const match = value.match(/^([A-Fa-f0-9]{16,})\.[A-Za-z0-9]+$/);
     return match ? match[1].toUpperCase() : value;
+}
+
+type ImageAnimationKind = "gif" | "animated-webp" | "apng" | "video";
+
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+/** 动图标记通常靠近文件头；先只读 64KB，避免为几 MB 的贴纸整块分配 Buffer。 */
+const IMAGE_SNIFF_PREFIX_BYTES = 64 * 1024;
+/**
+ * 块扫描在 64KB 内无法定论时（如 >64KB 的 tEXt / iCCP 把 acTL、ANMF 推到后面），
+ * 回退读整个文件一次。设上限避免为超大文件无界分配，超过仍无法定论则按静态图处理。
+ */
+const IMAGE_SNIFF_FULL_FILE_BYTES = 16 * 1024 * 1024;
+
+/** 块扫描三态：找到动图标记 / 确定没有 / 缓冲区在块中间结束、需要更长缓冲再判。 */
+type ChunkScanResult = "found" | "absent" | "inconclusive";
+
+/** 嗅探裁决：conclusive=false 表示 64KB 头部被块截断，需回退读整个文件。 */
+type ImageSniffVerdict = {
+    kind: Exclude<ImageAnimationKind, "video"> | null;
+    conclusive: boolean;
+};
+
+type FilePrefix = {
+    buffer: Buffer;
+    /** 已读到文件末尾（缓冲覆盖整个文件）。 */
+    complete: boolean;
+};
+
+/** 只读文件头；complete 表示缓冲区就是整个文件。 */
+function readFilePrefix(filePath: string, maxBytes: number): FilePrefix | null {
+    let fd: number | undefined;
+    try {
+        fd = openSync(filePath, "r");
+        const size = fstatSync(fd).size;
+        const bytesToRead = Math.min(size, maxBytes);
+        const buffer = Buffer.allocUnsafe(bytesToRead);
+        const bytesRead = readSync(fd, buffer, 0, bytesToRead, 0);
+        return { buffer: buffer.subarray(0, bytesRead), complete: bytesRead >= size };
+    } catch {
+        return null;
+    } finally {
+        if (fd !== undefined) {
+            try {
+                closeSync(fd);
+            } catch {
+                // 已读到的头部仍然有效
+            }
+        }
+    }
+}
+
+/**
+ * 按文件内容嗅探动图类型。
+ *
+ * QQ/NapCat 经常把多帧 GIF 落盘成 `.jpg` / `.png` 扩展名，只信扩展名会把动图
+ * 当成静态图压成首帧。webm/tgs 是 ffmpeg 容器格式，按扩展名识别即可。
+ *
+ * 快路径只读 64KB；只有块扫描被截断、无法定论时才回退读整个文件一次。
+ */
+function sniffImageAnimation(filePath: string): ImageAnimationKind | null {
+    const ext = path.extname(filePath).toLowerCase();
+    if (ext === ".webm" || ext === ".tgs") return "video";
+
+    const prefix = readFilePrefix(filePath, IMAGE_SNIFF_PREFIX_BYTES);
+    if (!prefix) return null;
+    const prefixVerdict = sniffImageAnimationBuffer(prefix);
+    if (prefixVerdict.conclusive) return prefixVerdict.kind;
+
+    const whole = readFilePrefix(filePath, IMAGE_SNIFF_FULL_FILE_BYTES);
+    if (!whole) return null;
+    return sniffImageAnimationBuffer(whole).kind;
+}
+
+function sniffImageAnimationBuffer({ buffer, complete }: FilePrefix): ImageSniffVerdict {
+    if (buffer.length >= 6) {
+        const signature = buffer.toString("latin1", 0, 6);
+        if (signature === "GIF87a" || signature === "GIF89a") return { kind: "gif", conclusive: true };
+    }
+    if (buffer.length >= PNG_SIGNATURE.length && buffer.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)) {
+        const scan = scanPngChunksBeforeIdat(buffer, "acTL", complete);
+        return { kind: scan === "found" ? "apng" : null, conclusive: scan !== "inconclusive" };
+    }
+    if (buffer.length >= 12
+        && buffer.toString("latin1", 0, 4) === "RIFF"
+        && buffer.toString("latin1", 8, 12) === "WEBP") {
+        const scan = scanWebpChunks(buffer, "ANMF", complete);
+        return { kind: scan === "found" ? "animated-webp" : null, conclusive: scan !== "inconclusive" };
+    }
+    return { kind: null, conclusive: true };
+}
+
+/** PNG 的 acTL 必须在 IDAT 之前，逐块扫描避免把压缩数据里的字节误判为 APNG。 */
+function scanPngChunksBeforeIdat(buffer: Buffer, chunkType: string, complete: boolean): ChunkScanResult {
+    let offset = PNG_SIGNATURE.length;
+    while (offset + 8 <= buffer.length) {
+        const length = buffer.readUInt32BE(offset);
+        const type = buffer.toString("latin1", offset + 4, offset + 8);
+        if (type === chunkType) return "found";
+        if (type === "IDAT" || type === "IEND") return "absent";
+        const next = offset + 12 + length;
+        if (next > buffer.length) {
+            // 缓冲区停在块中间：前缀不够长，完整文件则说明数据截断/损坏。
+            return complete ? "absent" : "inconclusive";
+        }
+        offset = next;
+    }
+    // 停在块边界但没有 IDAT/IEND：完整文件是损坏的 PNG，前缀则可能还有下一个块。
+    return complete ? "absent" : "inconclusive";
+}
+
+/** 逐块扫描 RIFF，确认 ANMF（动画帧）块存在；VP8/VP8L 是静态图的终止标记。 */
+function scanWebpChunks(buffer: Buffer, chunkType: string, complete: boolean): ChunkScanResult {
+    const containerEnd = 8 + buffer.readUInt32LE(4);
+    let offset = 12;
+    while (offset + 8 <= buffer.length && offset < containerEnd) {
+        const type = buffer.toString("latin1", offset, offset + 4);
+        if (type === chunkType) return "found";
+        if (type === "VP8 " || type === "VP8L") return "absent";
+        const size = buffer.readUInt32LE(offset + 4);
+        const next = offset + 8 + size + (size & 1);
+        if (next > buffer.length) {
+            return complete ? "absent" : "inconclusive";
+        }
+        offset = next;
+    }
+    // 已走到 RIFF 声明末尾，或完整文件里块头都不够：确定没有动画帧。
+    if (offset >= containerEnd) return "absent";
+    return complete ? "absent" : "inconclusive";
 }
 
 type OneBotMessageSegment = {
@@ -84,6 +217,8 @@ type OneBotActionResponse = {
     retcode?: number;
     data?: unknown;
     message?: string;
+    /** NapCat 扩展字段，错误时通常是中文人类可读描述（如"群成员不存在"） */
+    wording?: string;
     echo?: string;
 };
 
@@ -180,6 +315,8 @@ export class OneBotAdapter implements PlatformAdapter {
     private readonly connection = new ConnectionTracker("onebot");
     private static readonly RECONNECT_BASE_MS = 1000;
     private static readonly RECONNECT_MAX_MS = 30_000;
+    /** 重连次数上限：达到后停止重连，避免 NapCat 永久下线时无限刷日志 */
+    private static readonly RECONNECT_MAX_ATTEMPTS = 50;
     /** ws ping 间隔；NapCat 侧不一定主动 ping，半开连接只能靠自己探活 */
     private static readonly HEARTBEAT_INTERVAL_MS = 30_000;
     /** 超过该时长没有任何回应（pong 或消息）即认为连接已死 */
@@ -199,11 +336,17 @@ export class OneBotAdapter implements PlatformAdapter {
     * OneBot get_stranger_info / get_friend_list 返回 nickname 字段
     */
     private readonly userNickCache = new Map<string, string>();
+    /** in-flight 去重：同 ID 并发 fetch 时复用 promise，完成后从 map 删除 */
+    private readonly inflightGroupNameFetch = new Map<string, Promise<string | undefined>>();
+    private readonly inflightUserNickFetch = new Map<string, Promise<string | undefined>>();
+    /** 拟人化延迟状态：chatId → 上次发送时间戳 (ms) */
+    private readonly lastSendTimes = new Map<string, number>();
 
     constructor(
         private config: OneBotConfig,
         private nc: NotificationCenter,
         private mediaDownloader?: MediaDownloader,
+        private personaName: string = "我",
         private stickerPolicy?: StickerSendPolicy,
     ) {}
 
@@ -225,8 +368,8 @@ export class OneBotAdapter implements PlatformAdapter {
             throw err;
         }
 
-        // 连接成功后预加载白名单群组的名称
-        this.prefetchWhitelistedGroups();
+        // 连接成功后预加载 peer 名称（whitelist 开启时只拉名单内 peer）
+        this.prefetchPeerNames();
     }
 
     getConnectionStatus(): AdapterConnectionStatus {
@@ -372,7 +515,7 @@ export class OneBotAdapter implements PlatformAdapter {
         }
 
         await this.connect();
-        this.prefetchWhitelistedGroups();
+        this.prefetchPeerNames();
     }
 
     private connect(): Promise<void> {
@@ -380,7 +523,10 @@ export class OneBotAdapter implements PlatformAdapter {
             const isReconnect = this.reconnectAttempts > 0;
             let settled = false;
             this.connection.markConnecting(this.config.wsUrl);
-            const ws = new WebSocket(this.config.wsUrl);
+            const wsOpts = this.config.accessToken
+                ? { headers: { Authorization: `Bearer ${this.config.accessToken}` } }
+                : undefined;
+            const ws = new WebSocket(this.config.wsUrl, wsOpts);
             this.ws = ws;
 
             const settle = (fn: () => void) => {
@@ -499,18 +645,28 @@ export class OneBotAdapter implements PlatformAdapter {
     private scheduleReconnect(): void {
         if (this.stopRequested || this.reconnectTimer) return;
         this.reconnectAttempts++;
-        const delay = Math.min(
+        if (this.reconnectAttempts > OneBotAdapter.RECONNECT_MAX_ATTEMPTS) {
+            log.error(
+                `OneBotAdapter 重连次数超过上限 ${OneBotAdapter.RECONNECT_MAX_ATTEMPTS}，停止重连`,
+            );
+            return;
+        }
+        const base = Math.min(
             OneBotAdapter.RECONNECT_BASE_MS * Math.pow(2, this.reconnectAttempts - 1),
             OneBotAdapter.RECONNECT_MAX_MS,
         );
+        // ±20% jitter：避免多个 bot 同时断网后同步重连（thundering herd）
+        const delay = Math.round(base * (0.8 + Math.random() * 0.4));
         this.connection.markRetryScheduled(this.reconnectAttempts, delay);
-        log.info(`OneBotAdapter 将在 ${delay}ms 后重连 (第 ${this.reconnectAttempts} 次)`);
+        log.info(
+            `OneBotAdapter 将在 ${delay}ms 后重连 (第 ${this.reconnectAttempts}/${OneBotAdapter.RECONNECT_MAX_ATTEMPTS} 次)`,
+        );
         this.reconnectTimer = setTimeout(async () => {
             this.reconnectTimer = null;
             if (this.stopRequested) return;
             try {
                 await this.connect();
-                this.prefetchWhitelistedGroups();
+                this.prefetchPeerNames();
             } catch {
                 // 连接失败由 close 处理器重新排程；这里只吞掉 rejection，
                 // 避免变成 unhandled rejection。
@@ -534,56 +690,55 @@ export class OneBotAdapter implements PlatformAdapter {
     }
 
     /**
-     * 连接成功后预加载白名单群组名称和私聊用户昵称。
-     * 调用 get_group_list 和 get_friend_list 批量获取，
-     * 填充缓存使快照立即显示群名而非群号。
+     * 连接成功后预加载群组名称和私聊用户昵称。
+     * whitelist 开启时只缓存名单内的 peer，避免在大量群里启动时拉一堆冗余数据。
+     * 异步执行，不阻塞 start()。
      */
-    private prefetchWhitelistedGroups(): void {
-        // 异步执行，不阻塞 start()
+    private prefetchPeerNames(): void {
+        const wl = this.config.whitelist;
+        const whitelistEnabled = wl?.enabled === true;
+        const wlGroups = whitelistEnabled ? new Set((wl?.groups ?? []).map(String)) : null;
+        const wlUsers = whitelistEnabled ? new Set((wl?.users ?? []).map(String)) : null;
+
         (async () => {
             try {
-                // 1. 获取群列表
-                const groupListResult = await this.callAction("get_group_list", {}) as Record<string, unknown>;
-                const groupListData = groupListResult?.data ?? groupListResult;
+                const groupListData = await this.callAction("get_group_list", {});
                 if (Array.isArray(groupListData)) {
-                    for (const g of groupListData) {
+                    let cached = 0;
+                    for (const item of groupListData) {
+                        const g = (item ?? {}) as Record<string, unknown>;
                         const gid = String(g.group_id ?? "");
                         const gname = String(g.group_name ?? "");
-                        if (gid && gname) {
-                            this.groupNameCache.set(gid, gname);
-                        }
+                        if (!gid || !gname) continue;
+                        if (wlGroups && !wlGroups.has(gid)) continue;
+                        this.groupNameCache.set(gid, gname);
+                        cached++;
                     }
-                    log.info("预加载群列表成功", { count: groupListData.length, cached: this.groupNameCache.size });
+                    log.info("预加载群列表完成", { total: groupListData.length, cached, whitelistEnabled });
                 }
             } catch (err) {
                 log.warn("预加载群列表失败", { error: String(err) });
             }
 
             try {
-                // 2. 获取好友列表（私聊用户昵称）
-                const friendListResult = await this.callAction("get_friend_list", {}) as Record<string, unknown>;
-                const friendListData = friendListResult?.data ?? friendListResult;
+                const friendListData = await this.callAction("get_friend_list", {});
                 if (Array.isArray(friendListData)) {
-                    for (const f of friendListData) {
+                    let cached = 0;
+                    for (const item of friendListData) {
+                        const f = (item ?? {}) as Record<string, unknown>;
                         const uid = String(f.user_id ?? "");
                         const nick = String(f.nickname ?? "");
-                        if (uid && nick) {
-                            this.userNickCache.set(uid, nick);
-                        }
+                        if (!uid || !nick) continue;
+                        if (wlUsers && !wlUsers.has(uid)) continue;
+                        this.userNickCache.set(uid, nick);
+                        cached++;
                     }
-                    log.info("预加载好友列表成功", { count: friendListData.length, cached: this.userNickCache.size });
+                    log.info("预加载好友列表完成", { total: friendListData.length, cached, whitelistEnabled });
                 }
             } catch (err) {
                 log.warn("预加载好友列表失败", { error: String(err) });
             }
         })();
-    }
-
-    /**
-     * 获取所有已缓存的群名和用户昵称，供外部批量更新 GroupModel。
-     */
-    getCachedNames(): { groupNames: ReadonlyMap<string, string>; userNicks: ReadonlyMap<string, string> } {
-        return { groupNames: this.groupNameCache, userNicks: this.userNickCache };
     }
 
     canHandle(method: string): boolean {
@@ -600,6 +755,8 @@ export class OneBotAdapter implements PlatformAdapter {
             "onebot.sendSticker",
             "onebot.sendFace",
             "onebot.sendTyping",
+            "onebot.sendReaction",
+            "onebot.pokeUser",
             "onebot.deleteMessages",
             "qq.sendMessage",
             "qq.sendAt",
@@ -609,17 +766,31 @@ export class OneBotAdapter implements PlatformAdapter {
             "qq.sendSticker",
             "qq.sendFace",
             "qq.sendTyping",
+            "qq.sendReaction",
+            "qq.pokeUser",
             "qq.deleteMessages",
         ];
     }
 
     formatMention(rawUserId: string, _username?: string): string | undefined {
-        const userId = this.normalizeMentionTarget(rawUserId);
+        const userId = normalizeMentionTargetUtil(rawUserId);
         return userId ? `[CQ:at,qq=${userId}]` : undefined;
     }
 
-    async markAsRead(_chatId: string): Promise<void> {
-        // OneBot v11 / NapCat 通常没有统一的标记已读接口，静默忽略。
+    async markAsRead(chatId: string): Promise<void> {
+        // NapCat 支持按 chat 类型分发的已读接口；失败时静默吞掉避免污染上层逻辑。
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+        try {
+            const parsed = parseChatId(chatId);
+            if (parsed.groupId != null) {
+                await this.callAction("mark_group_msg_as_read", { group_id: Number(parsed.groupId) });
+            } else if (parsed.rawId.startsWith("private:")) {
+                const userId = parsed.rawId.slice("private:".length);
+                await this.callAction("mark_private_msg_as_read", { user_id: Number(userId) });
+            }
+        } catch (err) {
+            log.debug("markAsRead 失败（已忽略）", { chatId, error: String(err) });
+        }
     }
 
     muteChat(chatId: string, hours: number): void {
@@ -692,13 +863,13 @@ export class OneBotAdapter implements PlatformAdapter {
                 const chatId = ensureCompositeId("onebot", String(args[0] ?? ""));
                 const message = this.normalizeOutgoingMessageArg(args[1]);
                 const opts = (args[2] ?? {}) as Record<string, unknown>;
-                await this.applyHumanizedDelay(chatId, this.outgoingMessageText(message).length);
+                await this.applyHumanizedDelay(chatId, summarizeOneBotMessage(message).length);
                 return this.sendMessage(chatId, message, opts);
             }
             case "onebot.sendAt":
             case "qq.sendAt": {
                 const chatId = ensureCompositeId("onebot", String(args[0] ?? ""));
-                const userIds = this.normalizeMentionTargets(args[1]);
+                const userIds = normalizeMentionTargetsUtil(args[1]);
                 if (userIds.length === 0) throw new Error("onebot.sendAt: userId is required");
                 const text = typeof args[2] === "string" ? args[2] : "";
                 const opts = (args[3] ?? {}) as Record<string, unknown>;
@@ -763,6 +934,41 @@ export class OneBotAdapter implements PlatformAdapter {
                 const chatId = ensureCompositeId("onebot", String(args[0] ?? ""));
                 const ids = Array.isArray(args[1]) ? args[1].map(id => String(id)).filter(Boolean) : [];
                 return this.deleteMessages(chatId, ids);
+            }
+            case "onebot.sendReaction":
+            case "qq.sendReaction": {
+                // chatId 仅用于 handleCall 顶部的 mute 拦截；set_msg_emoji_like 本身不需要 chat 范围
+                const messageId = String(args[1] ?? "").trim();
+                const emoji = String(args[2] ?? "").trim();
+                if (!messageId) throw new Error("onebot.sendReaction: messageId is required");
+                if (!emoji) throw new Error("onebot.sendReaction: emoji is required");
+                return this.callAction("set_msg_emoji_like", {
+                    message_id: /^-?\d+$/.test(messageId) ? Number(messageId) : messageId,
+                    emoji_id: emoji,
+                });
+            }
+            case "onebot.pokeUser":
+            case "qq.pokeUser": {
+                const chatId = ensureCompositeId("onebot", String(args[0] ?? ""));
+                const targetUserId = args[1] != null ? String(args[1]).trim() : "";
+                const parsed = parseChatId(chatId);
+                if (parsed.groupId == null) {
+                    throw new Error("onebot.pokeUser: 当前实现仅支持群聊戳一戳");
+                }
+                if (!targetUserId) throw new Error("onebot.pokeUser: userId is required");
+                return this.callAction("group_poke", {
+                    group_id: Number(parsed.groupId),
+                    user_id: Number(targetUserId),
+                });
+            }
+            case "onebot.getChatMembers":
+            case "qq.getChatMembers": {
+                const chatId = ensureCompositeId("onebot", String(args[0] ?? ""));
+                const parsed = parseChatId(chatId);
+                if (parsed.groupId == null) {
+                    throw new Error("onebot.getChatMembers: 仅支持群聊");
+                }
+                return this.callAction("get_group_member_list", { group_id: Number(parsed.groupId) });
             }
             case "onebot.sendTyping":
             case "qq.sendTyping": {
@@ -1153,29 +1359,16 @@ export class OneBotAdapter implements PlatformAdapter {
         const isAnimated = this.isAnimatedImagePath(resolvedPath);
 
         if (options?.preserveAnimation && isAnimated) {
-            // 动图路径：webm/tgs → GIF，GIF 直接保留
+            // 动图路径按内容判定：QQ/NapCat 经常把 GIF 落盘成 .jpg/.png。
+            const animation = sniffImageAnimation(resolvedPath);
             let normalizedPath = resolvedPath;
-            if (lowerPath.endsWith(".webm") || lowerPath.endsWith(".tgs")) {
+            if (animation === "gif" && !lowerPath.endsWith(".gif")) {
+                // 内容已是 GIF：只补正扩展名，避免重新编码损失画质或放大体积。
+                normalizedPath = this.copyGifWithExtension(resolvedPath);
+            } else if (animation === "video" || animation === "animated-webp") {
                 normalizedPath = this.convertToAnimatedGif(resolvedPath);
-            } else if (lowerPath.endsWith(".webp")) {
-                // .webp 后缀但实际是 GIF 的文件，重命名为 .gif 确保 NapCat 正确识别
-                const head = readFileSync(resolvedPath).subarray(0, 4);
-                if (head[0] === 0x47 && head[1] === 0x49 && head[2] === 0x46) {
-                    // 实际是 GIF，复制为 .gif 扩展名
-                    const stat = statSync(resolvedPath);
-                    const hash = createHash("sha1").update(`${resolvedPath}:${stat.size}:${stat.mtimeMs}:rename-gif`).digest("hex").slice(0, 16);
-                    const outDir = path.resolve(process.cwd(), "workspace", "Downloads", "other", "qq-converted");
-                    mkdirSync(outDir, { recursive: true });
-                    const outPath = path.join(outDir, `${path.basename(resolvedPath, path.extname(resolvedPath))}_${hash}.gif`);
-                    if (!existsSync(outPath)) {
-                        writeFileSync(outPath, readFileSync(resolvedPath));
-                    }
-                    normalizedPath = outPath;
-                } else {
-                    // 真正的 animated webp，转 GIF
-                    normalizedPath = this.convertToAnimatedGif(resolvedPath);
-                }
             }
+            // APNG 保持原文件；sendSticker 的缩放阶段会输出动画 GIF。
             if (options?.resizeForQqSticker) {
                 normalizedPath = this.resizeStickerImageForQq(normalizedPath);
             }
@@ -1198,24 +1391,9 @@ export class OneBotAdapter implements PlatformAdapter {
         return normalizedPath;
     }
 
-    /** 判断文件是否为动图格式（GIF / webm / tgs / 扩展名不匹配但实际为 GIF 的 webp） */
+    /** 判断文件是否为动图：GIF / APNG / animated WebP 按内容嗅探，webm/tgs 按扩展名。 */
     private isAnimatedImagePath(filePath: string): boolean {
-        const ext = path.extname(filePath).toLowerCase();
-        if (ext === ".gif" || ext === ".webm" || ext === ".tgs") return true;
-        // .webp 文件可能实际是 GIF（QQ/NapCat 有时用 .webp 扩展名存 GIF）
-        // 或者是 animated webp（含 ANMF chunk）
-        if (ext === ".webp" && existsSync(filePath)) {
-            try {
-                const buf = readFileSync(filePath);
-                // 实际内容是 GIF？
-                if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) return true; // "GIF"
-                // Animated WebP: RIFF header + WEBP + 检查 ANMF chunk
-                if (buf.length >= 12 && buf.toString("ascii", 0, 4) === "RIFF" && buf.toString("ascii", 8, 12) === "WEBP") {
-                    return buf.includes(Buffer.from("ANMF"));
-                }
-            } catch { /* ignore */ }
-        }
-        return false;
+        return sniffImageAnimation(filePath) !== null;
     }
 
     /** 将 webm/tgs/animated-webp 动图转为 GIF（带调色板优化） */
@@ -1249,6 +1427,25 @@ export class OneBotAdapter implements PlatformAdapter {
             });
             return sourcePath;
         }
+    }
+
+    /**
+     * 把内容已是 GIF、但扩展名不是 .gif 的文件复制一份 .gif 路径。
+     * NapCat 依赖文件名后缀识别图片类型；复制字节可避免 ffmpeg 重编码损失。
+     */
+    private copyGifWithExtension(sourcePath: string): string {
+        const stat = statSync(sourcePath);
+        const hash = createHash("sha1")
+            .update(`${sourcePath}:${stat.size}:${stat.mtimeMs}:rename-gif`)
+            .digest("hex")
+            .slice(0, 16);
+        const outDir = path.resolve(process.cwd(), "workspace", "Downloads", "other", "qq-converted");
+        mkdirSync(outDir, { recursive: true });
+        const outPath = path.join(outDir, `${path.basename(sourcePath, path.extname(sourcePath))}_${hash}.gif`);
+        if (!existsSync(outPath)) {
+            writeFileSync(outPath, readFileSync(sourcePath));
+        }
+        return outPath;
     }
 
     private resolveFileReferenceToPath(file: string): string | null {
@@ -1328,22 +1525,23 @@ export class OneBotAdapter implements PlatformAdapter {
 
     private resizeStickerImageForQq(sourcePath: string): string {
         const stat = statSync(sourcePath);
-        const isGif = sourcePath.toLowerCase().endsWith(".gif");
-        const suffix = isGif ? "sticker-anim-w200" : "sticker-w200";
+        // 以内容判定而不是扩展名：QQ/NapCat 常把 GIF 存成 .jpg/.png。
+        const isAnimated = sniffImageAnimation(sourcePath) !== null;
+        const suffix = isAnimated ? "sticker-anim-w200" : "sticker-w200";
         const hash = createHash("sha1")
             .update(`${sourcePath}:${stat.size}:${stat.mtimeMs}:${suffix}`)
             .digest("hex")
             .slice(0, 16);
         const outDir = path.resolve(process.cwd(), "workspace", "Downloads", "other", "qq-converted");
         mkdirSync(outDir, { recursive: true });
-        const outExt = isGif ? ".gif" : ".png";
+        const outExt = isAnimated ? ".gif" : ".png";
         const outPath = path.join(outDir, `${path.basename(sourcePath, path.extname(sourcePath))}_${hash}_w200${outExt}`);
         if (existsSync(outPath)) {
             return outPath;
         }
         try {
-            if (isGif) {
-                // 动画 GIF 缩放：保持帧，使用调色板优化
+            if (isAnimated) {
+                // 动画（GIF/APNG/animated WebP/webm）缩放：保持帧，使用调色板优化
                 execFileSync("ffmpeg", [
                     "-hide_banner", "-loglevel", "error",
                     "-i", sourcePath,
@@ -1403,12 +1601,9 @@ export class OneBotAdapter implements PlatformAdapter {
         throw new Error(`Unsupported onebot chatId: ${chatId}`);
     }
 
-    private async deleteMessages(chatId: string, messageIds: string[]): Promise<void> {
+    private async deleteMessages(_chatId: string, messageIds: string[]): Promise<void> {
+        // delete_msg 在群聊与私聊都可用（撤回自己的消息），无需按 chat 类型分流
         if (messageIds.length === 0) return;
-        const parsed = parseChatId(chatId);
-        if (parsed.groupId == null) {
-            throw new Error("deleteMessages: OneBot 目前仅支持群消息撤回");
-        }
         for (const id of messageIds) {
             await this.callAction("delete_msg", { message_id: Number(id) });
         }
@@ -1492,7 +1687,7 @@ export class OneBotAdapter implements PlatformAdapter {
     }
 
     private async prepareOutgoingMessage(message: OneBotOutgoingMessage, opts: Record<string, unknown>): Promise<OneBotOutgoingMessage> {
-        const mentionSegments = this.outgoingMentionTargets(opts.mentions)
+        const mentionSegments = normalizeMentionTargetsUtil(opts.mentions)
             .map(qq => ({ type: "at", data: { qq } }));
 
         if (typeof message === "string") {
@@ -1528,7 +1723,7 @@ export class OneBotAdapter implements PlatformAdapter {
         if (type === "at") {
             const rawTarget = data.qq ?? data.user_id ?? data.id;
             if (String(rawTarget).startsWith("onebot:group:")) validateOneBotMentionTarget(String(rawTarget));
-            const qq = this.normalizeMentionTarget(rawTarget);
+            const qq = normalizeMentionTargetUtil(rawTarget);
             validateOneBotMentionTarget(qq);
             return { type, data: { ...data, qq } };
         }
@@ -1583,14 +1778,12 @@ export class OneBotAdapter implements PlatformAdapter {
             || value.startsWith("file://")
             || value.startsWith("data:");
     }
-
     private outgoingMentionTargets(value: unknown): string[] {
         if (JSON.stringify(value)?.includes("onebot:group:")) throw new Error("QQ @ 需要用户 QQ 号，不能传入群 chatId");
-        const targets = this.normalizeMentionTargets(value);
+        const targets = normalizeMentionTargetsUtil(value);
         targets.forEach(validateOneBotMentionTarget);
         return targets;
     }
-
     private sanitizeOutgoingMediaOptions(chatId: string, media: Record<string, unknown>, opts: Record<string, unknown>): Record<string, unknown> {
         const mediaType = String(media.type ?? "");
         if ((mediaType !== "audio" && mediaType !== "voice") || opts.replyTo == null) {
@@ -1607,7 +1800,7 @@ export class OneBotAdapter implements PlatformAdapter {
         return nextOpts;
     }
 
-    private handleWsMessage(raw: string): void {
+    private async handleWsMessage(raw: string): Promise<void> {
         const payload = JSON.parse(raw) as OneBotIncomingEvent | OneBotActionResponse;
 
         if (typeof (payload as OneBotActionResponse).echo === "string") {
@@ -1618,7 +1811,8 @@ export class OneBotAdapter implements PlatformAdapter {
             this.pending.delete(echo);
             const resp = payload as OneBotActionResponse;
             if (resp.status === "failed" || (typeof resp.retcode === "number" && resp.retcode !== 0)) {
-                pending.reject(new Error(resp.message ?? `OneBot action failed: ${resp.retcode}`));
+                const detail = resp.wording ?? resp.message ?? `OneBot action failed: retcode=${resp.retcode}`;
+                pending.reject(new Error(detail));
             } else {
                 pending.resolve(resp.data ?? resp);
             }
@@ -1636,7 +1830,6 @@ export class OneBotAdapter implements PlatformAdapter {
         if (event.post_type !== "message") return;
         if (String(event.self_id ?? "") !== String(this.config.selfId)) return;
 
-        // normalizeIncomingMessage 是异步的（需要调用 OneBot API 获取群名/昵称）
         this.normalizeIncomingMessage(event).then(normalized => {
             if (!normalized) return;
 
@@ -1773,49 +1966,65 @@ export class OneBotAdapter implements PlatformAdapter {
     }
 
     /**
-     * 异步获取群名称，带缓存。
-     * 调用 OneBot get_group_info API，成功后缓存结果。
+     * 异步获取群名称，带缓存与 in-flight 去重。
+     * 并发同一 groupId 时复用单次 RPC；调用 OneBot get_group_info API，成功后缓存结果。
      */
     private async fetchGroupName(groupId: string): Promise<string | undefined> {
         if (this.groupNameCache.has(groupId)) {
             return this.groupNameCache.get(groupId)!;
         }
-        try {
-            const result = await this.callAction("get_group_info", { group_id: Number(groupId) }) as Record<string, unknown>;
-            const data = (result?.data ?? result) as Record<string, unknown> | undefined;
-            const name = typeof data?.group_name === "string" ? data.group_name : undefined;
-            if (name) {
-                this.groupNameCache.set(groupId, name);
-                log.debug("获取群名成功", { groupId, groupName: name });
+        const inflight = this.inflightGroupNameFetch.get(groupId);
+        if (inflight) return inflight;
+
+        const promise = (async () => {
+            try {
+                const data = await this.callAction("get_group_info", { group_id: Number(groupId) }) as Record<string, unknown> | undefined;
+                const name = typeof data?.group_name === "string" ? data.group_name : undefined;
+                if (name) {
+                    this.groupNameCache.set(groupId, name);
+                    log.debug("获取群名成功", { groupId, groupName: name });
+                }
+                return name;
+            } catch (err) {
+                log.warn("获取群名失败", { groupId, error: String(err) });
+                return undefined;
+            } finally {
+                this.inflightGroupNameFetch.delete(groupId);
             }
-            return name;
-        } catch (err) {
-            log.warn("获取群名失败", { groupId, error: String(err) });
-            return undefined;
-        }
+        })();
+        this.inflightGroupNameFetch.set(groupId, promise);
+        return promise;
     }
 
     /**
-     * 异步获取用户昵称，带缓存。
-     * 调用 OneBot get_stranger_info API，成功后缓存结果。
+     * 异步获取用户昵称，带缓存与 in-flight 去重。
+     * 并发同一 userId 时复用单次 RPC。
      */
     private async fetchUserNickname(userId: string): Promise<string | undefined> {
         if (this.userNickCache.has(userId)) {
             return this.userNickCache.get(userId)!;
         }
-        try {
-            const result = await this.callAction("get_stranger_info", { user_id: Number(userId) }) as Record<string, unknown>;
-            const data = (result?.data ?? result) as Record<string, unknown> | undefined;
-            const nickname = typeof data?.nickname === "string" ? data.nickname : undefined;
-            if (nickname) {
-                this.userNickCache.set(userId, nickname);
-                log.debug("获取用户昵称成功", { userId, nickname });
+        const inflight = this.inflightUserNickFetch.get(userId);
+        if (inflight) return inflight;
+
+        const promise = (async () => {
+            try {
+                const data = await this.callAction("get_stranger_info", { user_id: Number(userId) }) as Record<string, unknown> | undefined;
+                const nickname = typeof data?.nickname === "string" ? data.nickname : undefined;
+                if (nickname) {
+                    this.userNickCache.set(userId, nickname);
+                    log.debug("获取用户昵称成功", { userId, nickname });
+                }
+                return nickname;
+            } catch (err) {
+                log.warn("获取用户昵称失败", { userId, error: String(err) });
+                return undefined;
+            } finally {
+                this.inflightUserNickFetch.delete(userId);
             }
-            return nickname;
-        } catch (err) {
-            log.warn("获取用户昵称失败", { userId, error: String(err) });
-            return undefined;
-        }
+        })();
+        this.inflightUserNickFetch.set(userId, promise);
+        return promise;
     }
 
     private async normalizeIncomingMessage(event: OneBotIncomingEvent): Promise<NormalizedOneBotIncomingMessage | null> {
@@ -1838,17 +2047,23 @@ export class OneBotAdapter implements PlatformAdapter {
         const replyToMessageId = this.extractReplyTo(normalizedMessage) ?? (event.reply?.message_id != null ? String(event.reply.message_id) : undefined);
         const normalizedText = text || (mediaInfo ? this.mediaPlaceholder(mediaInfo.type) : "");
 
-        // 异步获取群名或用户昵称作为 chatTitle
-        let chatTitle: string | undefined;
+        // chatTitle：命中缓存同步返回；未命中先用 fallback (groupId / displayName)，
+        // 后台 fire-and-forget 触发 fetch 写入缓存，下条消息能用上漂亮名字。
+        // 下游 main.ts 每条消息都会 upsert GroupModel.chatTitle，不依赖首条就有最终值。
+        let chatTitle: string;
         if (messageType === "group") {
             const groupId = String(event.group_id ?? "");
-            chatTitle = await this.fetchGroupName(groupId);
-            // 回退：缓存未命中时先用群号，后台获取成功后会在下条消息更新
-            if (!chatTitle) chatTitle = groupId;
+            const cached = this.groupNameCache.get(groupId);
+            chatTitle = cached ?? groupId;
+            if (!cached && groupId) {
+                this.fetchGroupName(groupId).catch(() => undefined);
+            }
         } else {
-            // 私聊：用对方昵称作为 chatTitle
-            const nickname = await this.fetchUserNickname(userId);
-            chatTitle = nickname || displayName;
+            const cached = this.userNickCache.get(userId);
+            chatTitle = cached ?? displayName;
+            if (!cached) {
+                this.fetchUserNickname(userId).catch(() => undefined);
+            }
         }
 
         // 缓存发送者昵称（群聊时也缓存群成员昵称）
@@ -1945,7 +2160,7 @@ export class OneBotAdapter implements PlatformAdapter {
         const seen = new Set<string>();
         for (const seg of message) {
             if (seg.type !== "at") continue;
-            const rawUserId = this.normalizeMentionTarget(seg.data?.qq ?? seg.data?.user_id ?? seg.data?.id);
+            const rawUserId = normalizeMentionTargetUtil(seg.data?.qq ?? seg.data?.user_id ?? seg.data?.id);
             if (!rawUserId) continue;
             const key = rawUserId.toLowerCase();
             if (seen.has(key)) continue;
@@ -1997,7 +2212,7 @@ export class OneBotAdapter implements PlatformAdapter {
         return message.map(seg => {
             if (seg.type === "text") return String(seg.data?.text ?? "");
             if (seg.type === "at") {
-                const rawUserId = this.normalizeMentionTarget(seg.data?.qq ?? seg.data?.user_id ?? seg.data?.id);
+                const rawUserId = normalizeMentionTargetUtil(seg.data?.qq ?? seg.data?.user_id ?? seg.data?.id);
                 if (!rawUserId) return "@";
                 const label = rawUserId.toLowerCase() === "all"
                     ? "全体成员"
@@ -2128,91 +2343,6 @@ export class OneBotAdapter implements PlatformAdapter {
         }
     }
 
-    private normalizeMentionTarget(value: unknown): string {
-        const raw = String(value ?? "").trim();
-        if (!raw) return "";
-        if (raw.toLowerCase() === "all") return "all";
-
-        let candidate = raw;
-        const cqMatch = /^\[CQ:at,qq=([^,\]]+)/i.exec(candidate);
-        if (cqMatch) candidate = cqMatch[1];
-        if (candidate.startsWith("@")) candidate = candidate.slice(1);
-        if (candidate.startsWith("qq:")) candidate = candidate.slice("qq:".length);
-
-        if (candidate.startsWith("onebot:")) {
-            const parsed = parseChatId(candidate);
-            if (parsed.rawId.startsWith("private:")) {
-                candidate = parsed.rawId.slice("private:".length);
-            } else if (parsed.rawId.startsWith("group:")) {
-                candidate = parsed.rawId.slice("group:".length);
-            } else {
-                candidate = parsed.rawId;
-            }
-        }
-
-        return candidate.trim();
-    }
-
-    private normalizeMentionTargets(value: unknown): string[] {
-        const result: string[] = [];
-        const seen = new Set<string>();
-        const add = (target: string) => {
-            if (!target) return;
-            const key = target.toLowerCase();
-            if (seen.has(key)) return;
-            seen.add(key);
-            result.push(target);
-        };
-        const visit = (item: unknown): void => {
-            if (item == null) return;
-            if (Array.isArray(item)) {
-                for (const child of item) visit(child);
-                return;
-            }
-            const raw = String(item).trim();
-            if (!raw) return;
-            const cqMatches = [...raw.matchAll(/\[CQ:at,qq=([^,\]]+)/ig)];
-            if (cqMatches.length > 0) {
-                for (const match of cqMatches) add(this.normalizeMentionTarget(match[1]));
-                return;
-            }
-            if (/[,，、;；\s]/.test(raw)) {
-                for (const part of raw.split(/[,，、;；\s]+/)) {
-                    add(this.normalizeMentionTarget(part));
-                }
-                return;
-            }
-            add(this.normalizeMentionTarget(raw));
-        };
-        visit(value);
-        return result;
-    }
-
-    private outgoingMessageText(message: OneBotOutgoingMessage): string {
-        if (typeof message === "string") return message;
-        return message.map(segment => {
-            const data = segment.data ?? {};
-            switch (segment.type) {
-                case "text":
-                    return String(data.text ?? "");
-                case "at": {
-                    const qq = this.normalizeMentionTarget(data.qq ?? data.user_id ?? data.id);
-                    return qq ? `@${qq}` : "@";
-                }
-                case "face":
-                    return `[face:${String(data.id ?? "")}]`;
-                case "reply":
-                    return `[reply:${String(data.id ?? data.message_id ?? "")}]`;
-                case "image":
-                case "record":
-                case "video":
-                case "file":
-                    return `[${segment.type}:${String(data.file ?? "")}]`;
-                default:
-                    return `[${segment.type}]`;
-            }
-        }).join("");
-    }
 
     private async callAction(action: string, params: Record<string, unknown>): Promise<unknown> {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {

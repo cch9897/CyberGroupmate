@@ -8,7 +8,7 @@ import type { ActiveUserProfile, GroupContextPackage, CodeActReplyTask, Dispatch
 import type { MemoryStoreV2 } from "../../memory-v2/index.js";
 import type { GlobalState } from "../../main-agent/global-state.js";
 import type { SubagentManager } from "../../subagent/subagent-manager.js";
-import { getGroupModelKey } from "../../core/chat-id.js";
+import { getGroupModelKey, isValidCompositeChatId } from "../../core/chat-id.js";
 import { toUnixTimestampMs } from "../../core/timezone.js";
 import { requireNonEmptyString } from "./params.js";
 import {
@@ -103,6 +103,12 @@ export interface DispatchApiDeps {
     initializeExecutor?: (executor: ExecutorLike, chatId: string) => void | Promise<void>;
     taskIdFactory?: () => string;
     getActiveUserProfilesForChat?: (chatId: string) => ActiveUserProfile[] | undefined;
+    /**
+     * chat_filter 出站闸口：返回 false 时拒绝向该 chat 派发任务。
+     * 生产 wiring 必须传入基于 `loadConfig().chatFilter` 的实时实现（支持热重载）；
+     * 单元测试可注入自己的谓词，避免隐式依赖仓库 config.yaml。
+     */
+    isChatAllowed?: (chatId: string) => boolean;
 }
 
 export function createDispatchApi(deps: DispatchApiDeps) {
@@ -114,6 +120,16 @@ export function createDispatchApi(deps: DispatchApiDeps) {
                 "派发目标会话 ID，形如 telegram:-1001234567890",
             );
             assertNoLegacyContext(taskSpec);
+            // 裸 ID / 非 composite 无法可靠归一到某平台，直接拒绝，避免黑名单
+            // 规则（如 onebot:group:xxx）匹配不到而 fail-open。
+            if (!isValidCompositeChatId(chatId)) {
+                throw new Error(`[chat_filter] dispatch.taskToGroup 拒绝派发：chatId=${chatId || "(empty)"} 不是有效的 composite chatId。`);
+            }
+            // chat_filter 出站闸口：必须在 getOrCreate 之前，确保被过滤会话
+            // 不会创建 Subagent / 任务记录，也不会进入 CodeAct 发送链路。
+            if (deps.isChatAllowed && !deps.isChatAllowed(chatId)) {
+                throw new Error(`[chat_filter] dispatch.taskToGroup 拒绝派发：目标 chat=${chatId} 被 chat_filter 拦截。`);
+            }
             const source = normalizeDispatchSource(options?.source);
             const subagent = deps.subagentManager.getOrCreate(chatId) as SubagentLike;
             const executor = await ensureExecutor(subagent, chatId, deps);
@@ -289,7 +305,7 @@ async function maybeRunGrounding(
     deps: DispatchApiDeps,
     contentDirection: string,
 ): Promise<string | undefined> {
-    if (!deps.groundingConfig?.apiKey) {
+    if (!deps.groundingConfig?.apiKey || deps.groundingConfig?.enabled === false) {
         return undefined;
     }
 

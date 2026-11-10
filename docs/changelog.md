@@ -1,5 +1,68 @@
 # Changelog
 
+## 2026-10-23: 修复 chat_filter 白名单外的群仍收到机器人消息
+
+`config.yaml` 的 `chat_filter` 是 whitelist，但 `onebot:group:123456789` 在过滤生效后仍收到 Meta-dispatched CodeAct 消息。入站拦截只保证消息不再进入处理 pipeline：被拦截消息仍写入 `message_log`（`access_control_blocked=1`），被拦截群仍写入 `group_models`；而 Meta 的 `conversations.inbox` 通过未过滤的 `getRecentMessages` 把 blocked 消息当作未读，`dispatch.taskToGroup` 与 sandbox adapter 写路径又没有 chat 级校验，最终经 OneBot `send_group_msg` 发出。
+
+### 🐛 修复
+
+- 新增 `isChatBlockedByFilter(config, chatId)`（chat 级、无 sender 语义），作为出站统一判定；未标注 group/private 的 OneBot 目标会同时按两种形态匹配，避免黑名单漏判。
+- `dispatch.taskToGroup` 在 `getOrCreate` 前校验：非 composite chatId 直接拒绝；被 `chat_filter` 拦截时抛含 `chat_filter` 与 chatId 的错误，不创建 Subagent / 任务记录。生产 wiring 每次调用读取 `loadConfig().chatFilter`，release 热重载后立即放行。
+- `sandbox/host-call-handler` 的 adapter 写路径新增无条件、fail-closed 闸口（独立于 `restrict_adapter_writes_to_bound_chat`）：显式目标优先，裸 ID 按绑定平台补全；无显式目标的写方法回退绑定 chat；`__background__` 无法解析目标时拒绝；读操作与 self target 放行。覆盖 `sandbox_call`、shell wake、dispatch 回源通知等经 `__background__` 的写调用，以及 mtcute `answerText/replyText/*Media` 等无法提取目标的方法。
+- `emergency.block` 的预设文案发送前同样经过 chat_filter（拉黑动作本身仍生效）。
+- `getRecentMessages` / `queryMessages` 新增 `includeBlocked`（默认 true，Dashboard 不受影响）。`conversations.inbox/messages/query`、`code-act-executor.refreshTaskMessages` 传 `false`。
+- `conversations.inbox` 对 subagents 与 `group_models` 两个来源做 chat 级剔除；`messages(blockedChatId)` 明确拒绝；`query` 过滤显式/全局结果中的 blocked chat，且显式限定全部被过滤时返回空结果而非退化成全局搜索。不再依赖「latestMessage 为空」判断。
+- 未修改 `config.yaml` 白名单，未跳过 `restoreAll`。
+
+### 🧪 测试
+
+- 新增 `tests/chat-filter-outbound.test.ts`：adapter 写闸口、`__background__` fail-closed、mtcute 无目标回退、self/read 放行、Dashboard release 热重载、`emergency.block` 不发送、inbox/messages/query 的 chat 级过滤、blocked 历史与 blocked 新消息并存场景、`includeBlocked` 默认 true。
+- 扩展 `tests/inbound-filter.test.ts` 与 `tests/meta-api-dispatch.test.ts`。
+- `npx tsc --noEmit` 通过；定向测试 34 个 + 回归测试 108 个 + 全量 1156 个测试全部通过。
+
+### 改动文件清单
+
+| 文件 | 变更 |
+|---|---|
+| `src/core/inbound-filter.ts` | 新增 `isChatBlockedByFilter`；OneBot 未标注目标的双形态候选 |
+| `src/meta-sandbox/meta-api/dispatch.ts` | composite 校验 + `isChatAllowed` 闸口（getOrCreate 前） |
+| `src/meta-sandbox/meta-api/index.ts` | 生产 wiring 每次读取 `loadConfig().chatFilter` |
+| `src/meta-sandbox/meta-api/conversations.ts` | inbox/messages/query chat 级过滤 + `includeBlocked:false` |
+| `src/sandbox/host-call-handler.ts` | adapter 写路径无条件 fail-closed 闸口；emergency.block 发送闸口；写限制开关改用缓存配置 |
+| `src/memory-v2/memory-v2.ts` / `types.ts` | `getRecentMessages` / `queryMessages` 支持 `includeBlocked` |
+| `src/subagent/code-act-executor.ts` | `refreshTaskMessages` 过滤 blocked 行 |
+| `tests/inbound-filter.test.ts`、`tests/meta-api-dispatch.test.ts`、`tests/meta-api-conversations.test.ts`、`tests/chat-filter-outbound.test.ts` | 契约与回归测试 |
+
+---
+
+## 2026-10-22: 修复 QQ 出站动图表情包被压成静态首帧
+
+QQ 收到的多帧 GIF 常被 NapCat 以 `.jpg` / `.png` 文件名回传，`media-downloader` 落盘时沿用了错误扩展名。出站 `isAnimatedImagePath()` 只按扩展名判断（仅 `.webp` 做 magic 嗅探），`resizeStickerImageForQq()` 对非 `.gif` 走 `ffmpeg -frames:v 1`，把动画压成首帧 PNG 后再以 base64 发出，接收方看到的就是静态图。
+
+### 🐛 修复
+
+- 新增 `sniffImageAnimation()`：按内容识别 GIF87a/GIF89a、APNG（IDAT 前 `acTL`）、animated WebP（`ANMF`）；`.webm` / `.tgs` 仍按扩展名识别。
+- `isAnimatedImagePath()`、`normalizeOutgoingImageFile()`、`resizeStickerImageForQq()` 共用同一内容判断；GIF 内容在贴纸、photo、普通 image segment 路径都会补正为 `.gif`。
+- 内容已是 GIF 但扩展名错误时，先补正为 `.gif` 路径，避免 NapCat 按扩展名误判；`sendSticker` 的 200px 缩放阶段仍会用 `palettegen` / `paletteuse` 重新编码 GIF。
+- animated WebP / webm 尝试转为 GIF；当前环境的 ffmpeg 8.0.1 无法解码 animated WebP（`image data not found`）时会回退原文件，不会压成首帧。
+- 动画缩放使用 `palettegen` / `paletteuse` 保帧并输出 `.gif`；仅静态图走 `-frames:v 1` 输出 `.png`。
+- 嗅探快路径只读 64KB 文件头；若辅助块（如 >64KB 的 `tEXt` / `iCCP`）把 `acTL` / `ANMF` 推到前缀之外，则回退读取整个文件一次再判定（最多读 16MB，仍无法定论则按静态图处理）。
+- 已知限制：APNG 目前只在贴纸缩放路径转为 GIF；`sendMedia(photo)` 等非贴纸路径仍保留 APNG 原字节，NapCat 会按 JPEG 处理，可能仍显示静态首帧。
+
+### 🧪 测试
+
+- `tests/onebot-adapter.test.ts` 新增 6 个回归用例：GIF 字节命名为 `.png` / `.jpg` 经 `sendSticker` 仍为多帧 GIF；GIF 字节经 `sendMedia(type=photo)` 仍为多帧 GIF；APNG 转多帧 GIF；`acTL` 位于 >64KB `tEXt` 辅助块之后时仍判定为 APNG；静态 PNG 仍为单帧 PNG。
+- `pnpm test`：1140 个测试全部通过。
+
+### 改动文件清单
+
+| 文件 | 变更 |
+|---|---|
+| `src/adapter/onebot-adapter.ts` | 新增内容嗅探（三态判定 + 64KB 前缀/整文件回退）；出站动图分支与缩放改为按内容判断；GIF 扩展名补正 |
+| `tests/onebot-adapter.test.ts` | 新增 6 个动图/静态图发送回归测试（含 >64KB 辅助块后的 APNG 嗅探） |
+
+---
+
 ## 2026-10-15: 修复贴纸发送策略失效 + 新增 searchStickers 搜索 API
 
 meta-codeact 重构（移除 `dispatch-handler.ts`）时丢失了 `sticker_sending_mode` 的全部运行时校验，导致 `allow_listed` / `disallow_all` 模式下 Agent 仍可通过 `sendSticker`（任意 uniqueFileId）或 `sendMedia(type=sticker)` 发送允许列表外的贴纸。本次在 adapter 层重新接入强制校验，并为 Agent 提供合规的贴纸库搜索入口。

@@ -404,7 +404,6 @@ export async function processMediaBatch(
             downloadFn,
             stickerCache,
             mediaDownloader,
-            imageCatalog,
         );
         // 复用结果到同 uniqueFileId 的所有条目（修正 messageIndex）
         return group.map(s => s === representative
@@ -535,12 +534,12 @@ export async function processMediaBatch(
         }
     }
 
-    // ─── 图片目录追踪（记录 photo 的 SHA256 + 出现频率 + pHash/dHash） ───
+    // ─── 图片目录追踪（记录 photo/sticker 的 SHA256 + 出现频率 + pHash/dHash） ───
     if (imageCatalog) {
         const hashPromises: Array<Promise<void>> = [];
         for (const pm of results) {
             const att = resultSources.get(pm) ?? attachments.find(a => a.messageIndex === pm.index);
-            if (!att || att.type !== "photo") continue;
+            if (!att || (att.type !== "photo" && att.type !== "sticker")) continue;
             let rawBuffer: Buffer | undefined;
             if (pm.base64Data) {
                 rawBuffer = Buffer.from(pm.base64Data, "base64");
@@ -736,7 +735,6 @@ async function processSingleSticker(
     downloadFn?: DownloadFn,
     stickerCache?: StickerCache,
     mediaDownloader?: MediaDownloader,
-    imageCatalog?: ImageCatalog,
 ): Promise<ProcessedMedia> {
     const mode = config?.stickerMode ?? "emoji_only";
     const animated = isAnimatedSticker(sticker);

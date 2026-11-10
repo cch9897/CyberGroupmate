@@ -1,4 +1,5 @@
 import { type GroundingConfig, loadConfig } from "../../core/config.js";
+import { isChatBlockedByFilter } from "../../core/inbound-filter.js";
 import { buildVisibilityDeps } from "../../core/visibility-policy.js";
 import type { AttentionAccumulator } from "../../accumulator/attention-accumulator.js";
 import type { MemoryStoreV2 } from "../../memory-v2/index.js";
@@ -43,8 +44,12 @@ export interface BuildMetaApiContextDeps extends Omit<DispatchApiDeps, "subagent
 }
 
 export function buildMetaApiContext(deps: BuildMetaApiContextDeps) {
+    // 每次调用都重新读 loadConfig()（Dashboard release 会 saveConfig 热重载），
+    // 不得捕获启动时的 chatFilter 快照。
+    const isChatAllowed = (chatId: string) => !isChatBlockedByFilter(loadConfig().chatFilter, chatId);
+
     return {
-        conversations: createConversationsApi(deps.memory, deps.subagentManager),
+        conversations: createConversationsApi(deps.memory, deps.subagentManager, { isChatAllowed }),
         memory: createMemoryApi(deps.memory),
         privacy: createPrivacyApi(
             deps.memory,
@@ -69,6 +74,7 @@ export function buildMetaApiContext(deps: BuildMetaApiContextDeps) {
             globalState: deps.globalState,
             subagentManager: deps.subagentManager,
             accumulator: deps.accumulator,
+            isChatAllowed,
             onTaskDispatched: deps.onTaskDispatched,
             groundingConfig: deps.groundingConfig,
             groundingRunner: deps.groundingRunner,

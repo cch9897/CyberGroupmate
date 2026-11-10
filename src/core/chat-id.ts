@@ -57,7 +57,6 @@ export function composeChatId(platform: PlatformName, ...parts: string[]): strin
     }
     return `${platform}:${parts.join(":")}`;
 }
-
 /**
  * 解析 composite chatId。
  *
@@ -71,11 +70,22 @@ export function composeChatId(platform: PlatformName, ...parts: string[]): strin
  * parseChatId("discord:user789")
  *   → { platform: "discord", rawId: "user789" }  (DM, 无 groupId/channelId)
  *
- * parseChatId("onebot:group:679691983")
- *   → { platform: "onebot", rawId: "group:679691983", groupId: "679691983" }
+ * parseChatId("onebot:group:987654321")
+ *   → { platform: "onebot", rawId: "group:987654321", groupId: "987654321" }
  *
- * parseChatId("onebot:private:1694442676")
- *   → { platform: "onebot", rawId: "private:1694442676" }  (私聊, 无 groupId)
+ * parseChatId("onebot:private:111111111")
+ *   → { platform: "onebot", rawId: "private:111111111" }  (私聊, 无 groupId)
+ *
+ * ─── OneBot 复合 ID 迁移说明（自 4e5d15f） ───
+ * OneBot 平台的所有标识符（chatId 与 userId）均使用上述三段式复合 ID：
+ *   - 群聊 chatId：onebot:group:<groupId>
+ *   - 私聊 chatId：onebot:private:<userId>
+ *   - 用户标识符：onebot:private:<userId>（入站 normalizeIncomingMessage 返回的 userId）
+ *
+ * 此变更属 breaking：4e5d15f 之前入站 userId 为裸 QQ 号，之后改为复合 ID。
+ * 下游 person profile / memory / dedup / reflection 均已兼容复合形态。
+ * 裸 QQ 号仍可通过 adapter 内部的归一化逻辑反向解析（接受裸 QQ、CQ 码、@前缀、
+ * qq: 前缀、onebot:private: / onebot:group: / onebot: 等多种形态，统一还原为裸 QQ 号）。
  */
 export function parseChatId(compositeId: string): ParsedChatId {
     if (!compositeId) {
@@ -252,7 +262,7 @@ export function fileNameToChatId(fileName: string): string {
     }
 
     // OneBot: 三段式（onebot:group:xxx / onebot:private:xxx），需将 _ 还原为 :
-    // onebot_group_679691983 → onebot:group:679691983
+    // onebot_group_987654321 → onebot:group:987654321
     if (platform === "onebot") {
         return `onebot:${rest.replaceAll("_", ":")}`;
     }

@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { relative, resolve } from "node:path";
-import { ensureCompositeId, getGroupModelKey, getPlatform, isValidCompositeChatId } from "../core/chat-id.js";
+import { ensureCompositeId, getGroupModelKey, getPlatform, isValidCompositeChatId, type PlatformName } from "../core/chat-id.js";
 import {
     assertEgressAllowed,
     isExplicitReadBlocked,
@@ -20,8 +20,14 @@ import {
     type EnvironmentVariable,
 } from "../core/config.js";
 import { validateCronMinInterval } from "../core/cron-matcher.js";
+import { isChatBlockedByFilter } from "../core/inbound-filter.js";
 import { createLogger } from "../core/logger.js";
 import { describeImage, ensureSupportedFormat } from "../core/vision-processor.js";
+import {
+    normalizeMentionTarget as normalizeOneBotMentionTarget,
+    normalizeMentionTargets as normalizeOneBotMentionTargets,
+    summarizeOneBotMessage,
+} from "../adapter/onebot-message-utils.js";
 import { MemoryStoreV2 } from "../memory-v2/index.js";
 import { embed } from "../memory-v2/embedding.js";
 import { GlobalState } from "../main-agent/global-state.js";
@@ -69,7 +75,7 @@ interface DispatchApiLike {
     listTasks(options?: unknown): Promise<unknown>;
 }
 
-interface CreateSandboxHostCallHandlerDeps {
+export interface CreateSandboxHostCallHandlerDeps {
     appConfig: AppConfig;
     globalState: GlobalState;
     accumulator: AttentionAccumulator;
@@ -104,7 +110,9 @@ function isValidEnvKey(key: string): boolean {
 }
 
 function isBoundChatWriteRestrictionEnabled(): boolean {
-    return loadConfig("config.yaml", true).subagent?.restrictAdapterWritesToBoundChat === true;
+    // 与 chat_filter 等同走缓存；saveConfig 会刷新缓存，避免每次写调用强制重读文件
+    // 并把测试/热重载注入的配置覆盖掉。
+    return loadConfig().subagent?.restrictAdapterWritesToBoundChat === true;
 }
 
 /**
@@ -165,26 +173,75 @@ function getFeishuReadTarget(method: string, args: unknown[]): string | undefine
     return target;
 }
 
-function getRestrictedWriteTarget(method: string, args: unknown[], adapter: PlatformAdapter): unknown {
-    if (adapter.getWriteMethods().includes(method)) return args[0];
-    if (method === "feishu.callApi" && FEISHU_WRITE_ACTIONS.has(String(args[1] ?? ""))) return args[0];
+/**
+ * 识别 adapter 写调用并提取显式目标。
+ *
+ * `write` 与 `target` 必须一起返回：有些写方法（如 mtcute 的
+ * answerText / replyText / *Media）按消息上下文发送，目标无法从参数中提取；
+ * 调用方需要把它们按「默认目标 = 绑定 chat」处理，而不是当成读操作放行。
+ */
+function getAdapterWriteIntent(
+    method: string,
+    args: unknown[],
+    adapter: PlatformAdapter,
+): { write: boolean; target?: unknown } {
+    if (adapter.getWriteMethods().includes(method)) return { write: true, target: args[0] };
+    if (method === "feishu.callApi" && FEISHU_WRITE_ACTIONS.has(String(args[1] ?? ""))) {
+        return { write: true, target: args[0] };
+    }
     if (adapter.platform === "telegram" && method.startsWith("telegram.")) {
         const mtcuteMethod = method.slice("telegram.".length);
         if (TELEGRAM_MTCUTE_WRITE_METHODS.has(mtcuteMethod)) {
-            return getTelegramMtcuteWriteTarget(mtcuteMethod, args);
+            return { write: true, target: getTelegramMtcuteWriteTarget(mtcuteMethod, args) };
         }
     }
     if (method === "telegram.mtcute") {
         const mtcuteMethod = String(args[0] ?? "");
-        if (!TELEGRAM_MTCUTE_WRITE_METHODS.has(mtcuteMethod)) return undefined;
-        return getTelegramMtcuteWriteTarget(mtcuteMethod, args.slice(1));
+        if (TELEGRAM_MTCUTE_WRITE_METHODS.has(mtcuteMethod)) {
+            return { write: true, target: getTelegramMtcuteWriteTarget(mtcuteMethod, args.slice(1)) };
+        }
     }
     if (adapter.platform === "onebot") {
         const native = getOneBotNativeParams(method, args);
         if (native && isOneBotNapCatWriteAction(native.action)) {
-            return getOneBotNapCatWriteTarget(native.action, native.params);
+            return { write: true, target: getOneBotNapCatWriteTarget(native.action, native.params) };
         }
     }
+    return { write: false };
+}
+
+/**
+ * 解析写调用的实际目标 chat。
+ *
+ * - 显式 target：composite 直接使用；裸 ID 按绑定平台（background 用 adapter 平台）补全。
+ * - self target（me / self）：返回 null，显式放行（adapter 自身会限定范围）。
+ * - 无显式 target：退回绑定 chat；`__background__` 且无法解析出实际目标时返回
+ *   undefined，由调用方 fail-closed。
+ */
+function resolveWriteChatId(
+    chatId: string,
+    adapter: PlatformAdapter,
+    writeTarget: unknown,
+): string | null | undefined {
+    const platform = (chatId !== "__background__" && isValidCompositeChatId(chatId)
+        ? getPlatform(chatId)
+        // PlatformAdapter.platform 是字符串；实现方保证是已知平台名。
+        : adapter.platform) as PlatformName;
+
+    if (writeTarget != null) {
+        if (isSelfTarget(writeTarget)) return null;
+        if (typeof writeTarget === "string") {
+            const target = writeTarget.trim();
+            if (target) {
+                return isValidCompositeChatId(target) ? target : ensureCompositeId(platform, target);
+            }
+        } else if (typeof writeTarget === "number" || typeof writeTarget === "bigint") {
+            return ensureCompositeId(platform, String(writeTarget));
+        }
+        // 非空但无法解析的显式目标：按「无显式目标」处理（绑定 chat / fail-closed）。
+    }
+
+    if (chatId !== "__background__" && isValidCompositeChatId(chatId)) return chatId;
     return undefined;
 }
 
@@ -278,83 +335,6 @@ function getOneBotNativeParams(method: string, args: unknown[]): { action: strin
 function getOneBotNativeMessageText(params: unknown): string {
     const rec = params && typeof params === "object" ? params as Record<string, unknown> : {};
     return summarizeOneBotMessage(rec.message);
-}
-
-function normalizeOneBotMentionTarget(value: unknown): string {
-    const raw = String(value ?? "").trim();
-    if (!raw) return "";
-    if (raw.toLowerCase() === "all") return "all";
-    if (raw.startsWith("onebot:private:")) return raw.slice("onebot:private:".length);
-    if (raw.startsWith("onebot:")) return raw.slice("onebot:".length);
-    if (raw.startsWith("@")) return raw.slice(1);
-    return raw;
-}
-
-function normalizeOneBotMentionTargets(value: unknown): string[] {
-    const result: string[] = [];
-    const seen = new Set<string>();
-    const add = (target: string) => {
-        if (!target) return;
-        const key = target.toLowerCase();
-        if (seen.has(key)) return;
-        seen.add(key);
-        result.push(target);
-    };
-    const visit = (item: unknown): void => {
-        if (item == null) return;
-        if (Array.isArray(item)) {
-            for (const child of item) visit(child);
-            return;
-        }
-        const raw = String(item).trim();
-        if (!raw) return;
-        const cqMatches = [...raw.matchAll(/\[CQ:at,qq=([^,\]]+)/ig)];
-        if (cqMatches.length > 0) {
-            for (const match of cqMatches) add(normalizeOneBotMentionTarget(match[1]));
-            return;
-        }
-        if (/[,，、;；\s]/.test(raw)) {
-            for (const part of raw.split(/[,，、;；\s]+/)) {
-                add(normalizeOneBotMentionTarget(part));
-            }
-            return;
-        }
-        add(normalizeOneBotMentionTarget(raw));
-    };
-    visit(value);
-    return result;
-}
-
-function summarizeOneBotMessage(value: unknown): string {
-    if (typeof value === "string") return value;
-    if (!Array.isArray(value)) return String(value ?? "");
-    return value.map((segment) => {
-        if (!segment || typeof segment !== "object") return "";
-        const record = segment as Record<string, unknown>;
-        const type = String(record.type ?? "");
-        const data = record.data && typeof record.data === "object"
-            ? record.data as Record<string, unknown>
-            : {};
-        switch (type) {
-            case "text":
-                return String(data.text ?? "");
-            case "at": {
-                const qq = normalizeOneBotMentionTarget(data.qq ?? data.user_id ?? data.id);
-                return qq ? `@${qq}` : "@";
-            }
-            case "reply":
-                return `[reply:${String(data.id ?? data.message_id ?? "")}]`;
-            case "face":
-                return `[face:${String(data.id ?? "")}]`;
-            case "image":
-            case "record":
-            case "video":
-            case "file":
-                return `[${type}:${String(data.file ?? "")}]`;
-            default:
-                return type ? `[${type}]` : "";
-        }
-    }).join("");
 }
 
 function getSendIntent(platform: string, method: string, args: unknown[]): (InterruptedSendPayload & { textLength: number }) | null {
@@ -575,12 +555,31 @@ export function createSandboxHostCallHandler(chatId: string, deps: CreateSandbox
                     }
                 }
             }
-            // 提取一次写目标，R2 隔离与全局严格开关共用。
-            const writeTarget = getRestrictedWriteTarget(method, args, adapter);
+            // 提取一次写意图，R2 隔离与全局严格开关共用。
+            const writeIntent = getAdapterWriteIntent(method, args, adapter);
+            const writeTarget = writeIntent.target;
             const externalTarget = writeTarget != null && !isSelfTarget(writeTarget)
                 && chatId !== "__background__" && isValidCompositeChatId(chatId)
                 ? ensureCompositeId(getPlatform(chatId), String(writeTarget))
                 : null;
+
+            // chat_filter 出站闸口（无条件、fail-closed）：必须先于 R2 与
+            // restrictAdapterWritesToBoundChat 判定，且不依赖该开关（现网为 false）。
+            // 读方法直接放行；self target 放行；显式目标无法解析时退回绑定 chat；
+            // __background__ 且无法解析出实际目标时拒绝写调用。
+            if (writeIntent.write) {
+                const writeChatId = resolveWriteChatId(chatId, adapter, writeTarget);
+                if (writeChatId === undefined) {
+                    throw new Error(
+                        `[chat_filter] ${method} 被拦截：无法确定写入目标 chat，拒绝 __background__ 写操作。`
+                    );
+                }
+                if (writeChatId !== null && isChatBlockedByFilter(loadConfig().chatFilter, writeChatId)) {
+                    throw new Error(
+                        `[chat_filter] ${method} 被拦截：目标 chat=${writeChatId} 被 chat_filter 禁止。`
+                    );
+                }
+            }
 
             // R2 写隔离：私密会话内容不得外发（始终生效，独立于 restrictAdapterWritesToBoundChat 全局开关）。
             if (externalTarget) {
@@ -1150,6 +1149,11 @@ export function createSandboxHostCallHandler(chatId: string, deps: CreateSandbox
                 const message = loadConfig().emergencyBlock?.message ?? DEFAULT_EMERGENCY_BLOCK_MESSAGE;
                 if (adapter) {
                     try {
+                        // 与 :490-529 的 adapter 写闸口保持一致：被 chat_filter 拦截的会话
+                        // 不得发出预设文案（拉黑动作本身仍生效）。
+                        if (isChatBlockedByFilter(loadConfig().chatFilter, chatId)) {
+                            throw new Error(`[chat_filter] emergency.block 拒绝向 chat=${chatId} 发送预设文案。`);
+                        }
                         await adapter.handleCall(`${platform}.sendText`, [chatId, message]);
                         notified = true;
                     } catch (err) {

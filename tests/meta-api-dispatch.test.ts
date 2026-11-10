@@ -1,7 +1,9 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { createDispatchApi } from "../src/meta-sandbox/meta-api/dispatch.js";
+import { createDispatchApi, type DispatchApiDeps } from "../src/meta-sandbox/meta-api/dispatch.js";
+import type { GroupSubagent } from "../src/subagent/group-subagent.js";
 import { collectQuoteRefs, resolveQuoteRefs } from "../src/meta-sandbox/meta-api/quotes.js";
+import { isChatBlockedByFilter } from "../src/core/inbound-filter.js";
 
 describe("quote refs", () => {
     it("parses framework-owned refs and keeps external refs as literal strings", async () => {
@@ -322,5 +324,85 @@ describe("createDispatchApi", () => {
         assert.equal(reminders[0].bindingId, "telegram:3");
         assert.equal(reminders[0].callback, "检查 telegram:3 是否有回复，并决定是否继续跟进");
         assert.equal(reminders[0].data.trackingKey, "dispatch:task-meta-3");
+    });
+
+    it("rejects a chat blocked by chat_filter before creating a subagent or task record", async () => {
+        const filter = {
+            enabled: true,
+            mode: "whitelist" as const,
+            chatIds: ["onebot:group:987654321"],
+        };
+        let getOrCreateCalls = 0;
+        const records: unknown[] = [];
+        const digests: string[] = [];
+        const enqueued: unknown[] = [];
+        const marked: string[] = [];
+        const api = createDispatchApi({
+            memory: {} as unknown as DispatchApiDeps["memory"],
+            subagentManager: {
+                getOrCreate: () => {
+                    getOrCreateCalls += 1;
+                    return {
+                        chatId: "onebot:group:987654321",
+                        codeActExecutor: {
+                            enqueue: (task: unknown) => enqueued.push(task),
+                            getSessionFilePath: () => "",
+                        },
+                    } as unknown as GroupSubagent;
+                },
+                getSessionFilePath: () => "",
+            } as unknown as DispatchApiDeps["subagentManager"],
+            accumulator: {
+                markActioned: (chatId: string) => marked.push(chatId),
+            } as unknown as DispatchApiDeps["accumulator"],
+            globalState: {
+                recordDispatchedSubagentTask: (record: unknown) => records.push(record),
+                addSessionDigest: (content: string) => digests.push(content),
+                getSessionDigests: () => [],
+            } as unknown as DispatchApiDeps["globalState"],
+            isChatAllowed: (chatId) => !isChatBlockedByFilter(filter, chatId),
+            taskIdFactory: () => "task-filtered",
+        });
+
+        await assert.rejects(
+            () => api.taskToGroup("onebot:group:123456789", { contentDirection: "reply there" }),
+            /\[chat_filter\].*onebot:group:123456789/,
+        );
+
+        assert.equal(getOrCreateCalls, 0, "blocked dispatch must not create a subagent");
+        assert.deepEqual(records, []);
+        assert.deepEqual(digests, []);
+        assert.deepEqual(enqueued, []);
+        assert.deepEqual(marked, []);
+
+        const allowed = await api.taskToGroup("onebot:group:987654321", { contentDirection: "reply there" });
+        assert.equal(allowed.taskId, "task-filtered");
+        assert.equal(getOrCreateCalls, 1);
+        assert.equal(records.length, 1);
+        assert.equal(enqueued.length, 1);
+    });
+
+    it("rejects bare chat ids so blacklist rules cannot miss the target", async () => {
+        let getOrCreateCalls = 0;
+        const api = createDispatchApi({
+            memory: {} as unknown as DispatchApiDeps["memory"],
+            subagentManager: {
+                getOrCreate: () => {
+                    getOrCreateCalls += 1;
+                    throw new Error("getOrCreate must not be called for a bare chat id");
+                },
+                getSessionFilePath: () => "",
+            } as unknown as DispatchApiDeps["subagentManager"],
+            accumulator: {
+                markActioned: () => undefined,
+            } as unknown as DispatchApiDeps["accumulator"],
+            isChatAllowed: () => true,
+        });
+
+        await assert.rejects(
+            () => api.taskToGroup("123456789", { contentDirection: "reply" }),
+            /composite chatId/,
+        );
+        assert.equal(getOrCreateCalls, 0);
     });
 });

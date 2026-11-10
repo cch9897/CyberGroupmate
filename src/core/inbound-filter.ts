@@ -31,6 +31,24 @@ export function shouldDropInbound(
 }
 
 /**
+ * Chat 级过滤判定（出站语义）。
+ *
+ * 只按 chatId 判断，不传 userId：出站时需要回答的是「这个会话是否被
+ * chat_filter 整体禁止」，而不是「某个发送者是否被过滤」——后者的信息在
+ * 发送时并不存在。与入站共用同一套候选 ID / 通配符规则，因此 Dashboard
+ * 放行（releaseChatFromFilter + saveConfig）后热重载即可立即恢复放行。
+ *
+ * 调用方：dispatch.taskToGroup、sandbox adapter 写路径、Meta 读侧
+ * conversations.inbox/messages/query。
+ */
+export function isChatBlockedByFilter(
+    config: ChatFilterConfig | undefined,
+    chatId: string,
+): boolean {
+    return shouldDropInbound(config, { chatId });
+}
+
+/**
  * Return a copy of the filter config that releases one whole chat.
  *
  * Exact blacklist entries are removed. If a wildcard or sender rule would
@@ -96,6 +114,14 @@ function chatIdCandidates(chatId: string): string[] {
         // leaf keeps documented raw numeric IDs useful across every platform.
         const typedRaw = /^(?:group|private):(.+)$/.exec(parsed.rawId);
         addCandidate(candidates, typedRaw?.[1]);
+
+        // 出站目标可能是未标注 group/private 的 onebot:<id>（如 adapter 写方法的裸目标）。
+        // 同时按群聊/私聊两种形态参与匹配，避免黑名单条目 onebot:group:<id>
+        // 因形态不一致而 fail-open。
+        if (parsed.platform === "onebot" && !parsed.groupId && !parsed.rawId.startsWith("private:")) {
+            addCandidate(candidates, `onebot:group:${parsed.rawId}`);
+            addCandidate(candidates, `onebot:private:${parsed.rawId}`);
+        }
     } catch {
         // Raw IDs are valid filter targets too.
     }

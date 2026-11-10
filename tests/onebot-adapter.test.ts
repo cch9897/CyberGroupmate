@@ -1,11 +1,15 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve as pathResolve } from "node:path";
+import { crc32 } from "node:zlib";
 import { NotificationCenter } from "../src/event/notification-center.js";
 import type { NotificationEvent } from "../src/event/notification-center.js";
 import { OneBotAdapter } from "../src/adapter/onebot-adapter.js";
+import type { MediaDownloader } from "../src/core/media-downloader.js";
 import type { OneBotConfig } from "../src/core/config.js";
 
 function makeNC(): NotificationCenter {
@@ -28,6 +32,108 @@ function captureEvents(nc: NotificationCenter): NotificationEvent[] {
 
 async function waitForAsyncHandlers(): Promise<void> {
     await new Promise(resolve => setTimeout(resolve, 0));
+}
+
+function hasCommand(command: string): boolean {
+    try {
+        execFileSync("sh", ["-c", `command -v ${command}`], { stdio: "ignore" });
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function writeAnimatedGif(filePath: string): void {
+    execFileSync("ffmpeg", [
+        "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i", "testsrc=size=64x64:rate=5",
+        "-t", "0.6", "-loop", "0",
+        "-f", "gif",
+        filePath,
+    ], { timeout: 15000 });
+}
+
+function writeStaticPng(filePath: string): void {
+    execFileSync("ffmpeg", [
+        "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i", "color=c=red:s=64x64",
+        "-frames:v", "1",
+        filePath,
+    ], { timeout: 15000 });
+}
+
+function writeApng(filePath: string): void {
+    execFileSync("ffmpeg", [
+        "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i", "testsrc=size=64x64:rate=5",
+        "-t", "0.6", "-plays", "0",
+        "-f", "apng",
+        filePath,
+    ], { timeout: 15000 });
+}
+
+/**
+ * 生成一个 acTL 前带 >64KB tEXt 辅助块的 APNG（合法 PNG/APNG 布局）。
+ * 用于验证嗅探不会停在 64KB 前缀内把 APNG 误判成静态图。
+ * 注意：本环境的 ffmpeg 8.0.1 会把这种布局按单帧处理，因此测试只断言分类分支。
+ */
+function writeApngWithOversizedTextChunk(filePath: string): void {
+    writeApng(filePath);
+    const source = readFileSync(filePath);
+    let offset = 8;
+    while (offset + 8 <= source.length) {
+        const length = source.readUInt32BE(offset);
+        if (source.toString("latin1", offset + 4, offset + 8) === "acTL") break;
+        offset += 12 + length;
+    }
+    assert.equal(source.toString("latin1", offset + 4, offset + 8), "acTL", "ffmpeg APNG output must contain acTL");
+    const payload = Buffer.concat([
+        Buffer.from("Comment", "latin1"),
+        Buffer.from([0]),
+        Buffer.alloc(70 * 1024, 0x41),
+    ]);
+    const typeAndPayload = Buffer.concat([Buffer.from("tEXt", "latin1"), payload]);
+    const chunk = Buffer.alloc(12 + payload.length);
+    chunk.writeUInt32BE(payload.length, 0);
+    typeAndPayload.copy(chunk, 4);
+    chunk.writeUInt32BE(crc32(typeAndPayload), 4 + typeAndPayload.length);
+    writeFileSync(filePath, Buffer.concat([source.subarray(0, offset), chunk, source.subarray(offset)]));
+    assert.ok(offset + chunk.length > 64 * 1024, "acTL must land beyond the 64KB sniff prefix");
+}
+
+function countVideoFrames(filePath: string): number {
+    const raw = execFileSync("ffprobe", [
+        "-v", "error",
+        "-count_frames",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=nb_read_frames",
+        "-of", "default=nokey=1:noprint_wrappers=1",
+        filePath,
+    ], { timeout: 15000 }).toString().trim();
+    return Number(raw.split(/\s+/)[0]);
+}
+
+function decodeOutgoingImage(calls: Array<{ action: string; params: Record<string, unknown> }>): Buffer {
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].action, "send_group_msg");
+    const message = calls[0].params.message as Array<{ type: string; data?: Record<string, unknown> }>;
+    const image = message.find(segment => segment.type === "image");
+    assert.ok(image, "expected an image segment");
+    const file = String(image.data?.file ?? "");
+    assert.ok(file.startsWith("base64://"), `expected base64 image payload, got ${file.slice(0, 60)}`);
+    return Buffer.from(file.slice("base64://".length), "base64");
+}
+
+/** 清理适配器写入 workspace/Downloads/other/qq-converted 的测试产物。 */
+function cleanConvertedArtifacts(prefix: string): void {
+    const outDir = pathResolve(process.cwd(), "workspace", "Downloads", "other", "qq-converted");
+    try {
+        for (const name of readdirSync(outDir)) {
+            if (name.startsWith(`${prefix}_`)) unlinkSync(join(outDir, name));
+        }
+    } catch {
+        // 没有转换产物时目录可能不存在
+    }
 }
 
 describe("OneBotAdapter", () => {
@@ -74,7 +180,7 @@ describe("OneBotAdapter", () => {
         assert.equal(events[0].displayName, "Alice");
         assert.equal(events[0].text, "hi @BotName ping");
         assert.equal(events[0].mentionsAgent, true);
-        assert.equal(events[0].chatTitle, "Test QQ Group");
+        assert.equal(events[0].chatTitle, "42");
         assert.deepEqual(events[0].mentions, [{
             userId: "onebot:123456789",
             rawUserId: "123456789",
@@ -332,6 +438,367 @@ describe("OneBotAdapter", () => {
         assert.deepEqual(calls[0].params.message, [
             { type: "record", data: { file: `file://${pathResolve(process.cwd(), "workspace", "media/private_voice.ogg")}` } },
         ]);
+
+        nc.dispose();
+    });
+
+    for (const extension of ["png", "jpg"]) {
+        it(`keeps GIF frames when a cached sticker is named .${extension}`, {
+            skip: !(hasCommand("ffmpeg") && hasCommand("ffprobe")),
+        }, async () => {
+            const dir = mkdtempSync(join(tmpdir(), `onebot-sticker-${extension}-`));
+            const nc = makeNC();
+            const fixtureBase = `gif-as-${extension}-${randomUUID().slice(0, 8)}`;
+            try {
+                const source = join(dir, `${fixtureBase}.${extension}`);
+                writeAnimatedGif(source);
+                const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+                const mediaDownloader = {
+                    getExistingPath: (key: string) => key === "gif-sticker" ? source : null,
+                } as unknown as MediaDownloader;
+                const adapter = new OneBotAdapter(makeConfig({ sendFileAsDataUrl: true }), nc, mediaDownloader);
+                // @ts-expect-error - override private method for payload inspection
+                adapter.callAction = async (action: string, params: Record<string, unknown>) => {
+                    calls.push({ action, params });
+                    return { message_id: 1 };
+                };
+
+                // @ts-expect-error - invoke private sticker send path
+                await adapter.sendSticker("onebot:group:42", "gif-sticker", {});
+
+                const payload = decodeOutgoingImage(calls);
+                assert.match(payload.subarray(0, 6).toString("latin1"), /^GIF8[79]a$/);
+                const outPath = join(dir, "outgoing.gif");
+                writeFileSync(outPath, payload);
+                assert.ok(countVideoFrames(outPath) > 1, "animated GIF must keep more than one frame");
+            } finally {
+                cleanConvertedArtifacts(fixtureBase);
+                nc.dispose();
+                rmSync(dir, { recursive: true, force: true });
+            }
+        });
+    }
+
+    it("keeps GIF frames when sendMedia sends a .jpg-named GIF as a photo", {
+        skip: !(hasCommand("ffmpeg") && hasCommand("ffprobe")),
+    }, async () => {
+        const dir = mkdtempSync(join(tmpdir(), "onebot-photo-gif-"));
+        const nc = makeNC();
+        const fixtureBase = `photo-as-jpg-${randomUUID().slice(0, 8)}`;
+        try {
+            const source = join(dir, `${fixtureBase}.jpg`);
+            writeAnimatedGif(source);
+            const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+            const adapter = new OneBotAdapter(makeConfig({ sendFileAsDataUrl: true }), nc);
+            // @ts-expect-error - override private method for payload inspection
+            adapter.callAction = async (action: string, params: Record<string, unknown>) => {
+                calls.push({ action, params });
+                return { message_id: 4 };
+            };
+
+            // @ts-expect-error - invoke private media send path
+            await adapter.sendMedia("onebot:group:42", { type: "photo", file: source }, {});
+
+            const payload = decodeOutgoingImage(calls);
+            assert.match(payload.subarray(0, 6).toString("latin1"), /^GIF8[79]a$/);
+            const outPath = join(dir, "outgoing.gif");
+            writeFileSync(outPath, payload);
+            assert.ok(countVideoFrames(outPath) > 1, "photo path must not flatten a GIF");
+        } finally {
+            cleanConvertedArtifacts(fixtureBase);
+            nc.dispose();
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("keeps APNG frames when a cached sticker is a .png", {
+        skip: !(hasCommand("ffmpeg") && hasCommand("ffprobe")),
+    }, async () => {
+        const dir = mkdtempSync(join(tmpdir(), "onebot-sticker-apng-"));
+        const nc = makeNC();
+        const fixtureBase = `apng-${randomUUID().slice(0, 8)}`;
+        try {
+            const source = join(dir, `${fixtureBase}.png`);
+            writeApng(source);
+            const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+            const mediaDownloader = {
+                getExistingPath: (key: string) => key === "apng-sticker" ? source : null,
+            } as unknown as MediaDownloader;
+            const adapter = new OneBotAdapter(makeConfig({ sendFileAsDataUrl: true }), nc, mediaDownloader);
+            // @ts-expect-error - override private method for payload inspection
+            adapter.callAction = async (action: string, params: Record<string, unknown>) => {
+                calls.push({ action, params });
+                return { message_id: 3 };
+            };
+
+            // @ts-expect-error - invoke private sticker send path
+            await adapter.sendSticker("onebot:group:42", "apng-sticker", {});
+
+            const payload = decodeOutgoingImage(calls);
+            assert.match(payload.subarray(0, 6).toString("latin1"), /^GIF8[79]a$/);
+            const outPath = join(dir, "outgoing.gif");
+            writeFileSync(outPath, payload);
+            assert.ok(countVideoFrames(outPath) > 1, "APNG must be converted to a multi-frame GIF");
+        } finally {
+            cleanConvertedArtifacts(fixtureBase);
+            nc.dispose();
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("still detects APNG when acTL sits behind a >64KB ancillary chunk", {
+        skip: !hasCommand("ffmpeg"),
+    }, async () => {
+        const dir = mkdtempSync(join(tmpdir(), "onebot-sticker-apng-bigtext-"));
+        const nc = makeNC();
+        const fixtureBase = `apng-bigtext-${randomUUID().slice(0, 8)}`;
+        try {
+            const source = join(dir, `${fixtureBase}.png`);
+            writeApngWithOversizedTextChunk(source);
+            assert.ok(readFileSync(source).length > 64 * 1024, "fixture must push acTL beyond the sniff prefix");
+            const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+            const mediaDownloader = {
+                getExistingPath: (key: string) => key === "apng-bigtext-sticker" ? source : null,
+            } as unknown as MediaDownloader;
+            const adapter = new OneBotAdapter(makeConfig({ sendFileAsDataUrl: true }), nc, mediaDownloader);
+            // @ts-expect-error - override private method for payload inspection
+            adapter.callAction = async (action: string, params: Record<string, unknown>) => {
+                calls.push({ action, params });
+                return { message_id: 5 };
+            };
+
+            // @ts-expect-error - invoke private sticker send path
+            await adapter.sendSticker("onebot:group:42", "apng-bigtext-sticker", {});
+
+            // 分类为 APNG 时走动画缩放分支（palettegen 输出 .gif）；误判为静态则输出 .png。
+            // 本环境的 ffmpeg 8.0.1 把 tEXt 在 acTL 之前的布局按单帧处理，故只断言分支/格式，不断言帧数。
+            const payload = decodeOutgoingImage(calls);
+            assert.match(payload.subarray(0, 6).toString("latin1"), /^GIF8[79]a$/);
+        } finally {
+            cleanConvertedArtifacts(fixtureBase);
+            nc.dispose();
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("still emits a single-frame PNG for a genuinely static sticker", {
+        skip: !(hasCommand("ffmpeg") && hasCommand("ffprobe")),
+    }, async () => {
+        const dir = mkdtempSync(join(tmpdir(), "onebot-sticker-static-"));
+        const nc = makeNC();
+        const fixtureBase = `static-${randomUUID().slice(0, 8)}`;
+        try {
+            const source = join(dir, `${fixtureBase}.png`);
+            writeStaticPng(source);
+            const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+            const mediaDownloader = {
+                getExistingPath: (key: string) => key === "static-sticker" ? source : null,
+            } as unknown as MediaDownloader;
+            const adapter = new OneBotAdapter(makeConfig({ sendFileAsDataUrl: true }), nc, mediaDownloader);
+            // @ts-expect-error - override private method for payload inspection
+            adapter.callAction = async (action: string, params: Record<string, unknown>) => {
+                calls.push({ action, params });
+                return { message_id: 2 };
+            };
+
+            // @ts-expect-error - invoke private sticker send path
+            await adapter.sendSticker("onebot:group:42", "static-sticker", {});
+
+            const payload = decodeOutgoingImage(calls);
+            assert.equal(payload.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
+            const outPath = join(dir, "outgoing.png");
+            writeFileSync(outPath, payload);
+            assert.equal(countVideoFrames(outPath), 1);
+        } finally {
+            cleanConvertedArtifacts(fixtureBase);
+            nc.dispose();
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("markAsRead dispatches to group/private NapCat actions", async () => {
+        const nc = makeNC();
+        const adapter = new OneBotAdapter(makeConfig(), nc);
+        const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+
+        // @ts-expect-error - fake connected ws so markAsRead doesn't early-return
+        adapter.ws = { readyState: 1 };
+        // @ts-expect-error - override private method for payload inspection
+        adapter.callAction = async (action: string, params: Record<string, unknown>) => {
+            calls.push({ action, params });
+            return null;
+        };
+
+        await adapter.markAsRead("onebot:group:979200391");
+        await adapter.markAsRead("onebot:private:12345678");
+
+        assert.deepEqual(calls, [
+            { action: "mark_group_msg_as_read", params: { group_id: 979200391 } },
+            { action: "mark_private_msg_as_read", params: { user_id: 12345678 } },
+        ]);
+
+        nc.dispose();
+    });
+
+    it("markAsRead swallows callAction errors", async () => {
+        const nc = makeNC();
+        const adapter = new OneBotAdapter(makeConfig(), nc);
+
+        // @ts-expect-error - fake connected ws
+        adapter.ws = { readyState: 1 };
+        // @ts-expect-error - override private method to throw
+        adapter.callAction = async () => { throw new Error("boom"); };
+
+        // Should not throw
+        await adapter.markAsRead("onebot:group:1");
+
+        nc.dispose();
+    });
+
+    it("deleteMessages now works for private chats", async () => {
+        const nc = makeNC();
+        const adapter = new OneBotAdapter(makeConfig(), nc);
+        const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+
+        // @ts-expect-error - fake connected ws for handleCall guard
+        adapter.ws = { readyState: 1 };
+        // @ts-expect-error - override private method
+        adapter.callAction = async (action: string, params: Record<string, unknown>) => {
+            calls.push({ action, params });
+            return null;
+        };
+
+        await adapter.handleCall("onebot.deleteMessages", ["onebot:private:12345678", ["100", "101"]]);
+
+        assert.deepEqual(calls, [
+            { action: "delete_msg", params: { message_id: 100 } },
+            { action: "delete_msg", params: { message_id: 101 } },
+        ]);
+
+        nc.dispose();
+    });
+
+    it("applyHumanizedDelay is a no-op (delay moved to sandbox host-call handling)", async () => {
+        const nc = makeNC();
+        const adapter = new OneBotAdapter(makeConfig({
+            humanizedDelay: { enabled: true, msPerChar: 50, minDelay: 200, maxDelay: 1000 },
+        }), nc);
+
+        const t0 = Date.now();
+        // @ts-expect-error - invoke private method directly
+        await adapter.applyHumanizedDelay("onebot:group:1", 100);
+        const elapsed = Date.now() - t0;
+        assert.ok(elapsed < 50, `no-op delay should return immediately (was ${elapsed}ms)`);
+
+        nc.dispose();
+    });
+
+    it("sendReaction routes to set_msg_emoji_like with emoji_id", async () => {
+        const nc = makeNC();
+        const adapter = new OneBotAdapter(makeConfig(), nc);
+        const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+
+        // @ts-expect-error - fake connected ws for handleCall guard
+        adapter.ws = { readyState: 1 };
+        // @ts-expect-error - override private method
+        adapter.callAction = async (action: string, params: Record<string, unknown>) => {
+            calls.push({ action, params });
+            return null;
+        };
+
+        await adapter.handleCall("onebot.sendReaction", ["onebot:group:1", "12345", "128077"]);
+
+        assert.deepEqual(calls, [
+            { action: "set_msg_emoji_like", params: { message_id: 12345, emoji_id: "128077" } },
+        ]);
+
+        nc.dispose();
+    });
+
+    it("pokeUser routes to group_poke for group chats", async () => {
+        const nc = makeNC();
+        const adapter = new OneBotAdapter(makeConfig(), nc);
+        const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+
+        // @ts-expect-error - fake connected ws for handleCall guard
+        adapter.ws = { readyState: 1 };
+        // @ts-expect-error - override private method
+        adapter.callAction = async (action: string, params: Record<string, unknown>) => {
+            calls.push({ action, params });
+            return null;
+        };
+
+        await adapter.handleCall("onebot.pokeUser", ["onebot:group:979200391", "12345678"]);
+
+        assert.deepEqual(calls, [
+            { action: "group_poke", params: { group_id: 979200391, user_id: 12345678 } },
+        ]);
+
+        // 私聊场景应抛错
+        await assert.rejects(
+            adapter.handleCall("onebot.pokeUser", ["onebot:private:1", "2"]),
+            /仅支持群聊/,
+        );
+
+        nc.dispose();
+    });
+
+    it("getChatMembers routes to get_group_member_list", async () => {
+        const nc = makeNC();
+        const adapter = new OneBotAdapter(makeConfig(), nc);
+        const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+
+        // @ts-expect-error - fake connected ws for handleCall guard
+        adapter.ws = { readyState: 1 };
+        // @ts-expect-error - override private method
+        adapter.callAction = async (action: string, params: Record<string, unknown>) => {
+            calls.push({ action, params });
+            return [{ user_id: 1 }, { user_id: 2 }];
+        };
+
+        const result = await adapter.handleCall("onebot.getChatMembers", ["onebot:group:979200391"]);
+
+        assert.deepEqual(calls, [
+            { action: "get_group_member_list", params: { group_id: 979200391 } },
+        ]);
+        assert.deepEqual(result, [{ user_id: 1 }, { user_id: 2 }]);
+
+        nc.dispose();
+    });
+
+    it("extractText renders mentions as @rawUserId when no mentionLabels provided", () => {
+        const nc = makeNC();
+        const adapter = new OneBotAdapter(makeConfig(), nc);
+        // @ts-expect-error - 私有方法，验证渲染逻辑
+        const out = adapter["extractText"]([
+            { type: "at", data: { qq: "123456789" } },
+            { type: "text", data: { text: " 在吗，告诉 " } },
+            { type: "at", data: { qq: "999" } },
+            { type: "text", data: { text: " 和 " } },
+            { type: "at", data: { qq: "777" } },
+            { type: "text", data: { text: " 一声" } },
+        ]);
+        assert.equal(out, "@123456789 在吗，告诉 @999 和 @777 一声");
+        nc.dispose();
+    });
+
+    it("getMessage enriches result via enrichOneBotMessageRecord", async () => {
+        const nc = makeNC();
+        const adapter = new OneBotAdapter(makeConfig(), nc);
+
+        // callAction 返回 OneBot 原始响应（message 字段包含消息内容）
+        // @ts-expect-error - override private method
+        adapter.callAction = async () => ({
+            message_id: 123,
+            message: [{ type: "text", data: { text: "hello" } }],
+        });
+
+        // @ts-expect-error - invoke private method for focused test
+        const result = await adapter.getMessage("123") as Record<string, unknown>;
+        // enrichOneBotMessageRecord 展开原始字段 + 附加 text/mentions/messageSegments 等
+        assert.equal(result.message_id, 123);
+        assert.equal(result.text, "hello");
+        assert.ok(Array.isArray(result.messageSegments));
 
         nc.dispose();
     });

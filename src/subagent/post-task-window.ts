@@ -32,6 +32,7 @@ import {
 } from "../core/message-enricher.js";
 import type { DownloadFn } from "../core/vision-processor.js";
 import type { MediaDownloader } from "../core/media-downloader.js";
+import type { ImageCatalog } from "../core/image-catalog.js";
 
 const log = createLogger("post-task-window");
 
@@ -89,6 +90,8 @@ export interface PostTaskFollowUpJudgeInput {
     downloadFn?: DownloadFn;
     /** 媒体下载管理器（存在时将识别到的图片保存到磁盘） */
     mediaDownloader?: MediaDownloader;
+    /** 图片目录（存在时记录 photo/sticker 出现频率用于表情包检测） */
+    imageCatalog?: ImageCatalog;
 }
 
 export interface PostTaskFollowUpJudgeResult {
@@ -105,6 +108,8 @@ export interface PostTaskFollowUpEnrichConfig {
     downloadFn?: DownloadFn;
     /** 媒体下载管理器；存在时将图片保存到磁盘 */
     mediaDownloader?: MediaDownloader;
+    /** 图片目录；存在时记录 photo/sticker 出现频率 */
+    imageCatalog?: ImageCatalog;
 }
 
 export type PostTaskFollowUpJudge = (input: PostTaskFollowUpJudgeInput) => Promise<PostTaskFollowUpJudgeResult>;
@@ -146,6 +151,8 @@ export interface PostTaskWindowManagerOptions {
     downloadFnProvider?: (chatId: string) => DownloadFn | undefined;
     /** 共享媒体下载管理器（将识别到的图片保存到磁盘） */
     mediaDownloader?: MediaDownloader;
+    /** 共享图片目录（记录 photo/sticker 出现频率用于表情包检测） */
+    imageCatalog?: ImageCatalog;
 }
 
 export class PostTaskWindowManager {
@@ -161,6 +168,7 @@ export class PostTaskWindowManager {
     private readonly stickerDescriptionLookup?: StickerDescriptionLookup;
     private readonly downloadFnProvider?: (chatId: string) => DownloadFn | undefined;
     private readonly mediaDownloader?: MediaDownloader;
+    private readonly imageCatalog?: ImageCatalog;
     private readonly windows = new Map<string, ActivePostTaskWindow>();
 
     constructor(options: PostTaskWindowManagerOptions) {
@@ -176,6 +184,7 @@ export class PostTaskWindowManager {
         this.stickerDescriptionLookup = options.stickerDescriptionLookup;
         this.downloadFnProvider = options.downloadFnProvider;
         this.mediaDownloader = options.mediaDownloader;
+        this.imageCatalog = options.imageCatalog;
     }
 
     handleSentMessage(chatId: string, event: NotificationEvent): void {
@@ -524,6 +533,7 @@ export class PostTaskWindowManager {
                 stickerDescriptionLookup: this.stickerDescriptionLookup,
                 downloadFn: this.downloadFnProvider?.(chatId),
                 mediaDownloader: this.mediaDownloader,
+                imageCatalog: this.imageCatalog,
             });
             if (this.windows.get(chatId) !== window) return;
 
@@ -821,6 +831,7 @@ async function judgePostTaskFollowUpWithLLM(input: PostTaskFollowUpJudgeInput): 
     const enrichConfig = resolvePostTaskFollowUpEnrichConfig(config, profiles, {
         downloadFn: recognizeImages ? input.downloadFn : undefined,
         mediaDownloader: recognizeImages ? input.mediaDownloader : undefined,
+        imageCatalog: recognizeImages ? input.imageCatalog : undefined,
     });
 
     const { content, imageParts } = await buildFollowUpJudgePrompt(input, enrichConfig);
@@ -903,7 +914,7 @@ export async function formatFollowUpJudgeInput(
 function resolvePostTaskFollowUpEnrichConfig(
     config: AppConfig = loadConfig(),
     judgeProfiles?: LLMConfig[],
-    extra?: { downloadFn?: DownloadFn; mediaDownloader?: MediaDownloader },
+    extra?: { downloadFn?: DownloadFn; mediaDownloader?: MediaDownloader; imageCatalog?: ImageCatalog },
 ): PostTaskFollowUpEnrichConfig {
     const llmConfig = judgeProfiles?.[0]
         ?? (config.llmRouting.post_task_followup != null
@@ -920,6 +931,7 @@ function resolvePostTaskFollowUpEnrichConfig(
             : undefined,
         downloadFn: extra?.downloadFn,
         mediaDownloader: extra?.mediaDownloader,
+        imageCatalog: extra?.imageCatalog,
     };
 }
 
@@ -951,6 +963,7 @@ async function enrichFollowUpJudgeMessages(
         visionLlmConfig: enrichConfig.visionLlmConfig,
         downloadFn: enableMedia ? enrichConfig.downloadFn : undefined,
         mediaDownloader: enableMedia ? enrichConfig.mediaDownloader : undefined,
+        imageCatalog: enableMedia ? enrichConfig.imageCatalog : undefined,
         chatId: input.chatId,
         stickerDescriptionLookup: input.stickerDescriptionLookup,
         enableMediaProcessing: enableMedia,

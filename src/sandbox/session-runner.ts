@@ -284,6 +284,43 @@ export function trimAfterFirstCodeBlock(response: string, hasEndTurn: boolean = 
 }
 
 /**
+ * 空残骸 / 复读残骸判定。
+ *
+ * 背景：LLM 输出可能因截断、空响应、失败重试而只剩 prefill 前缀
+ * （"让可丽露想想，让可丽露想想，..."）。这类残骸若写入 history，
+ * 下一轮回放时模型会模仿这一复读模式，造成持续的"想想想想"输出。
+ *
+ * 判定规则（保守，宁漏勿误）：
+ * - 含代码块 / <end_task> / SESSION_DIGEST → 有效，放行
+ * - 空 → 残骸
+ * - 剩余文本中"让X想想"类祈使短语的重复占比 ≥ 60% → 残骸
+ * - 其余情况一律放行（正常短句、正常思考、任意正文）
+ */
+export function isResidueOnlyAssistantText(assistantText: string, prefill?: string): boolean {
+    const stripped = (prefill && assistantText.startsWith(prefill))
+        ? assistantText.slice(prefill.length).trim()
+        : assistantText.trim();
+
+    // 有实质元信息 → 有效
+    if (stripped.includes("```") || stripped.includes(END_TURN_MARKER) || stripped.includes("[SESSION_DIGEST]")) {
+        return false;
+    }
+    // 全空 → 残骸
+    if (stripped.length === 0) return true;
+
+    // 统计"让X想想/看看/来/一下"类祈使短语的重复占比（忽略空白）
+    const repRe = /(让[^，。\n]{1,10}(想想|看看|来|一下)？?[，。、| ]*)/g;
+    const totalLen = stripped.replace(/\s/g, "").length;
+    let repLen = 0;
+    let m: RegExpExecArray | null;
+    while ((m = repRe.exec(stripped)) !== null) {
+        repLen += m[1].replace(/\s/g, "").length;
+        if (m.index === repRe.lastIndex) repRe.lastIndex++; // 防零宽死循环
+    }
+    return totalLen > 0 && repLen / totalLen >= 0.6;
+}
+
+/**
  * 从 LLM response 中提取思考文本和代码块
  *
  * 代码块匹配 ```typescript, ```ts, ```js, ```javascript,
@@ -725,6 +762,35 @@ export async function runCodeActSession(
                 discarded: rawAssistantText.length - assistantText.length,
             });
         }
+
+        // ─── 空残骸防御：输出只剩 prefill 前缀（无正文/无代码块/无结束标记）时不写历史 ───
+        // 这类输出来自截断/空响应/失败重试后的"前缀残留"，存进 history 会成为坏 few-shot：
+        // 模型下一轮会模仿"让XX想想，让XX想想，..."的复读模式。
+        if (isResidueOnlyAssistantText(assistantText, prefill)) {
+            log.warn(`Turn ${turnNum}: 输出仅剩 prefill 复读残骸（无实质内容），跳过写入历史并引导重试`, {
+                rawLen: rawAssistantText.length,
+                afterLen: assistantText.length,
+            });
+            turns.push({
+                turn: turnNum,
+                assistantMessage: assistantText,
+                thinking: "",
+                codeBlocks: [],
+                executionResults: [],
+                usage: llmResponse.usage,
+            });
+            // 给模型一个轻量 observation，促使其重新生成有效回复（不把残骸回放给它）
+            const residueObs = "[你刚才的输出被判定为无效（仅重复了开头提示语/空内容）。请重新输出：一段自然语言思考 + 一个代码块，或直接 <end_task>。]";
+            emitProgress({
+                turn: turnNum,
+                phase: "observation",
+                executionOutput: residueObs,
+                isProcessing: true,
+            });
+            messages.push({ role: "user", content: residueObs });
+            continue;
+        }
+
         messages.push({
             role: "assistant",
             content: assistantText,

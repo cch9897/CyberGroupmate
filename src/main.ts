@@ -479,7 +479,13 @@ async function main(): Promise<void> {
     }
 
     if (appConfig.onebot) {
-        const onebotAdapter = new OneBotAdapter(appConfig.onebot, nc, sharedMediaDownloader, stickerSendPolicy);
+        const onebotAdapter = new OneBotAdapter(
+            appConfig.onebot,
+            nc,
+            sharedMediaDownloader,
+            appConfig.persona?.name ?? "赛博群友",
+            stickerSendPolicy,
+        );
         adapters.push(onebotAdapter);
     }
 
@@ -622,6 +628,7 @@ async function main(): Promise<void> {
         stickerDescriptionLookup: memory,
         downloadFnProvider: (chatId) => buildDownloadFn(chatId),
         mediaDownloader: sharedMediaDownloader,
+        imageCatalog,
     });
 
     log.info("Subagent 组件初始化完成", {
@@ -1136,6 +1143,7 @@ async function main(): Promise<void> {
             sharedMediaDownloader,
             formatMention,
             globalState,
+            imageCatalog,
         );
     }
 

@@ -210,6 +210,9 @@ export interface OneBotConfig {
     wsUrl: string;
     /** Bot 的 QQ 号（用于识别自己的消息） */
     selfId: string;
+    /** OneBot v11 鉴权 token；若 NapCat 配置了 access_token，需在此填入相同值。
+     * 将以 `Authorization: Bearer <token>` 头发送到 WS。 */
+    accessToken?: string;
     /** 是否将本地文件编码为 data URL 发送（跨机器部署时建议开启） */
     sendFileAsDataUrl?: boolean;
     /** @deprecated 旧版入站白名单，仅用于迁移 */
@@ -532,13 +535,15 @@ export interface McpServerPreConfig {
 
 /** Grounding（联网事实查证）配置 */
 export interface GroundingConfig {
-    /** 搜索提供者：google (Gemini Google Search) 或 grok (xAI Web Search) */
-    provider: "google" | "grok";
+    /** 总开关：显式 false 时完全禁用（生产触发链跳过；Dashboard 手动测试不受影响）。默认 true */
+    enabled?: boolean;
+    /** 搜索提供者：google (Gemini Google Search)、grok (xAI Web Search) 或 custom (任意 OpenAI 兼容端点，经 web_search_options 搜索，如 ZenMux / OpenRouter / cliproxy 等网关) */
+    provider: "google" | "grok" | "custom";
     /** API Key */
     apiKey: string;
-    /** 自定义 Base URL（Grok 默认 https://api.x.ai/v1，Google 无需设置） */
+    /** 自定义 Base URL（Grok 默认 https://api.x.ai/v1，Google 无需设置，custom 必填，如 http://127.0.0.1:8317/v1） */
     baseUrl?: string;
-    /** 使用的模型（Grok 默认 grok-3-mini-fast，Google 默认 gemini-2.0-flash-lite） */
+    /** 使用的模型（Grok 默认 grok-3-mini-fast，Google 默认 gemini-2.0-flash-lite，custom 必填，如 google/gemini-3-flash-preview） */
     model?: string;
 }
 
@@ -775,6 +780,7 @@ export function loadConfig(configPath?: string, forceReload?: boolean): AppConfi
         onebot: Object.keys(fileOB).length > 0 ? {
             wsUrl: str(fileOB.ws_url) ?? "",
             selfId: str(fileOB.self_id) ?? "",
+            accessToken: str(fileOB.access_token),
             sendFileAsDataUrl: fileOB.send_file_as_data_url != null ? Boolean(fileOB.send_file_as_data_url) : undefined,
             whitelist: parseOneBotWhitelist(fileOB),
             humanizedDelay: parseOneBotHumanizedDelay(fileOB),
@@ -1277,10 +1283,11 @@ function parsePrivacyConfig(fileConfig: Record<string, unknown>): PrivacyConfig 
 function parseGroundingConfig(fileConfig: Record<string, unknown>): GroundingConfig | undefined {
     const raw = fileConfig.grounding as Record<string, unknown> | undefined;
     if (!raw || typeof raw !== "object") return undefined;
-    const provider = str(raw.provider) as "google" | "grok" | undefined;
+    const provider = str(raw.provider) as "google" | "grok" | "custom" | undefined;
     const apiKey = str(raw.api_key);
     if (!provider || !apiKey) return undefined;
     return {
+        enabled: raw.enabled !== false,
         provider,
         apiKey,
         baseUrl: str(raw.base_url),
@@ -1651,6 +1658,9 @@ export function serializeConfigToObject(config: AppConfig): Record<string, unkno
             ws_url: config.onebot.wsUrl,
             self_id: config.onebot.selfId,
         };
+        if (config.onebot.accessToken) {
+            ob.access_token = config.onebot.accessToken;
+        }
         if (config.onebot.sendFileAsDataUrl != null) {
             ob.send_file_as_data_url = config.onebot.sendFileAsDataUrl;
         }

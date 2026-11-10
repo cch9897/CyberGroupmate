@@ -467,6 +467,19 @@ export interface MessageQueryOptions {
     after?: string;
     before?: string;
     limit?: number;
+    /**
+     * 是否包含被 chat_filter / 访问控制拦截的消息，默认 true。
+     * Dashboard 与放行流程需要看到 blocked 行；Meta 读侧显式传 false。
+     */
+    includeBlocked?: boolean;
+}
+
+export interface RecentMessagesOptions {
+    /**
+     * 是否包含被 chat_filter / 访问控制拦截的消息，默认 true。
+     * Dashboard 与放行流程需要看到 blocked 行；Meta 读侧显式传 false。
+     */
+    includeBlocked?: boolean;
 }
 
 export interface InteractionSearchResult {
@@ -813,8 +826,8 @@ export interface IMemoryStoreV2 {
     /** 获取指定 userId 在所有群的群内画像 */
     getProfilesForUser(userId: string): PersonGroupProfile[];
 
-    /** 获取指定 chatId 最近的原始消息 */
-    getRecentMessages(chatId: string, limit?: number): RecentMessageEntry[];
+    /** 获取指定 chatId 最近的原始消息（includeBlocked 默认 true，Dashboard 需要看到被拦截消息） */
+    getRecentMessages(chatId: string, limit?: number, options?: RecentMessagesOptions): RecentMessageEntry[];
 
     /** 获取尚未通过 Dashboard 放行的访问控制积压消息（最新在前） */
     getPendingAccessControlMessages(chatId: string, limit?: number): RecentMessageEntry[];

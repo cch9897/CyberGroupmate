@@ -2526,15 +2526,14 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         return profiles;
     }
 
-    getRecentMessages(chatId: string, limit: number = 5): RecentMessageEntry[] {
-        if (!chatId || typeof chatId !== "string") {
-            return [];
-        }
+    getRecentMessages(chatId: string, limit: number = 5, options: { includeBlocked?: boolean } = {}): RecentMessageEntry[] {
+        if (!chatId || typeof chatId !== "string") return [];
+        const includeBlocked = options.includeBlocked ?? true;
         const rows = this.db.prepare(
             `SELECT message_id, chat_id, user_id, display_name, text, reply_to_message_id, timestamp, media_type, media_info, mentions,
                     access_control_blocked
              FROM message_log
-             WHERE chat_id = ?
+             WHERE chat_id = ?${includeBlocked ? "" : " AND access_control_blocked = 0"}
              ORDER BY timestamp DESC
              LIMIT ?`
         ).all(chatId, limit) as Record<string, unknown>[];
@@ -2837,10 +2836,15 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         after?: string;
         before?: string;
         limit?: number;
+        includeBlocked?: boolean;
     } = {}): MessageSearchResult[] {
         const limit = Math.min(Math.max(options.limit ?? 20, 1), 100);
         const conditions: string[] = [];
         const params: unknown[] = [];
+
+        if ((options.includeBlocked ?? true) === false) {
+            conditions.push("access_control_blocked = 0");
+        }
 
         const chatIds = [...new Set((options.chatIds ?? []).map(String).filter(Boolean))];
         if (chatIds.length > 0) {

@@ -47,7 +47,12 @@ function getConfiguredBudget(): ContextBudget {
     try {
         const cfg = loadConfig();
         if (!cfg.contextBudget) return DEFAULT_CONTEXT_BUDGET;
-        return { ...DEFAULT_CONTEXT_BUDGET, ...cfg.contextBudget };
+        // 解析器对缺失字段会生成值为 undefined 的键（见 config.ts parsedContextBudget），
+        // 直接展开会让 undefined 覆盖默认值，导致预算字段全部失效。
+        const overrides = Object.fromEntries(
+            Object.entries(cfg.contextBudget).filter(([, v]) => v != null),
+        );
+        return { ...DEFAULT_CONTEXT_BUDGET, ...overrides };
     } catch {
         return DEFAULT_CONTEXT_BUDGET;
     }

@@ -40,6 +40,7 @@ import {
     type StickerDescriptionLookup,
 } from "../core/message-enricher.js";
 import type { MediaDownloader } from "../core/media-downloader.js";
+import type { ImageCatalog } from "../core/image-catalog.js";
 import type { ChatMessage, ImagePart } from "../core/llm.js";
 import { createLogger } from "../core/logger.js";
 import { formatTsForPrompt, normalizeProgrammaticTimestamps, sanitizePromptTimestamps } from "../core/timezone.js";
@@ -587,6 +588,8 @@ export class CodeActExecutor {
     private sendTypingFn: ((chatId: string) => Promise<void>) | undefined;
     /** 媒体下载管理器（保存文件到磁盘） */
     private mediaDownloader: MediaDownloader | undefined;
+    /** 图片目录（表情包频率追踪，可选） */
+    private imageCatalog: ImageCatalog | undefined;
     /** 平台特定的 @ 提及格式化函数（由 adapter 提供） */
     private formatMentionFn: ((rawUserId: string, username?: string) => string | undefined) | undefined;
 
@@ -603,6 +606,7 @@ export class CodeActExecutor {
         mediaDownloader?: MediaDownloader,
         formatMention?: (rawUserId: string, username?: string) => string | undefined,
         globalState?: Pick<GlobalState, "getSessionDigests" | "updateDispatchedSubagentTask">,
+        imageCatalog?: ImageCatalog,
     ): void {
         this.sandboxPool = sandboxPool;
         this.nc = nc;
@@ -619,7 +623,8 @@ export class CodeActExecutor {
         this.mediaDownloader = mediaDownloader;
         this.formatMentionFn = formatMention;
         this.globalState = globalState ?? this.globalState;
-        log.info("setDependencies", { chatId: this.chatId, hasSandboxPool: true, hasVision: !!visionConfig, hasVisionLlm: !!visionLlmConfig, hasDownload: !!downloadFn, hasTyping: !!sendTyping, hasMediaDownloader: !!mediaDownloader, hasMention: !!formatMention, hasGlobalState: !!this.globalState });
+        this.imageCatalog = imageCatalog ?? this.imageCatalog;
+        log.info("setDependencies", { chatId: this.chatId, hasSandboxPool: true, hasVision: !!visionConfig, hasVisionLlm: !!visionLlmConfig, hasDownload: !!downloadFn, hasTyping: !!sendTyping, hasMediaDownloader: !!mediaDownloader, hasMention: !!formatMention, hasGlobalState: !!this.globalState, hasImageCatalog: !!this.imageCatalog });
     }
 
     /**
@@ -942,6 +947,7 @@ export class CodeActExecutor {
                     stickerCache: this.memory ?? undefined,
                     chatId: this.chatId,
                     mediaDownloader: this.mediaDownloader,
+                    imageCatalog: this.imageCatalog,
                 },
             );
             const targetMessages = enriched.formattedText;
@@ -1458,6 +1464,7 @@ export class CodeActExecutor {
             stickerCache: this.memory ?? undefined,
             chatId: this.chatId,
             mediaDownloader: this.mediaDownloader,
+            imageCatalog: this.imageCatalog,
         });
     }
 
@@ -1540,7 +1547,7 @@ export class CodeActExecutor {
     private async refreshTaskMessages(task: CodeActReplyTask): Promise<void> {
         if (!this.memory) return;
         try {
-            const freshMessages = this.memory.getRecentMessages(this.chatId, 20);
+            const freshMessages = this.memory.getRecentMessages(this.chatId, 20, { includeBlocked: false });
             if (freshMessages.length === 0) return;
 
             const msgIdToName = new Map<string, string>();
@@ -1875,6 +1882,11 @@ export class CodeActExecutor {
      * 调用 context-manager.compact() 生成 LLM Context Briefing，
      * 支持话题保护和 reply chain 保护。
      */
+    /** Maximum characters for the compact summary (prevents unbounded growth) */
+    private static readonly COMPACT_MAX_CHARS = 30000;
+    /** Maximum characters for rebuilt interaction history */
+    private static readonly COMPACT_MAX_HISTORY_CHARS = 15000;
+
     private async compactSession(overheadTokens = 0): Promise<void> {
         const keep = Math.max(4, Math.floor(this.config.maxSessionMessages * 0.4));
         // 条数不够时跳过 Layer 1，但仍要走 Layer 2 的 token 预算检查
@@ -1891,9 +1903,10 @@ export class CodeActExecutor {
         const recentMessages = this.session.slice(-keep);
 
         // ═══ Layer 1: 结构化快速 compact ═══
-        // 从 executionRecords 构建摘要（只带最近的，全量会让摘要失控）
+        // 从 executionRecords 构建摘要（限制最近 N 条）
+        const recordsToSummarize = this.executionRecords.slice(-COMPACT_RECORD_SUMMARY_LIMIT);
         const recordSummaries: string[] = [];
-        for (const rec of this.executionRecords.slice(-COMPACT_RECORD_SUMMARY_LIMIT)) {
+        for (const rec of recordsToSummarize) {
             const summary = formatExecutionRecordForCompact(rec);
             if (summary) recordSummaries.push(summary);
         }
@@ -1907,19 +1920,38 @@ export class CodeActExecutor {
             }
         }
 
-        const rebuiltInteractionHistory = this.rebuildCompactedInteractionHistory(compactedMessages);
+        let rebuiltInteractionHistory = this.rebuildCompactedInteractionHistory(compactedMessages);
+        // Truncate interaction history if too long
+        if (rebuiltInteractionHistory && rebuiltInteractionHistory.length > CodeActExecutor.COMPACT_MAX_HISTORY_CHARS) {
+            rebuiltInteractionHistory = rebuiltInteractionHistory.slice(-CodeActExecutor.COMPACT_MAX_HISTORY_CHARS);
+            rebuiltInteractionHistory = "...（历史已截断）\n" + rebuiltInteractionHistory.slice(rebuiltInteractionHistory.indexOf("\n") + 1);
+        }
 
         // 构建 compact 摘要
+        const omittedCount = this.executionRecords.length - recordsToSummarize.length;
         let compactContent = `[SESSION_HISTORY_COMPACT]\n== 之前执行了 ${this.executionCount} 次任务 ==`;
+        if (omittedCount > 0) {
+            compactContent += `\n（更早的 ${omittedCount} 条记录已省略）`;
+        }
         if (recordSummaries.length > 0) {
             compactContent += `\n${recordSummaries.join("\n")}`;
         }
         if (sentConfirmations.length > 0 && recordSummaries.length === 0) {
             // 如果没有 executionRecords（旧数据），用 session 中提取的兜底
-            compactContent += `\n\n== 历史已发消息 ==\n${sentConfirmations.join("\n")}`;
+            compactContent += `\n\n== 历史已发消息 ==\n${sentConfirmations.slice(-20).join("\n")}`;
         }
         if (rebuiltInteractionHistory) {
             compactContent += `\n\n${rebuiltInteractionHistory}`;
+        }
+
+        // Final safety cap: hard-truncate if still over budget
+        if (compactContent.length > CodeActExecutor.COMPACT_MAX_CHARS) {
+            log.warn("compactSession Layer 1: compact summary exceeds max chars, truncating", {
+                chatId: this.chatId,
+                originalLength: compactContent.length,
+                maxChars: CodeActExecutor.COMPACT_MAX_CHARS,
+            });
+            compactContent = compactContent.slice(0, CodeActExecutor.COMPACT_MAX_CHARS) + "\n...（摘要已截断）";
         }
 
         const compactMsg: SessionMessage = {
@@ -1941,6 +1973,7 @@ export class CodeActExecutor {
             chatId: this.chatId,
             remaining: this.session.length,
             executionRecords: this.executionRecords.length,
+            compactChars: compactContent.length,
         });
     }
 
@@ -1996,7 +2029,7 @@ export class CodeActExecutor {
                 afterMessages: this.session.length,
             });
         } catch (err) {
-            log.warn("compactSession Layer 2 失败，改为强制裁剪", {
+            log.warn("compactSession Layer 2 失败，执行 emergency truncation", {
                 chatId: this.chatId,
                 error: String(err),
             });
